@@ -15,6 +15,7 @@ from tools.android_build import android_configure_inputs, generate_android_build
 from tools.linux_build import check_profile_options, generate_linux_build, linux_configure_inputs
 from tools.web_build import generate_web_build, web_configure_inputs
 from tools.windows_build import generate_windows_build, windows_configure_inputs
+from tools.xbox_build import generate_xbox_build, xbox_configure_inputs
 
 
 def is_windows() -> bool:
@@ -126,6 +127,11 @@ if not is_windows():
         "folder with `Include` and `Lib`, each with a versioned folder (default: WindowsSdkDir)",
     )
 
+parser.add_argument(
+    "--nxdk",
+    metavar="PATH",
+    help="nxdk for the original Xbox build, `ninja xbox` (default: port/xbox/xemu.local.toml's, or ~/source/repos/nxdk)",
+)
 args = parser.parse_args()
 try:
     check_profile_options(args.profile, args.pgo)
@@ -146,6 +152,7 @@ sln = SimpleNamespace(
     android_ndk=args.android_ndk,
     android_guest_cc=args.android_guest_cc,
     web_emcc=args.web_emcc,
+    nxdk=args.nxdk,
 )
 if not is_windows():
     sln.windows_cc = args.windows_cc
@@ -173,6 +180,7 @@ generate_linux_build(n, sln)
 generate_android_build(n, sln)
 generate_windows_build(n, sln)
 generate_web_build(n, sln)
+generate_xbox_build(n, sln)
 
 n.comment("Reconfigure on change")
 n.rule(
@@ -191,6 +199,7 @@ n.build(
         *android_configure_inputs(),
         *windows_configure_inputs(),
         *web_configure_inputs(),
+        *xbox_configure_inputs(),
     ],
 )
 n.newline()
