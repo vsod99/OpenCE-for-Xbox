@@ -152,6 +152,17 @@ static void write_to_debug_file(
 	char prefix[32];
 	long spin;
 
+#ifdef HALO_XBOX
+	/* d: is the disc there: the lines go to the log (COM2) instead */
+	{
+		extern void platform_log(const char *format, ...);
+
+		(void)file;
+		(void)date;
+		platform_log("debug.txt: %s", string);
+		return;
+	}
+#endif
 	/* (a moment's wait for another thread's line; a crash report written
 	while this thread held the lock goes on without it) */
 	for (spin = 0; spin < 50000000 && __sync_lock_test_and_set(&debug_file_port_lock, 1); spin++)

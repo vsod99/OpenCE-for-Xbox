@@ -105,6 +105,8 @@ void test_input_hold_action(int hold);
 void test_input_press(unsigned long buttons);
 /* menu_functions.c's */
 void pc_menu_start_map(char const *map_name);
+/* main.c's */
+short main_get_solo_level_from_name(char const *name);
 
 enum
 {
@@ -163,9 +165,12 @@ static struct
 	short next_cue;
 	long cue_players;
 	long cues_start;
-	/* debug.start_map: started this many seconds into the main menu */
+	/* debug.start_map: started this many seconds into the main menu (a
+	campaign level), or (any other map) hosted as a split screen game:
+	the host's steps with no other machine let in */
 	real start_map_seconds;
 	boolean start_map_done;
+	boolean split_screen;
 } network_test;
 
 /* the variant at the index of the list (copied to name), FALSE past its end */
@@ -227,7 +232,28 @@ static void network_test_read_settings(
 		network_test.mode = _network_test_log;
 	}
 	network_test.public_game = config_boolean("debug.network_test_public") != 0;
+	/* debug.start_map "bloodgulch[:variant]": a split screen game, one
+	player's, of slayer or the variant */
+	{
+		char const *start_map = config_string("debug.start_map");
+		char level[64];
+
+		snprintf(level, sizeof(level), "%.*s", (int)strcspn(start_map, ":"), start_map);
+		if (network_test.mode == _network_test_off && *start_map && main_get_solo_level_from_name(level) == NONE)
+		{
+			network_test.mode = _network_test_host;
+			network_test.split_screen = TRUE;
+			network_test.start_map_done = TRUE;
+			snprintf(network_test.map_name, sizeof(network_test.map_name), "%s", level);
+			snprintf(network_test.variant_name, sizeof(network_test.variant_name), "%s",
+				start_map[strlen(level)] == ':' ? start_map + strlen(level) + 1 : "slayer");
+			setting = "split screen (debug.start_map)";
+		}
+	}
 	network_test.start_delay = (real)config_real("debug.network_test_start");
+	/* (a split screen game waits for no machine to join) */
+	if (network_test.split_screen && !*config_string("debug.network_test"))
+		network_test.start_delay = 3.0f;
 	network_test.kill_interval = (real)config_real("debug.network_test_kill");
 	network_test.shoot_interval = (real)config_real("debug.network_test_shoot");
 	network_test.vehicle_time = (real)config_real("debug.network_test_vehicle");
@@ -1509,7 +1535,16 @@ void network_test_update(
 			else
 			{
 				player_ui_fast_setup_network_server();
-				platform_log("network test: hosting %s", network_test.map_name);
+				/* (split screen: a server that lets in no other machine, as the
+				split screen menus set it up: network_game_is_splitscreen_local) */
+				if (network_test.split_screen)
+				{
+					network_game_accept_remote_connections(FALSE);
+					/* (one player's: the game's split screen takes two) */
+					network_game_server_port_set_minimum_players(1);
+				}
+				platform_log("network test: hosting %s%s", network_test.map_name,
+					network_test.split_screen ? " (split screen)" : "");
 				/* (in the server browser, as Create Game > Internet's PUBLIC) */
 				if (network_test.public_game)
 					p2p_set_hosting_public(TRUE);
