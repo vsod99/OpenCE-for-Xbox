@@ -138,6 +138,9 @@ enum
 	STUN_RETRY_INTERVAL = 500,
 	STUN_REFRESH_INTERVAL = 25000,
 	STUN_ATTEMPTS = 6,
+	/* a server whose name could not be looked up: no network yet (an
+	Xbox's address comes from DHCP seconds after the game starts) */
+	STUN_LOOKUP_RETRY_INTERVAL = 5000,
 	/* a joiner asks its router to forward the tunnel's port when it has not
 	reached a peer in this long; a forwarding is renewed this often (its
 	lease is an hour), and one refused asked for again this long after */
@@ -303,6 +306,7 @@ struct stun_server
 	unsigned long sent_time;
 	int has_mapped;
 	struct p2p_candidate mapped;
+	int lookup_failed;
 };
 
 pthread_mutex_t p2p_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1324,13 +1328,14 @@ static void stun_update(void)
 
 		if (!server->address && !server->attempts)
 		{
-			/* looked up here on the p2p thread, until it is found */
+			/* looked up here, on the p2p thread, and again every
+			STUN_LOOKUP_RETRY_INTERVAL until it is found */
 			server->address = p2p_resolve(server->host);
 			if (!server->address)
 			{
-				platform_log("Internet play: cannot look up the STUN server %s", server->host);
-				/* (looked up again a refresh's time from now, below: the
-				network may not have been up yet) */
+				if (!server->lookup_failed)
+					platform_log("Internet play: cannot look up the STUN server %s", server->host);
+				server->lookup_failed = 1;
 				server->attempts = STUN_ATTEMPTS;
 				server->sent_time = p2p_now();
 				continue;
@@ -1350,6 +1355,10 @@ static void stun_update(void)
 			stun_send(server);
 		}
 		else if (server->attempts >= STUN_ATTEMPTS && elapsed(server->sent_time, STUN_REFRESH_INTERVAL))
+		{
+			server->attempts = 0;
+		}
+		else if (!server->address && elapsed(server->sent_time, STUN_LOOKUP_RETRY_INTERVAL))
 		{
 			server->attempts = 0;
 		}
