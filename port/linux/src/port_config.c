@@ -56,6 +56,8 @@ enum
 	_platform_windows = 4,
 	/* (the web build, which has the desktop's settings, and these) */
 	_platform_web = 8,
+	/* the original Xbox (port/xbox), which builds as Windows does */
+	_platform_xbox = 16,
 };
 
 struct config_setting
@@ -428,6 +430,13 @@ static const struct config_setting config_settings[] =
 		"shield's own) or a multiplayer armor color: white, black, red, blue,\n"
 		"gray, yellow, green, pink, purple, cyan, cobalt, orange, teal, sage,\n"
 		"brown, tan, maroon or salmon." },
+	{ "game.custom_edition_reduce_detail", _config_boolean, "true", "HALO_CUSTOM_EDITION_REDUCE_DETAIL",
+		_environment_value, _platform_xbox,
+		"A Custom Edition map whose models do not fit the Xbox's memory at\n"
+		"their full detail draws them at medium detail at most (their high and\n"
+		"super high levels of detail are their medium one), when that fits;\n"
+		"false refuses such a map. Maps that fit keep their full detail\n"
+		"(port/xbox/README.md)." },
 
 	{ "game.unlock_all_levels", _config_boolean, "false", "HALO_UNLOCK_ALL_LEVELS", _environment_value, _platform_all,
 		"true: a profile made from now on starts with every campaign level\n"
@@ -814,6 +823,8 @@ static const struct config_setting config_settings[] =
 
 #ifdef HALO_ANDROID
 #define CONFIG_PLATFORM _platform_android
+#elif defined(HALO_XBOX)
+#define CONFIG_PLATFORM (_platform_desktop | _platform_windows | _platform_xbox)
 #elif defined(HALO_WEB)
 #define CONFIG_PLATFORM (_platform_desktop | _platform_web)
 #elif defined(_WIN32)
