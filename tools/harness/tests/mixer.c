@@ -367,6 +367,7 @@ static void scene(unsigned long voices, unsigned long silent, BOOL indoor, doubl
 		environment = room;
 		environment_serial++;
 	}
+	gains_initialize();
 	resampler_initialize();
 	resampler_phases_initialize();
 	reverb_initialize();
@@ -445,6 +446,7 @@ int main(int argc, char **argv)
 	};
 	unsigned long index;
 
+	gains_initialize();
 	resampler_initialize();
 	resampler_phases_initialize();
 
