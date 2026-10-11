@@ -440,8 +440,11 @@ static const struct config_setting config_settings[] =
 		"A Custom Edition map whose models do not fit the Xbox's memory at\n"
 		"their full detail draws them at medium detail at most (their high and\n"
 		"super high levels of detail are their medium one), when that fits;\n"
-		"false refuses such a map. Maps that fit keep their full detail\n"
-		"(port/xbox/README.md)." },
+		"false refuses such a map. Maps that fit keep their full detail. And a\n"
+		"texture the texture cache has no room for is drawn at half its size\n"
+		"(down to 256 pixels), as are, once the cache has run out of room,\n"
+		"the map's largest textures; false draws those as the default\n"
+		"checkerboard (port/xbox/README.md)." },
 
 	{ "game.unlock_all_levels", _config_boolean, "false", "HALO_UNLOCK_ALL_LEVELS", _environment_value, _platform_all,
 		"true: a profile made from now on starts with every campaign level\n"
