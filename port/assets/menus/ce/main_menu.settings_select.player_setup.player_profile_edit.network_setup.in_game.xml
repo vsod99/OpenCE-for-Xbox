@@ -15,9 +15,9 @@
 		<data input="port settings help"/>
 		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_map_sharing" x="54" y="73" platform="desktop android"/>
 		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_multiplayer_hud" x="54" y="103" platform="desktop android"/>
-		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_multiplayer_hud" x="54" y="73" platform="web"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_multiplayer_hud" x="54" y="73" platform="web xbox"/>
 		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_streamer_mode" x="54" y="133" platform="desktop android"/>
-		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_streamer_mode" x="54" y="103" platform="web"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/op_streamer_mode" x="54" y="103" platform="web xbox"/>
 		<child widget="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/button_bar" y="414"/>
 	</widget>
 	<widget name="main_menu/settings_select/player_setup/player_profile_edit/network_setup/in_game/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">

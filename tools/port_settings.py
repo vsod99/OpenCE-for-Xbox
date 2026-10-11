@@ -38,8 +38,9 @@ VOLUMES = [(str(step), f"{step / 10:g}") for step in range(11)]
 # menu opens), its header (widget, bitmap), the row spacing, and its rows:
 # (label, setting, [(shown, value)], help, platform[, key]): platform is None
 # for every platform, else the platforms the row is for, separated by spaces
-# ("desktop", "android", "web": the menus' platform attribute,
-# port/linux/src/menu_files.c); key names the row's widgets where two rows set
+# ("desktop", "android", "web", "xbox": the menus' platform attribute,
+# port/linux/src/menu_files.c; the original Xbox, port/xbox, has no window,
+# interpolation, high-res art, voices, clipboard or updater); key names the row's widgets where two rows set
 # one setting (one for each platform), else the setting's name does
 SCREENS = {
     "video_settings": {
@@ -70,15 +71,18 @@ SCREENS = {
             ("RESOLUTION SCALING:", "display.resolution_scaling", [("NATIVE", "native"), ("ORIGINAL", "original")],
              "Native draws at the resolution; Original draws\nthe Xbox's 640x480 and scales it up.", "desktop web"),
             ("V-SYNC:", "display.vsync", ON_OFF,
-             "Wait for the display between frames, so that the\npicture never tears.", None),
+             "Wait for the display between frames, so that the\npicture never tears.", "desktop android web"),
             ("FRAME RATE LIMIT:", "display.max_fps",
              [("AUTO", "0"), ("30", "30"), ("60", "60"), ("120", "120"), ("144", "144"), ("165", "165"),
               ("240", "240"), ("NONE", "-1")],
              "With V-Sync off, the most frames a second. Auto:\ntwice the display's refresh rate.", "desktop web"),
             ("SMOOTH MOTION:", "display.interpolation", ON_OFF,
-             "Draw a frame for every display refresh, blending\nbetween the game's 30 ticks a second.", None),
+             "Draw a frame for every display refresh, blending\nbetween the game's 30 ticks a second.",
+             "desktop android web"),
             ("INSTANT AIM:", "display.direct_camera", ON_OFF,
              "In first person, turn the view the moment the\nmouse moves, not up to two ticks later.", "desktop web"),
+            ("WIDESCREEN:", "display.widescreen", [("AUTO", "auto"), ("ON", "on"), ("OFF", "off")],
+             "On for a 16:9 television: a wider view. Auto\nfollows the console's video setting.", "xbox"),
             ("HIGH-RES HUD:", "display.high_res_hud", ON_OFF,
              "Draw the HUD from the high-res redraws; off\ndraws the game's own pictures.", None),
             ("BUTTON STYLE:", "display.hud_button_style",
@@ -158,8 +162,9 @@ SCREENS = {
             # voice chat: this machine's own (port/linux/game/network_voice.c)
             ("VOICE CHAT:", "audio.voice_chat",
              [("PUSH TO TALK", "push_to_talk"), ("OPEN MIC", "open_mic"), ("OFF", "off")],
-             "Talk in network games: while PUSH TO TALK is held\n(Controls), whenever you speak, or never.", None),
-            ("VOICE VOLUME:", "audio.voice_volume", VOLUMES, "The other players' voices.", None),
+             "Talk in network games: while PUSH TO TALK is held\n(Controls), whenever you speak, or never.",
+             "desktop android web"),
+            ("VOICE VOLUME:", "audio.voice_volume", VOLUMES, "The other players' voices.", "desktop android web"),
         ],
     },
     "network_setup": {
@@ -167,15 +172,16 @@ SCREENS = {
         "header": ("header_profile_network_settings", f"{PE}/network_setup/header_profile_network_settings"),
         "spacing": 30,
         # (the router, the clipboard and the updates, which the web build
-        # has not: the other rows from the top there)
+        # has not, and the clipboard and updates, which the Xbox has not:
+        # the other rows from the top there)
         "platform_places": True,
         "rows": [
             ("INTERNET PLAY:", "network.online", ON_OFF,
              "Host and join games over the internet by invite\nlinks; off keeps to the local network.",
-             "desktop android web"),
+             "desktop android web xbox"),
             ("UPNP PORT FORWARDING:", "network.allow_upnp", ON_OFF,
              "Let internet play ask the router to forward its\nport, for networks that stop connections.",
-             "desktop android"),
+             "desktop android xbox"),
             ("JOIN FROM CLIPBOARD:", "network.join_from_clipboard", ON_OFF,
              "Join the game of an invite link copied before\nswitching to the game.", "desktop android"),
             ("CHECK FOR UPDATES:", "update.auto", ON_OFF,
@@ -236,12 +242,14 @@ SCREENS["video_settings/extra_effects"] = {
     "rows": [row for row in _video["rows"] if row[1] in _extra_effects],
 }
 _video["rows"] = [row for row in _video["rows"] if row[1] not in _graphics | _extra_effects]
+# (a category: label, folder, help[, platform])
 _video["categories"] = [
-    ("GRAPHICS:", "video_settings/graphics", "The HUD, text, anti-aliasing, shadows,\nlighting and HDR."),
+    ("GRAPHICS:", "video_settings/graphics", "The HUD, text, anti-aliasing, shadows,\nlighting and HDR.",
+     "desktop android web"),
     ("FOV AND VIEWMODELS:", "video_settings/fov_viewmodels",
      "The field of view and the first-person\nweapon. Their defaults keep the stock view."),
     ("EXTRA EFFECTS:", "video_settings/extra_effects",
-     "Visual modifiers the stock game does not\nhave, such as the shield glow."),
+     "Visual modifiers the stock game does not\nhave, such as the shield glow.", "desktop android web"),
 ]
 SCREENS["video_settings/fov_viewmodels"] = {
     "screen": "fov_viewmodel_settings_screen", "header": _video["header"], "spacing": 30,
@@ -495,7 +503,7 @@ def _setting_screen(folder: str, spec: dict) -> list:
     # (platform_places: each platform's rows in places of their own, with
     # no gap where the others' are; a row in one place for all its
     # platforms, else a child for each place)
-    places = {"desktop": -1, "android": -1, "web": -1}
+    places = {"desktop": -1, "android": -1, "web": -1, "xbox": -1}
     for index, (label, setting, choices, _, platform, *named) in enumerate(spec["rows"]):
         key = named[0] if named else setting.split(".", 1)[1]
         row = f"{base}/op_{key}"
