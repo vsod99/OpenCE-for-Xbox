@@ -103,6 +103,8 @@ void network_damage_statistics(long *sent_reports, long *dealt_reports, long *re
 /* xinput_sdl.c's */
 void test_input_hold_action(int hold);
 void test_input_press(unsigned long buttons);
+/* network_test_clients.c's */
+void network_test_clients_update(void);
 /* menu_functions.c's */
 void pc_menu_start_map(char const *map_name);
 /* main.c's */
@@ -1133,6 +1135,9 @@ void network_test_update(
 		network_test_keyboard_line(game_time_get() - (long)(network_test.chat_time * TICKS_PER_SECOND) -
 			32 * TICKS_PER_SECOND);
 	}
+	/* debug.network_test_clients: machines inside the host joining its game */
+	if (network_test.mode == _network_test_host)
+		network_test_clients_update();
 	/* the game running: report (from the start of each game, or a revert to
 	a checkpoint: the time starts over, and the cues with it) */
 	if (game_in_progress() && game_time_get() < network_test.logged_time)
