@@ -1,140 +1,146 @@
-# Halo: Combat Evolved for Linux, Windows and Android
+# OpenCE for the original Xbox
 
-[![Join our Discord](https://invidget.switchblade.xyz/9gqcHyr5km)](https://discord.gg/9gqcHyr5km)
+This is a fork of [OpenCE](https://github.com/OpenCommunityEdition/OpenCE),
+the port of the Halo: Combat Evolved decompilation (Xbox build 2342) to
+Linux, Windows, Android and the web. The fork adds one more platform: **the
+original Xbox**, built from the same sources as the other ports with
+[nxdk](https://github.com/XboxDev/nxdk).
 
-This project is a port of the Halo: Combat Evolved decompilation to Linux,
-Windows and Android. The decompilation is of the Xbox build 2342
-(`cachebeta.exe`, SHA-256
-`4cc87b45f721270392a96f1674ed2b5cd4a7bb4355faeab4531d1cf1884d9520`).
+The game's own code, OpenCE's netcode and its PC menus all compile for the
+Xbox unchanged. A new platform layer (`port/xbox/src`) stands in for the
+desktop's OpenGL, SDL and sockets: Direct3D 8 drawn on the NV2A through
+pbkit, sound through the AC'97 controller, controllers through nxdk's USB
+stack, and networking through lwIP. Because the netcode and its network
+version are the same, an Xbox is meant to play with the PC builds over system
+link and internet play (two Xboxes play together; an Xbox with a PC is still
+to be tried).
 
-<img width="1289" height="995" alt="The game on Linux" src="https://github.com/user-attachments/assets/0d3ad50f-f8b8-46cf-aef8-e3661da2a7d7" />
+The Xbox port lives on the
+[`xbox-backport`](https://github.com/vsod99/halo-ce-universal/tree/xbox-backport)
+branch, which is rebased onto OpenCE's `main` as upstream moves. Its full
+documentation is
+[`port/xbox/README.md`](https://github.com/vsod99/halo-ce-universal/blob/xbox-backport/port/xbox/README.md).
+For the PC, Android and web builds, use [OpenCE](https://github.com/OpenCommunityEdition/OpenCE)
+itself.
 
-The port starts from the decompilation of [bnunu/halo-1](https://github.com/bnunu/halo-1).
-That project is a fork of [punpckhdq/halo](https://github.com/punpckhdq/halo).
+> **Work in progress.** Everything below runs in [xemu](https://xemu.app).
+> It has not yet been tried on a real console.
 
-## Download
+## Screenshots
 
-GitHub Actions builds the game for each commit. These links download the
-builds of the latest release:
+All three are frames the Xbox build saved from inside xemu (640×480).
 
-| Platform | Release | Debug |
-| --- | --- | --- |
-| Linux | [halo-linux-release.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-linux-release.zip) | [halo-linux-debug.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-linux-debug.zip) |
-| Windows | [halo-windows-release.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-windows-release.zip) | [halo-windows-debug.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-windows-debug.zip) |
-| Android | [halo-android-release.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-android-release.zip) | [halo-android-debug.zip](https://github.com/cybersecurity/halo-ce-universal/releases/latest/download/halo-android-debug.zip) |
+<p align="center">
+  <img src="docs/images/xbox-main-menu.png" alt="The main menu on the Xbox" width="32%">
+  <img src="docs/images/xbox-blood-gulch.png" alt="Blood Gulch in a network game on the Xbox" width="32%">
+  <img src="docs/images/xbox-b30.png" alt="The campaign level b30 on the Xbox" width="32%">
+</p>
+<p align="center"><em>The PC menus, a Blood Gulch network game with another player's name over their head, and the campaign's second level (b30).</em></p>
 
-Use the release build to play. The debug build stops at the first failed
-assertion and writes it to the log. Use the debug build to find and report
-problems.
+## What works
 
-The game updates itself. At start-up it looks for a newer release, and asks
-if you want to install it. Refer to "Updates" in
-[port/linux/README.md](port/linux/README.md#updates).
+- The PC menus, their pictures downscaled for the Xbox at build time, with
+  the Xbox's own rows in the settings screens (widescreen, field of view).
+- The campaign, multiplayer, split screen, and 480p or 480i at 4:3 or 16:9
+  (anamorphic, following the dashboard's setting).
+- Sound and music, mixed by OpenCE's mixer onto the AC'97 controller.
+- System link and internet play, including joining games in progress, the
+  server browser and UPnP. Two Xboxes play together in xemu.
+- Most Halo Custom Edition maps. Large ones have their textures and model
+  geometry loaded as they are needed.
+- Starting from the Halo disc: with no `maps` folder beside the program,
+  the maps are read from the disc in the drive, and the game asks for the
+  disc if there is none.
+- A self-updater from GitHub releases (it has no Xbox releases to install
+  yet).
 
-Each build of the `main` branch that passes on all three platforms is a new
-release. The [Releases](https://github.com/cybersecurity/halo-ce-universal/releases)
-page keeps the last five releases. If the latest build has a problem, get
-an older build from that page.
+## Need to knows
 
-## Game data
+- **A 128 MB console is required.** Every machine in an OpenCE game must
+  share the same object and player capacity, which raises the game state to
+  16 MB. That doesn't fit beside the map caches in a stock console's 64 MB.
+- **The console must be modified to run homebrew.** The program is an
+  unsigned XBE.
+- **You need your own copy of Halo.** Nothing from the game is included:
+  put the disc in the drive, or copy its `maps` folder beside the program.
+- **It plays with the PC builds of the same network version.** OpenCE raises
+  `HALO_PORT_NETWORK_VERSION` whenever the machines' messages change, and
+  builds of different versions don't see each other's games. The Xbox
+  branch follows upstream's `main`, so match it with a PC build of the same
+  time.
+- **Not on the Xbox:** the high-res HUD and text, mods, HDR, model detail
+  settings, higher resolutions and Smooth Motion. The game runs at 30 fps
+  at 480 lines, as the original did.
+- **Settings and saves** are kept on the hard disk, in `E:\halo`.
+- **Performance in xemu:** an Xbox hosts a 16-player game at 30 fps until
+  everyone starts firing, at which point it drops to about 18 fps. As a
+  client it runs a 17-player firefight at 12–17 fps and a 33-player one at
+  5–7 fps. In large games it's limited by simulating every player, not by
+  the network. A real console's numbers are still to be measured.
 
-The port does not include the game data. Download an Xbox disc image
-(`.xiso` or `.iso`) of Halo: Combat Evolved. All versions of the game
-operate. The maps of the European (PAL) version were made for a slower
-console. The port changes them to play as the North American (NTSC) maps do,
-so players of the two versions can play together.
+## Building
 
-1. Start the game.
-2. At the first start, the game asks for the disc image. Select it.
-3. The game extracts the `maps/` folder. Then the game starts.
+The build runs on macOS, Linux, or Windows through WSL. On macOS:
 
-On Linux and Windows, the game puts `maps/` next to the executable. On
-Android, copy the disc image to the phone first. The app puts `maps/` in its
-data folder. Refer to [port/android/README.md](port/android/README.md).
+1. Install the tools:
 
-## Platforms
+       brew install llvm lld coreutils ninja
+       brew install --cask xemu
 
-Each platform has its own instructions:
+2. Get nxdk and build its libraries optimized (its makefile builds them
+   without optimization otherwise):
 
-| Platform | Instructions |
-| --- | --- |
-| Linux (32-bit x86 executable, OpenGL 4.5, SDL3) | [port/linux/README.md](port/linux/README.md) |
-| Windows (32-bit x86 executable, OpenGL 4.5, SDL3) | [port/windows/README.md](port/windows/README.md) |
-| Android (arm64 app, OpenGL ES 3, SDL3) | [port/android/README.md](port/android/README.md) |
+       git clone --recursive https://github.com/XboxDev/nxdk ~/source/repos/nxdk
+       cd ~/source/repos/nxdk && NXDK_DIR=$PWD PATH=$PWD/bin:/opt/homebrew/opt/llvm/bin:$PATH \
+         make -B CFLAGS=-O2 $(for l in libpdclib libwinapi libxboxrt libnxdk libnxdk_hal libpbkit \
+           nxdk_usb libnxdk_automount_d xboxkrnl/libxboxkrnl; do echo $PWD/lib/$l.lib; done)
 
-The Linux README also gives the controls, the settings and the multiplayer
-functions. These are almost the same on all platforms.
+3. Check out the Xbox branch, and copy `port/xbox/xemu.example.toml` to
+   `port/xbox/xemu.local.toml`. Fill in nxdk's path and, to run in xemu, the
+   MCPX boot ROM dumped from your own console, a flash BIOS that gives the
+   program 128 MB (Cerbios is what this is tested with), a hard disk image,
+   and your Halo maps folder:
 
-## Multiplayer
+       git clone -b xbox-backport https://github.com/vsod99/halo-ce-universal
+       cd halo-ce-universal
+       python3 tools/xbox_dev.py doctor
 
-The game can play system link games on a local network and on the internet:
+4. Build:
 
-- A system link game can have up to 128 players on up to 128 machines.
-- Linux, Windows and Android machines can play in the same game.
-- An invite link lets a machine join a game on the internet. No server of
-  this project is necessary.
-- The netcode is new. Each machine moves its own player at once,
-  and the host makes the decisions for the game. Refer to
-  [port/linux/NETCODE.md](port/linux/NETCODE.md).
+       python3 configure.py --release
+       ninja xbox
 
-## Build the game
+   The program is `build/xbox/halo/bin/default.xbe`.
 
-You do not need the Xbox SDK. The port supplies the SDK declarations that
-the game uses. Refer to [port/include/xdk](port/include/xdk/README.md).
+5. Run it in xemu (the maps in `xemu.local.toml`'s `[game]` are packed
+   beside it):
 
-To build the game:
+       python3 tools/xbox_dev.py run build/xbox/halo
 
-1. Install Python and [ninja](https://ninja-build.org/).
-2. Install the tools for your platform. Refer to the README for the
-   platform.
-3. In the root folder of the repository, enter `python configure.py`.
-4. Enter `ninja` with the target for the platform:
+Windows (WSL) setup, the test tools (two-Xbox system link, profiling,
+screenshots) and the platform layer are described in
+[`port/xbox/README.md`](https://github.com/vsod99/halo-ce-universal/blob/xbox-backport/port/xbox/README.md).
 
-| Target | Result |
-| --- | --- |
-| `ninja linux` | `build/linux/halo` |
-| `ninja windows` (on Windows) | `build/windows/halo.exe` and `SDL3.dll` |
-| `ninja android_apk` | `port/android/app/build/outputs/apk/debug/app-debug.apk` |
+GitHub Actions also builds the Xbox on every push to `xbox-backport`. The
+`halo-xbox-release` and `halo-xbox-debug` artifacts are on the branch's
+[workflow runs](https://github.com/vsod99/halo-ce-universal/actions?query=branch%3Axbox-backport).
 
-If you enter `ninja` without a target, ninja builds the game for the
-computer that you use.
+### On a console
 
-`tools/ci_build.py` makes the same builds as GitHub Actions. For example,
-enter `python tools/ci_build.py linux release`.
+Copy `default.xbe` and `brokers.txt` (internet play's brokers) to a folder
+on the hard disk, for example by FTP to `E:\Apps\OpenCE`, and start it from
+your dashboard. Put the Halo disc in the drive, or a `maps` folder beside
+the XBE. For Custom Edition maps, add a `custom_maps` folder beside it, with
+their `bitmaps.map`, `sounds.map` and `loc.map`.
 
-### Build options
+## Credits
 
-Give these options to `configure.py`:
+OpenCE and the decompilation it builds on: see
+[OpenCE](https://github.com/OpenCommunityEdition/OpenCE), which started from
+[bnunu/halo-1](https://github.com/bnunu/halo-1), a fork of
+[punpckhdq/halo](https://github.com/punpckhdq/halo). The Xbox build uses
+[nxdk](https://github.com/XboxDev/nxdk), lwIP and pbkit, and is tested in
+[xemu](https://xemu.app).
 
-| Option | Result |
-| --- | --- |
-| (none) | A debug build. A failed assertion stops the game. |
-| `--release` | A release build. The game does not examine assertions, as in the retail game. |
-| `--portable` | The Linux and Windows builds operate on all x86-64 processors. Use this option for builds that you give to other persons. |
-| `--lto=thin`, `--lto=off` | Less link-time optimization. The link is faster. |
-| `--pgo=off` | No profile-guided optimization. |
-| `--pgo=train` | Records a new optimization profile. Refer to "Optimization profiles". |
-
-Without `--portable`, the Linux and Windows builds use all the instructions
-of the processor that builds them (`-march=native`). Such a build does not
-always start on a different computer.
-
-### Optimization profiles
-
-The builds use profiles of the game to optimize the code:
-
-- `pgo/halo_linux.profdata` for Linux and Android.
-- `pgo/halo_windows.profdata` for Windows.
-
-The profiles need clang 22 or later. With an older clang, the builds do not
-use the profiles.
-
-To record a new profile:
-
-1. Delete the profile.
-2. Enter `python configure.py --pgo=train`.
-3. Enter `ninja linux` or `ninja windows`.
-
-The build then plays the main menu and the first minute of each campaign
-level. This procedure continues for approximately 15 minutes. The game
-data must be in `assets/`.
+The repository is CC0, as OpenCE's is. Halo is Microsoft's: this project
+contains none of the game's data.
