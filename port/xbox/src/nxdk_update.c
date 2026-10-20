@@ -61,7 +61,9 @@ its clock, and its connection over lwIP's sockets.
 #define HALO_BUILD_FLAVOR "release"
 #endif
 
-#define UPDATE_REPOSITORY "OpenCommunityEdition/OpenCE"
+/* the releases the Xbox build updates from: this fork's, which publishes the
+Xbox's zips (OpenCE's own have none) */
+#define UPDATE_REPOSITORY "vsod99/OpenCE-for-Xbox"
 #define UPDATE_ASSET "halo-xbox-" HALO_BUILD_FLAVOR ".zip"
 #define UPDATE_FOLDER "D:\\"
 #define UPDATE_DIRECTORY UPDATE_FOLDER "update.partial"

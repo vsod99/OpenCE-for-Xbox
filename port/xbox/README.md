@@ -247,7 +247,9 @@ program over the network.
 A build GitHub Actions made of the main branch updates itself as the
 desktop builds do (`port/linux/README.md`, "Updates";
 `src/nxdk_update.c`). Once the console has an address, a thread asks
-GitHub for the latest release; if it is newer, the game asks at the main
+GitHub for the latest release of
+[vsod99/OpenCE-for-Xbox](https://github.com/vsod99/OpenCE-for-Xbox) (OpenCE's
+own releases have no Xbox zips); if it is newer, the game asks at the main
 menu on pbkit's text screen, the game's last frame waiting behind it: A
 updates, B carries on (asked again at the next start), Y stops the
 questions (`update.auto = false`; CHECK FOR UPDATES in Network Setup turns
