@@ -211,6 +211,7 @@ static struct
 		int used;
 	} newer[MAXIMUM_GAMES];
 } lobby;
+HALO_PORT_SPARSE(lobby);
 
 static int elapsed(unsigned long since, unsigned long time)
 {

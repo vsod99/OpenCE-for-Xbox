@@ -4000,6 +4000,7 @@ static struct
 	struct p2p_listing password_game;
 	boolean password_joined;
 } lobby_browser;
+HALO_PORT_SPARSE(lobby_browser);
 
 /* the row of the browser's chosen game, NONE if it is not on the rows */
 static short browser_chosen_row(void)

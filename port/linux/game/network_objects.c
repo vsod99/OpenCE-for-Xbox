@@ -352,6 +352,7 @@ static struct
 	long ammunition_time;
 	long carried_time;
 } objects_host_inventories[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(objects_host_inventories);
 /* ... each client machine, found once a tick: where its players' living
 units are, those units, and the vehicles they drive (with the player's
 absolute index); and where every player's living unit is, for a machine
@@ -422,6 +423,7 @@ static struct
 	long object_index;
 	long time;
 } objects_client_dead[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(objects_client_dead);
 /* ... where the host last had each unsteered vehicle, and when, and for
 how many ticks that step may be carried (distributed_client_note_unsteered_path) */
 static struct
@@ -431,6 +433,7 @@ static struct
 	long coast_ticks;
 	real_point3d position;
 } objects_client_unsteered_path[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(objects_client_unsteered_path);
 /* ... its own objects made since the last tick (of any kind: those of the
 kinds the host has go), and whether to look through all the objects
 instead (the host's all told, too many made, or made where it cannot say) */
@@ -972,6 +975,7 @@ static struct
 	byte number[NUMBER_OF_UNIT_DAMAGE_ANIMATIONS];
 	long time[NUMBER_OF_UNIT_DAMAGE_ANIMATIONS];
 } client_damage_animations[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(client_damage_animations);
 
 /* whether the animation is one of the unit's graph */
 static boolean distributed_unit_has_animation(

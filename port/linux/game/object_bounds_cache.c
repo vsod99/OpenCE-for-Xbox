@@ -23,6 +23,7 @@ struct object_bounds
 };
 
 static struct object_bounds object_bounds[MAXIMUM_OBJECTS_PER_MAP];
+HALO_PORT_SPARSE(object_bounds);
 static long object_bounds_epoch = 1;
 
 void object_bounds_cache_update(

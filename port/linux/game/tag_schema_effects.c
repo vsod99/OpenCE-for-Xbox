@@ -2800,6 +2800,7 @@ static struct
 	long seen_count;
 	struct widget_walk_frame frames[MAXIMUM_WIDGET_DEPTH + 1];
 } widget_walk;
+HALO_PORT_SPARSE(widget_walk);
 
 /* a widget's reference_index-th reference to a widget loaded with it, or
 NULL past them */

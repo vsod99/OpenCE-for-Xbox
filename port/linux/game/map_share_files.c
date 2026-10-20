@@ -164,6 +164,7 @@ struct map_share_files_globals
 /* ---------- globals */
 
 static struct map_share_files_globals map_share_files_globals;
+HALO_PORT_SPARSE(map_share_files_globals);
 
 /* ---------- names */
 

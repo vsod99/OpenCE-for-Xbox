@@ -158,4 +158,24 @@ with eight times the enemies asked for 464 in a frame. Each group is 160
 bytes */
 #define HALO_PORT_MAXIMUM_TRANSPARENT_GEOMETRY_GROUPS 2048 /* (384) */
 
+/* ---------- sparse static arrays
+
+The platform layer's largest static arrays are sized for the largest games
+too, and most of their pages hold only zeros. HALO_PORT_SPARSE(name), after
+a file's static array, lets the original Xbox port give those pages back
+and back them again only once written (port/xbox/src/nxdk_memory.c); it
+does nothing in the other builds. Never for an array a device writes to. */
+
+#ifdef HALO_XBOX
+void xbox_sparse_register(void *address, unsigned long size);
+#define HALO_PORT_SPARSE(name) \
+	static void __attribute__((constructor)) name##_sparse(void) \
+	{ \
+		xbox_sparse_register((void *)&(name), sizeof(name)); \
+	} \
+	extern int halo_port_sparse_declared
+#else
+#define HALO_PORT_SPARSE(name) extern int halo_port_sparse_declared
+#endif
+
 #endif /* __HALO_PORT_CAPACITY_H */

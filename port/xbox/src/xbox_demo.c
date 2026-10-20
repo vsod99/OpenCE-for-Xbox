@@ -129,6 +129,7 @@ static struct
 } demo;
 
 static struct demo_reading readings[MAXIMUM_READINGS];
+HALO_PORT_SPARSE(readings);
 
 /* the game time of a level being played, else -1 */
 static long game_time_or_none(void)

@@ -746,6 +746,7 @@ static struct
 /* the unreliable messages of this tick, a batch for each machine and one
 for the host */
 static struct distributed_batch distributed_batches[MAXIMUM_SENDERS];
+HALO_PORT_SPARSE(distributed_batches);
 /* (the largest messages, packed a machine at a time) */
 static struct distributed_packer distributed_packer;
 

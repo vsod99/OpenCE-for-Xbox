@@ -247,16 +247,31 @@ int close(int descriptor)
 	return CloseHandle(handle) ? 0 : fail();
 }
 
+/* (nxdk_memory.c) */
+int xbox_sparse_overlaps(const void *address, unsigned long size);
+long xbox_sparse_read_through(void *destination, unsigned long size,
+	long (*read)(void *context, void *buffer, unsigned long size), void *context);
+
+static long read_handle(void *context, void *buffer, unsigned long count)
+{
+	DWORD transferred;
+
+	if (!ReadFile((HANDLE)context, buffer, (DWORD)count, &transferred, NULL))
+		return GetLastError() == ERROR_HANDLE_EOF ? 0 : fail();
+	return (long)transferred;
+}
+
 ssize_t read(int descriptor, void *buffer, size_t count)
 {
 	HANDLE handle = descriptor_handle(descriptor);
-	DWORD transferred;
 
 	if (!handle)
 		return -1;
-	if (!ReadFile(handle, buffer, (DWORD)count, &transferred, NULL))
-		return GetLastError() == ERROR_HANDLE_EOF ? 0 : fail();
-	return (ssize_t)transferred;
+	/* (the disk is not let write into memory backed as it is written:
+	nxdk_memory.c) */
+	if (xbox_sparse_overlaps(buffer, (unsigned long)count))
+		return xbox_sparse_read_through(buffer, (unsigned long)count, read_handle, handle);
+	return read_handle(handle, buffer, (unsigned long)count);
 }
 
 ssize_t write(int descriptor, const void *buffer, size_t count)
@@ -304,8 +319,31 @@ static ssize_t positioned_transfer(int descriptor, void *buffer, size_t count, o
 	return (ssize_t)status.Information;
 }
 
+struct positioned_read
+{
+	int descriptor;
+	off_t offset;
+};
+
+static long positioned_read(void *context, void *buffer, unsigned long count)
+{
+	struct positioned_read *read = context;
+	ssize_t got = positioned_transfer(read->descriptor, buffer, count, read->offset, FALSE);
+
+	if (got > 0)
+		read->offset += got;
+	return (long)got;
+}
+
 ssize_t pread(int descriptor, void *buffer, size_t count, off_t offset)
 {
+	/* (as read's) */
+	if (xbox_sparse_overlaps(buffer, (unsigned long)count))
+	{
+		struct positioned_read read = { descriptor, offset };
+
+		return xbox_sparse_read_through(buffer, (unsigned long)count, positioned_read, &read);
+	}
 	return positioned_transfer(descriptor, buffer, count, offset, FALSE);
 }
 

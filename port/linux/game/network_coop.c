@@ -978,6 +978,7 @@ static struct
 	real position;
 	real power;
 } host_sent_devices[MAXIMUM_OBJECTS_PER_MAP];
+HALO_PORT_SPARSE(host_sent_devices);
 
 /* host: the structure BSP each client player's machine last said it has,
 NONE before its first input */
@@ -1056,6 +1057,7 @@ static struct
 	real_point3d position;
 	real_vector3d forward;
 } host_sent_transforms[MAXIMUM_OBJECTS_PER_MAP];
+HALO_PORT_SPARSE(host_sent_transforms);
 
 /* host, each tick: the scenery and machines that moved (and, every
 OBJECT_REFRESH_TICKS, all that ever have) */
@@ -1120,6 +1122,7 @@ static struct
 	byte region_permutations[MAXIMUM_REGIONS_PER_OBJECT];
 	real scale;
 } host_sent_looks[MAXIMUM_OBJECTS_PER_MAP];
+HALO_PORT_SPARSE(host_sent_looks);
 
 /* host, each tick: the objects whose looks changed (and, every
 OBJECT_REFRESH_TICKS, all whose looks ever have) */

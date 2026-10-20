@@ -153,6 +153,7 @@ struct custom_edition_maps_globals
 /* ---------- globals */
 
 static struct custom_edition_maps_globals custom_edition_maps_globals;
+HALO_PORT_SPARSE(custom_edition_maps_globals);
 
 /* Halo PC's own multiplayer maps (not on the Xbox), with their menu names
 from ui.map's mp_map_list. They are listed as VANILLA. */

@@ -43,6 +43,11 @@ unsigned long xbox_contiguous_largest_kb(void);
 void xbox_memory_report(const char *when);
 /* between frames: the game state's stock of pages, its zeroed pages taken back (nxdk_memory.c) */
 void xbox_game_state_frame(unsigned long frame);
+/* memory backed as it is written: whether a buffer meets it, and a file's
+bytes read into it through a buffer of their own (nxdk_memory.c) */
+int xbox_sparse_overlaps(const void *address, unsigned long size);
+long xbox_sparse_read_through(void *destination, unsigned long size,
+	long (*read)(void *context, void *buffer, unsigned long size), void *context);
 /* maps Halo Custom Edition's tag cache window, 0x40440000, onto the Xbox
 tag cache's pages, when there are Custom Edition maps
 (cache/physical_memory_map.c; nxdk_memory.c) */

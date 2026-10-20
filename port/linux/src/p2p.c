@@ -438,10 +438,12 @@ static struct
 	struct p2p_candidate upnp_candidate;
 	unsigned long upnp_time;
 } p2p = { 0, 0, -1, 0, -1, .hosting_socket = -1 };
+HALO_PORT_SPARSE(p2p);
 
 /* the proxy (its index + 1) with each local port (all of theirs are on
 p2p.local_address) */
 static unsigned short proxy_by_port[65536];
+HALO_PORT_SPARSE(proxy_by_port);
 
 static unsigned char identifier[P2P_IDENTIFIER_SIZE];
 /* this run's X25519 keys, which the identifier comes from: from an Ed25519

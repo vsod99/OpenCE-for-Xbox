@@ -386,6 +386,7 @@ static struct
 		long object_index;
 	} explosions[MAXIMUM_EXPLOSIONS_PER_TICK];
 } damage_explosions[MAXIMUM_TRACKED_PLAYERS];
+HALO_PORT_SPARSE(damage_explosions);
 /* ... where each player's unit and vehicle were at each of the last ticks
 (and whether they drove it) */
 static struct damage_history_tick
@@ -399,6 +400,7 @@ static struct damage_history_tick
 		boolean driving;
 	} objects[MAXIMUM_TRACKED_PLAYERS][2];
 } damage_history[TARGET_HISTORY_TICKS];
+HALO_PORT_SPARSE(damage_history);
 /* ... and where each player's living unit was every few ticks, longer (NONE
 for no time: none), how fast it or its vehicle went, and the size of the
 vehicle it rode */
@@ -409,6 +411,7 @@ static struct damage_trail_point
 	real speed;
 	real radius;
 } damage_trails[MAXIMUM_TRACKED_PLAYERS][PLAYER_TRAIL_POINTS];
+HALO_PORT_SPARSE(damage_trails);
 /* ... what each weapon or grenade deals, as the tags have it (their walk
 is long): the hits a second of a damage effect from it, how it deals it
 (the _damage_source flags), and how far from its firer */

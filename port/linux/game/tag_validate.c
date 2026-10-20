@@ -215,6 +215,7 @@ static struct
 /* a bit for each byte of the tag cache that a tag's root, block or data
 holds */
 static unsigned long tag_validate_claims[CLAIM_WORDS];
+HALO_PORT_SPARSE(tag_validate_claims);
 
 static char const tag_validate_empty_name[] = "";
 

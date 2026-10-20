@@ -229,6 +229,7 @@ struct client_actor
 /* ---------- globals */
 
 static struct host_actor host_actors[MAXIMUM_NETWORK_ACTORS];
+HALO_PORT_SPARSE(host_actors);
 static short host_actor_count;
 /* host: the numbers of every unit's impulses, speech and animations, from
 one counter, so a unit that drops out of the table and comes back can't
@@ -236,6 +237,7 @@ repeat the number a client last played */
 static byte host_event_number;
 
 static struct client_actor client_actors[MAXIMUM_NETWORK_ACTORS];
+HALO_PORT_SPARSE(client_actors);
 static short client_actor_count;
 
 /* ---------- private code */

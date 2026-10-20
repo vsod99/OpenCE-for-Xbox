@@ -378,6 +378,7 @@ static struct
 	/* the server browser's probes (p2p_signal_probe) */
 	struct probe probes[P2P_MAXIMUM_PROBES];
 } signalling;
+HALO_PORT_SPARSE(signalling);
 
 static int elapsed(unsigned long since, unsigned long time)
 {

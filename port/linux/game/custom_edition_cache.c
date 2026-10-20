@@ -104,6 +104,7 @@ struct custom_edition_cache_globals
 /* ---------- globals */
 
 static struct custom_edition_cache_globals custom_edition_cache_globals;
+HALO_PORT_SPARSE(custom_edition_cache_globals);
 
 /* ---------- private code */
 

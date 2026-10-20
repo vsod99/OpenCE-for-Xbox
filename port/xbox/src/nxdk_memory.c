@@ -18,6 +18,7 @@ virtual memory at a fixed address instead of at physical 0x1A00000
 
 #include <xboxkrnl/xboxkrnl.h>
 #include <windows.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nxdk_platform.h"
@@ -422,44 +423,68 @@ void *halo_custom_edition_tag_cache(void)
 	return custom_edition_tag_cache;
 }
 
-/* ---------- the game state, backed as it is written
+/* ---------- memory backed as it is written
 
 The game state's pools are sized for the largest games the native builds
 play, and every machine in a game must have the same sizes
 (halo_port_capacity.h), but a game uses a small part of them: in a
-sixteen-player Blood Gulch, 0.9 MB of 17.7 MB held anything. So its
-addresses are reserved, each of its pages is at first the one page of
+sixteen-player Blood Gulch, 0.9 MB of 17.7 MB held anything. The platform
+layer's largest static arrays are sized the same way (HALO_PORT_SPARSE). So
+these ranges are sparse: each of their pages is at first the one page of
 zeros, read only, and a page is given memory of its own when it is first
-written: every program here runs in the processor's most privileged mode,
+written. Every program here runs in the processor's most privileged mode,
 and the page fault is looked at here before the kernel's handler has it.
 The faults take pages from a stock refilled between frames (the kernel's
 allocator is called from the fault only when the stock is out). Pages that
 hold only zeros again, as each map's pools are emptied, go back to the page
-of zeros between frames (xbox_game_state_frame). */
+of zeros between frames (xbox_game_state_frame).
+
+A device writing to a sparse page that was never written would write the
+page of zeros itself, which every unwritten page reads: files are read into
+sparse ranges through a buffer of their own (xbox_sparse_read_through), and
+no static array a device writes to is made sparse. */
 #define GAME_STATE_ON_DEMAND 1
 #define GAME_STATE_MAXIMUM_PAGES (0x02000000UL / PAGE_BYTES)
+#define SPARSE_MAXIMUM_RANGES 64
 #define STOCK_TARGET_PAGES 256
 #define STOCK_MAXIMUM_PAGES 1024
 #define CR0_WRITE_PROTECT 0x00010000UL
 #define PAGE_FAULT_VECTOR 14
 
-static struct
+struct sparse_range
 {
 	unsigned long base, end;
+	/* each page's own memory (from MmAllocateSystemMemory), or NULL */
+	void **pages;
+};
+
+static struct
+{
 	/* an unwritten page's page table entry: the page of zeros, read only
 	(or, without the processor's write protection, not present) */
 	unsigned long zero_entry;
-	/* each page's own memory (from MmAllocateSystemMemory), or NULL */
-	void *pages[GAME_STATE_MAXIMUM_PAGES];
+	/* the game state's, then the static arrays' */
+	struct sparse_range ranges[SPARSE_MAXIMUM_RANGES];
+	unsigned long range_count;
+	/* the static arrays named before the game state is made
+	(xbox_sparse_register: constructors) */
+	struct
+	{
+		void *address;
+		unsigned long size;
+	} statics[SPARSE_MAXIMUM_RANGES];
+	unsigned long static_count;
 	void *stock[STOCK_MAXIMUM_PAGES];
 	unsigned long stock_count;
 	unsigned long backed, most_backed, faults, faults_unstocked, reclaimed;
 } demand;
 
+static void *game_state_pages[GAME_STATE_MAXIMUM_PAGES];
+
 /* (the kernel's page fault handler: the entry below goes on to it) */
 unsigned long xbox_page_fault_original;
 void xbox_page_fault_entry(void);
-int xbox_game_state_fault(unsigned long address, unsigned long error);
+int xbox_sparse_fault(unsigned long address, unsigned long error);
 
 /* the page fault: the processor has pushed the error code, then the
 fault's flags, code segment and address to return to */
@@ -473,7 +498,7 @@ __asm__(
 	"\tmovl %cr2, %eax\n"
 	"\tpushl %ecx\n"
 	"\tpushl %eax\n"
-	"\tcall _xbox_game_state_fault\n"
+	"\tcall _xbox_sparse_fault\n"
 	"\taddl $8, %esp\n"
 	"\ttestl %eax, %eax\n"
 	"\tpopal\n"
@@ -522,17 +547,30 @@ static BOOL page_is_zero(const void *page)
 	return TRUE;
 }
 
-__attribute__((used)) int xbox_game_state_fault(unsigned long address, unsigned long error)
+static struct sparse_range *sparse_range_find(unsigned long address)
+{
+	unsigned long index;
+
+	for (index = 0; index < demand.range_count; index++)
+	{
+		if (address >= demand.ranges[index].base && address < demand.ranges[index].end)
+			return &demand.ranges[index];
+	}
+	return NULL;
+}
+
+__attribute__((used)) int xbox_sparse_fault(unsigned long address, unsigned long error)
 {
 	unsigned long page = address & ~(PAGE_BYTES - 1);
+	struct sparse_range *range = sparse_range_find(address);
 	unsigned long index;
 	void *memory;
 
 	(void)error;
-	if (address < demand.base || address >= demand.end)
+	if (!range)
 		return 0;
-	index = (page - demand.base) / PAGE_BYTES;
-	if (demand.pages[index])
+	index = (page - range->base) / PAGE_BYTES;
+	if (range->pages[index])
 	{
 		/* (backed already: the processor still had the old entry) */
 		page_invalidate(page);
@@ -550,7 +588,7 @@ __attribute__((used)) int xbox_game_state_fault(unsigned long address, unsigned 
 			return 0;
 	}
 	page_zero(memory);
-	demand.pages[index] = memory;
+	range->pages[index] = memory;
 	*page_table_entry(page) = ((unsigned long)MmGetPhysicalAddress(memory) & PAGE_FRAME) |
 		PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
 	page_invalidate(page);
@@ -577,36 +615,41 @@ static void stock_refill(void)
 
 /* pages holding only zeros back to the page of zeros, and the stock kept
 at its size */
-static void game_state_reclaim(void)
+static void sparse_reclaim(void)
 {
-	unsigned long index;
+	unsigned long range_index, index;
 
-	for (index = 0; index < (demand.end - demand.base) / PAGE_BYTES; index++)
+	for (range_index = 0; range_index < demand.range_count; range_index++)
 	{
-		void *memory = demand.pages[index], *release = NULL;
-		unsigned long flags;
+		struct sparse_range *range = &demand.ranges[range_index];
 
-		if (!memory || !page_is_zero(memory))
-			continue;
-		/* (looked at again with nothing else running, then taken away) */
-		flags = interrupts_disable();
-		if (page_is_zero(memory))
+		for (index = 0; index < (range->end - range->base) / PAGE_BYTES; index++)
 		{
-			unsigned long page = demand.base + index * PAGE_BYTES;
+			void *memory = range->pages[index], *release = NULL;
+			unsigned long flags;
 
-			*page_table_entry(page) = demand.zero_entry;
-			page_invalidate(page);
-			demand.pages[index] = NULL;
-			demand.backed--;
-			demand.reclaimed++;
-			if (demand.stock_count < STOCK_MAXIMUM_PAGES)
-				demand.stock[demand.stock_count++] = memory;
-			else
-				release = memory;
+			if (!memory || !page_is_zero(memory))
+				continue;
+			/* (looked at again with nothing else running, then taken away) */
+			flags = interrupts_disable();
+			if (page_is_zero(memory))
+			{
+				unsigned long page = range->base + index * PAGE_BYTES;
+
+				*page_table_entry(page) = demand.zero_entry;
+				page_invalidate(page);
+				range->pages[index] = NULL;
+				demand.backed--;
+				demand.reclaimed++;
+				if (demand.stock_count < STOCK_MAXIMUM_PAGES)
+					demand.stock[demand.stock_count++] = memory;
+				else
+					release = memory;
+			}
+			interrupts_restore(flags);
+			if (release)
+				MmFreeSystemMemory(release, PAGE_BYTES);
 		}
-		interrupts_restore(flags);
-		if (release)
-			MmFreeSystemMemory(release, PAGE_BYTES);
 	}
 	while (demand.stock_count > STOCK_TARGET_PAGES)
 	{
@@ -619,14 +662,119 @@ static void game_state_reclaim(void)
 	}
 }
 
+/* page tables for the 4 MB steps of [first, end) the kernel has none for */
+static BOOL page_tables_make(unsigned long first, unsigned long end)
+{
+	unsigned long page_tables = (end - first) / PAGE_TABLE_SPAN;
+	unsigned char *tables = MmAllocateContiguousMemoryEx(page_tables * PAGE_BYTES, 0, 0xFFFFFFFF, PAGE_BYTES,
+		PAGE_READWRITE);
+	unsigned long index;
+
+	if (!tables)
+		return FALSE;
+	memset(tables, 0, page_tables * PAGE_BYTES);
+	for (index = 0; index < page_tables; index++)
+	{
+		*page_directory_entry(first + index * PAGE_TABLE_SPAN) =
+			((unsigned long)MmGetPhysicalAddress(tables + index * PAGE_BYTES) & PAGE_FRAME) |
+			PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED;
+	}
+	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
+	return TRUE;
+}
+
+/* the page fault's gate in the interrupt descriptor table, written with
+the write protection off (the table may be in a read-only page) */
+static void page_fault_hook(void)
+{
+	unsigned char descriptor[8];
+	unsigned short *gate;
+	unsigned long cr0, flags;
+
+	__asm__ __volatile__("sidt %0" : "=m"(*(unsigned char (*)[6])(descriptor + 2)));
+	gate = (unsigned short *)(*(unsigned long *)(descriptor + 4) + PAGE_FAULT_VECTOR * 8);
+	flags = interrupts_disable();
+	__asm__ __volatile__("movl %%cr0, %0" : "=r"(cr0));
+	xbox_page_fault_original = gate[0] | ((unsigned long)gate[3] << 16);
+	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0 & ~CR0_WRITE_PROTECT) : "memory");
+	gate[0] = (unsigned short)((unsigned long)xbox_page_fault_entry & 0xFFFF);
+	gate[3] = (unsigned short)((unsigned long)xbox_page_fault_entry >> 16);
+	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0) : "memory");
+	interrupts_restore(flags);
+}
+
+/* a static array of the platform layer's (HALO_PORT_SPARSE, from a
+constructor: before main) */
+void xbox_sparse_register(void *address, unsigned long size)
+{
+	if (demand.static_count < SPARSE_MAXIMUM_RANGES - 1)
+	{
+		demand.statics[demand.static_count].address = address;
+		demand.statics[demand.static_count].size = size;
+		demand.static_count++;
+	}
+}
+
+/* the static arrays' whole pages that hold only zeros given back to the
+kernel, and made sparse */
+static void sparse_statics_start(void)
+{
+	unsigned long index, given = 0, kept = 0;
+
+	for (index = 0; index < demand.static_count && demand.range_count < SPARSE_MAXIMUM_RANGES; index++)
+	{
+		unsigned long first = ((unsigned long)demand.statics[index].address + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
+		unsigned long end = ((unsigned long)demand.statics[index].address + demand.statics[index].size) &
+			~(PAGE_BYTES - 1);
+		struct sparse_range *range;
+		unsigned long page;
+
+		if (end <= first)
+			continue;
+		range = &demand.ranges[demand.range_count];
+		range->pages = calloc((end - first) / PAGE_BYTES, sizeof(void *));
+		if (!range->pages)
+			continue;
+		range->base = first;
+		range->end = end;
+		/* (pages not given back stay the program's: never faulted, never
+		taken back) */
+		for (page = first; page < end; page += PAGE_BYTES)
+		{
+			PVOID base = (PVOID)page;
+			SIZE_T region_size = PAGE_BYTES;
+			unsigned long flags;
+
+			if (!page_is_zero((void *)page))
+			{
+				kept++;
+				continue;
+			}
+			flags = interrupts_disable();
+			if (page_is_zero((void *)page) &&
+				NT_SUCCESS(NtFreeVirtualMemory(&base, &region_size, MEM_DECOMMIT)))
+			{
+				*page_table_entry(page) = demand.zero_entry;
+				page_invalidate(page);
+				given++;
+			}
+			else
+			{
+				kept++;
+			}
+			interrupts_restore(flags);
+		}
+		demand.range_count++;
+	}
+	platform_log("memory: %lu static arrays sparse, %lu KB given back, %lu KB kept", demand.static_count, given * 4,
+		kept * 4);
+}
+
 static BOOL game_state_on_demand_start(unsigned long address, unsigned long size)
 {
 	unsigned long first = address & ~(PAGE_TABLE_SPAN - 1);
 	unsigned long end = (address + size + PAGE_TABLE_SPAN - 1) & ~(PAGE_TABLE_SPAN - 1);
-	unsigned long page_tables = (end - first) / PAGE_TABLE_SPAN;
-	unsigned char *tables;
-	unsigned long index, cr0, idt[2], flags;
-	unsigned short *gate;
+	unsigned long index, cr0;
 	PVOID base = (PVOID)first;
 	SIZE_T region_size = end - first;
 
@@ -638,50 +786,34 @@ static BOOL game_state_on_demand_start(unsigned long address, unsigned long size
 		platform_log("the game state: cannot reserve %08lx-%08lx", first, end);
 		return FALSE;
 	}
-	tables = MmAllocateContiguousMemoryEx(page_tables * PAGE_BYTES, 0, 0xFFFFFFFF, PAGE_BYTES, PAGE_READWRITE);
-	if (!tables)
-		return FALSE;
 	__asm__ __volatile__("movl %%cr0, %0" : "=r"(cr0));
 	if (cr0 & CR0_WRITE_PROTECT)
 	{
 		void *zero = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
 
 		if (!zero)
-		{
-			MmFreeContiguousMemory(tables);
 			return FALSE;
-		}
 		page_zero(zero);
 		demand.zero_entry = ((unsigned long)MmGetPhysicalAddress(zero) & PAGE_FRAME) | PAGE_PRESENT | PAGE_ACCESSED;
 	}
-	demand.base = address;
-	demand.end = address + size;
-	memset(tables, 0, page_tables * PAGE_BYTES);
-	for (index = 0; index < page_tables; index++)
-	{
-		*page_directory_entry(first + index * PAGE_TABLE_SPAN) =
-			((unsigned long)MmGetPhysicalAddress(tables + index * PAGE_BYTES) & PAGE_FRAME) |
-			PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED;
-	}
-	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
+	if (!page_tables_make(first, end))
+		return FALSE;
 	for (index = 0; index < size / PAGE_BYTES; index++)
 		*page_table_entry(address + index * PAGE_BYTES) = demand.zero_entry;
 	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
+	demand.ranges[0].base = address;
+	demand.ranges[0].end = address + size;
+	demand.ranges[0].pages = game_state_pages;
+	demand.range_count = 1;
 	stock_refill();
-	/* the page fault's gate in the interrupt descriptor table, written with
-	the write protection off (the table may be in a read-only page) */
-	__asm__ __volatile__("sidt %0" : "=m"(*(unsigned char (*)[6])((unsigned char *)idt + 2)));
-	gate = (unsigned short *)(idt[1] + PAGE_FAULT_VECTOR * 8);
-	flags = interrupts_disable();
-	xbox_page_fault_original = gate[0] | ((unsigned long)gate[3] << 16);
-	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0 & ~CR0_WRITE_PROTECT) : "memory");
-	gate[0] = (unsigned short)((unsigned long)xbox_page_fault_entry & 0xFFFF);
-	gate[3] = (unsigned short)((unsigned long)xbox_page_fault_entry >> 16);
-	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0) : "memory");
-	interrupts_restore(flags);
+	page_fault_hook();
 	platform_log("the game state: %lu KB at %08lx, backed as it is written (%s); the kernel's page fault handler at %08lx",
 		size / 1024, address, demand.zero_entry ? "unwritten pages read the page of zeros" : "unwritten pages not present",
 		xbox_page_fault_original);
+	/* (the static arrays only with the page of zeros: a page not present
+	would fault on every read) */
+	if (demand.zero_entry)
+		sparse_statics_start();
 	return TRUE;
 }
 
@@ -694,20 +826,79 @@ void *xbox_game_state_allocate(unsigned long address, unsigned long size)
 
 static BOOL game_state_on_demand_contains(const void *address)
 {
-	return demand.base && (unsigned long)address >= demand.base && (unsigned long)address < demand.end;
+	return demand.range_count && (unsigned long)address >= demand.ranges[0].base &&
+		(unsigned long)address < demand.ranges[0].end;
+}
+
+/* whether [address, address+size) meets a sparse range */
+int xbox_sparse_overlaps(const void *address, unsigned long size)
+{
+	unsigned long index;
+
+	for (index = 0; index < demand.range_count; index++)
+	{
+		if ((unsigned long)address < demand.ranges[index].end &&
+			(unsigned long)address + size > demand.ranges[index].base)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* a file's bytes read into a sparse range: through a buffer of their own,
+and only the pages not all zeros (or already backed) written */
+long xbox_sparse_read_through(void *destination, unsigned long size,
+	long (*read)(void *context, void *buffer, unsigned long size), void *context)
+{
+	enum { CHUNK = 64 * 1024 };
+	unsigned char *buffer = malloc(CHUNK);
+	unsigned long done = 0;
+
+	if (!buffer)
+		return -1;
+	while (done < size)
+	{
+		unsigned long want = size - done < CHUNK ? size - done : CHUNK;
+		long got = read(context, buffer, want);
+		unsigned long at = 0;
+
+		if (got < 0)
+		{
+			free(buffer);
+			return done ? (long)done : -1;
+		}
+		while (at < (unsigned long)got)
+		{
+			unsigned char *target = (unsigned char *)destination + done + at;
+			unsigned long run = PAGE_BYTES - ((unsigned long)target & (PAGE_BYTES - 1));
+			struct sparse_range *range = sparse_range_find((unsigned long)target);
+
+			if (run > (unsigned long)got - at)
+				run = (unsigned long)got - at;
+			/* (a whole page of zeros over a page never written: left as it is) */
+			if (!(run == PAGE_BYTES && range && !range->pages[((unsigned long)target - range->base) / PAGE_BYTES] &&
+				page_is_zero(buffer + at)))
+				memcpy(target, buffer + at, run);
+			at += run;
+		}
+		done += (unsigned long)got;
+		if ((unsigned long)got < want)
+			break;
+	}
+	free(buffer);
+	return (long)done;
 }
 
 /* between frames: the stock refilled, and now and then the zeroed pages
 taken back and the use logged */
 void xbox_game_state_frame(unsigned long frame)
 {
-	if (!demand.base)
+	if (!demand.range_count)
 		return;
 	stock_refill();
 	if (frame % 300 == 0)
 	{
-		game_state_reclaim();
-		platform_log("the game state: %lu KB backed, at most %lu KB; %lu faults, %lu without stock; %lu KB taken back",
+		sparse_reclaim();
+		platform_log("sparse memory: %lu KB backed, at most %lu KB; %lu faults, %lu without stock; %lu KB taken back",
 			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.reclaimed * 4);
 	}
 }
