@@ -23,6 +23,9 @@ typedef unsigned char byte;
 #define FLAG(b) (1<<(b))
 #define TEST_FLAG(flags, bit) (((flags)&(unsigned)FLAG(bit))!=0)
 #define match_assert(file, line, condition) ((void)0)
+/* the port's sparse arrays (halo_port_capacity.h): as the native builds' */
+#define HALO_PORT_SPARSE(name) extern int halo_port_sparse_declared
+#define HALO_PORT_SPARSE_ZERO(address, size) memset((address), 0, (size))
 typedef struct { real x, y, z; } real_point3d;
 typedef struct { real i, j, k; } real_vector3d;
 #define DATUM_INDEX_TO_ABSOLUTE_INDEX(index) ((index) & 0xFFFF)
