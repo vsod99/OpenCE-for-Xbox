@@ -37,6 +37,12 @@ MUSL_STDIO_DIR = Path("port/third_party/musl-stdio")
 PORT_CONFIG = PORT_DIR / "port.json"
 LOCAL_CONFIG = PORT_DIR / "xemu.local.toml"
 BUILD = Path("build/xbox")
+# the builds: the 128 MB console's (ninja xbox), and the 64 MB console's
+# (ninja xbox64, HALO_XBOX_64MB: its own memory layout, port/xbox/README.md)
+XBOX_VARIANTS = [
+    ("xbox", BUILD, [], "128"),
+    ("xbox64", Path("build/xbox64"), ["-DHALO_XBOX_64MB"], "64"),
+]
 DEFAULT_NXDK = Path("~/source/repos/nxdk")
 DEFAULT_LLVM_BIN = Path("/opt/homebrew/opt/llvm/bin")
 DEFAULT_LLD_BIN = Path("/opt/homebrew/opt/lld/bin")
@@ -166,9 +172,6 @@ def generate_xbox_build(n: Writer, sln: Any) -> None:
     linux_config = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
 
     tags_header = BUILD / "halo_msvc_tags.h"
-    obj_dir = BUILD / "obj"
-    exe = BUILD / "halo.exe"
-    xbe = BUILD / "halo" / "bin" / "default.xbe"
     prefix_header = PORT_DIR / "include" / "halo_xbox_prefix.h"
     nxdk_lib = nxdk / "lib"
 
@@ -212,204 +215,214 @@ def generate_xbox_build(n: Writer, sln: Any) -> None:
     # cxbe makes every section of the PE file a section the kernel loads:
     # the XBE is made from a copy without the debug information, which
     # halo.exe keeps for gdb; and cxbe's 64 MB limit cleared, or a 128 MB
-    # console gives the game 64 (tools/xbox_xbe.py)
+    # console gives the game 64 (tools/xbox_xbe.py), except in the 64 MB
+    # build
     n.rule(
         name="xbox_xbe",
         command=("$xbox_objcopy --strip-debug $in $out.exe && "
                  "$xbox_cxbe -OUT:$out -TITLE:Halo $out.exe > /dev/null && rm $out.exe && "
-                 "$python tools/xbox_xbe.py $out 128"),
+                 "$python tools/xbox_xbe.py $out $memory"),
         description="XBOX XBE $out",
     )
 
-    abi = " ".join(XBOX_ABI_FLAGS + (["-DHALO_RELEASE"] if getattr(sln, "port_release", False) else []))
-    # pdclib, after port/xbox/include's stand-ins for the headers it lacks;
-    # the game sees the Linux build's C runtime wrappers ahead of them (the
-    # MSVC names, which port/linux/src/msvc_*.c implement, as on Linux), and
-    # not nxdk's own MSVC additions (xboxrt/libc_extensions)
-    pdclib_includes = " ".join([
-        f"-I{PORT_DIR / 'include'}",
-        f"-isystem {_quote(nxdk_lib / 'pdclib' / 'include')}",
-        f"-I{_quote(nxdk_lib / 'pdclib' / 'platform' / 'xbox' / 'include')}",
-    ])
-    libc_includes = f"-I{LINUX_DIR / 'include'} {pdclib_includes}"
-    # the POSIX calls of the platform layer shared with Linux: the Xbox's own
-    # (port/xbox/include/posix) and those the Windows build implements with
-    # Windows calls nxdk also has (port/windows/include/posix)
-    posix_includes = f"-I{PORT_DIR / 'include' / 'posix'} -I{WINDOWS_DIR / 'include' / 'posix'}"
-    implicit = [*xdk_headers(), prefix_header, tags_header]
-    objects: List[Path] = []
+    for target, build, extra_defines, memory in XBOX_VARIANTS:
+        obj_dir = build / "obj"
+        exe = build / "halo.exe"
+        xbe = build / "halo" / "bin" / "default.xbe"
+        abi = " ".join(XBOX_ABI_FLAGS + extra_defines +
+                       (["-DHALO_RELEASE"] if getattr(sln, "port_release", False) else []))
+        # pdclib, after port/xbox/include's stand-ins for the headers it lacks;
+        # the game sees the Linux build's C runtime wrappers ahead of them (the
+        # MSVC names, which port/linux/src/msvc_*.c implement, as on Linux), and
+        # not nxdk's own MSVC additions (xboxrt/libc_extensions)
+        pdclib_includes = " ".join([
+            f"-I{PORT_DIR / 'include'}",
+            f"-isystem {_quote(nxdk_lib / 'pdclib' / 'include')}",
+            f"-I{_quote(nxdk_lib / 'pdclib' / 'platform' / 'xbox' / 'include')}",
+        ])
+        libc_includes = f"-I{LINUX_DIR / 'include'} {pdclib_includes}"
+        # the POSIX calls of the platform layer shared with Linux: the Xbox's own
+        # (port/xbox/include/posix) and those the Windows build implements with
+        # Windows calls nxdk also has (port/windows/include/posix)
+        posix_includes = f"-I{PORT_DIR / 'include' / 'posix'} -I{WINDOWS_DIR / 'include' / 'posix'}"
+        implicit = [*xdk_headers(), prefix_header, tags_header]
+        objects: List[Path] = []
 
-    def add_object(source: Path, cflags: str) -> None:
-        obj = obj_dir / source.with_suffix(".o")
-        objects.append(obj)
-        n.build(outputs=obj, rule="xbox_cc", inputs=inline_export_wrapper(source, BUILD),
-                implicit=[*implicit, source], variables={"cflags": cflags})
-
-    game_cflags = " ".join([
-        abi, " ".join(GAME_FLAGS),
-        f"-include {prefix_header}", f"-include {tags_header}",
-        # the headers of the port's own game units (port/linux/game), for the
-        # game sources that call them
-        f"-iquote {Path(linux_config['game_sources'])}",
-        game_defines_and_includes(linux_config), libc_includes, f"-I{XDK_INCLUDE}",
-    ])
-    game_objects_start = len(objects)
-    for source in game_sources(linux_config):
-        add_object(source, game_cflags)
-    for source in sorted(Path(linux_config["game_sources"]).glob("*.c")):
-        add_object(source, game_cflags)
-    add_object(STB_VORBIS_SOURCE, game_cflags)
-    game_objects = objects[game_objects_start:]
-
-    platform_cflags = " ".join([
-        abi, " ".join(PLATFORM_FLAGS),
-        f"-include {prefix_header}", posix_includes,
-        f"-I{PORT_DIR / 'src'}", f"-I{LINUX_DIR / 'src'}", "-Iport/include",
-        f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{ZLIB_DIR}", f"-I{KCP_DIR}", f"-I{MONOCYPHER_DIR}",
-        "-Isource -Isource/cseries",
-        libc_includes, f"-I{XDK_INCLUDE}",
-        # (expat linked in, not a DLL's: called directly, not through
-        # __imp_ pointers, which lld's -opt:ref does not count as uses)
-        "-DXML_STATIC",
-        # pbkit's NV2A method names (nv_regs.h) for the Direct3D device
-        # (d3d8_nv2a.c), searched last
-        f"-idirafter {_quote(nxdk_lib / 'pbkit')}",
-    ])
-    # nxdk-cc's own flags (nxdk/bin/nxdk-cc)
-    nxdk_cflags = " ".join([
-        abi, "-std=gnu11", "-Wall", "-ffreestanding", "-fno-builtin", posix_includes,
-        f"-I{PORT_DIR / 'src'}", f"-I{PORT_DIR / 'common'}", f"-I{LINUX_DIR / 'src'}", f"-I{PORT_DIR / 'include'}",
-        f"-I{_quote(nxdk_lib)}", f"-I{_quote(nxdk_lib / 'xboxrt' / 'libc_extensions')}",
-        f"-isystem {_quote(nxdk_lib / 'pdclib' / 'include')}",
-        f"-I{_quote(nxdk_lib / 'pdclib' / 'platform' / 'xbox' / 'include')}",
-        f"-I{_quote(nxdk_lib / 'winapi')}", f"-I{_quote(nxdk_lib / 'xboxrt' / 'vcruntime')}",
-        "-U__STDC_NO_THREADS__",
-        # nxdk's USB host stack (nxdk_gamepads.c; nxdk/lib/usb/Makefile)
-        f"-I{_quote(nxdk_lib / 'usb' / 'libusbohci' / 'inc')}", f"-I{_quote(nxdk_lib / 'usb' / 'libusbohci_xbox')}",
-        "'-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\"'",
-    ])
-    for source in config.get("platform_sources", []):
-        add_object(Path(source), platform_cflags)
-    # lwIP, with the Xbox build's options ahead of nxdk's
-    # (port/xbox/src/lwip_config/lwipopts.h: the loopback interface), and
-    # nxdk's Ethernet driver for it: built here, not nxdk's libnxdk_net.lib
-    lwip_cflags = " ".join([
-        nxdk_cflags, f"-I{PORT_DIR / 'src' / 'lwip_config'}",
-        f"-I{_quote(nxdk_lib / 'net' / 'lwip' / 'src' / 'include')}",
-        f"-I{_quote(nxdk_lib / 'net' / 'nforceif' / 'include')}", f"-I{_quote(nxdk_lib / 'net' / 'nvnetdrv')}",
-    ])
-
-    def add_nxdk_object(source: Path) -> None:
-        obj = obj_dir / "nxdk" / source.relative_to(nxdk_lib).with_suffix(".o")
-        objects.append(obj)
-        cflags = f"{lwip_cflags} -w"
-        # (its driver started by nxdk_net.c's xbox_nvnetdrv_init, which gives
-        # the NIC's frames to lwIP as copies, not its zero-copy buffers)
-        if source.name == "nvnetdrv_lwip.c":
-            cflags += " -Dnvnetdrv_init=xbox_nvnetdrv_init"
-        n.build(outputs=obj, rule="xbox_cc", inputs=source, implicit=[PORT_DIR / "src" / "lwip_config" / "lwipopts.h"],
-                variables={"cflags": cflags})
-
-    for source in lwip_sources(nxdk_lib):
-        add_nxdk_object(source)
-    # internet play's UPnP (nxdk_upnp.c, port/linux/src/posix_upnp.c) and
-    # miniupnpc, as on a POSIX system: lwIP's sockets by their POSIX names
-    # (port/xbox/include/lwip_posix, ahead of the other headers), _WIN32 not
-    # defined
-    upnp_cflags = " ".join([
-        f"-I{PORT_DIR / 'include' / 'lwip_posix'}", lwip_cflags, "-U_WIN32", *MINIUPNPC_DEFINES,
-        "-DNEED_STRUCT_IP_MREQN", f"-I{MINIUPNPC_DIR / 'include'}", f"-I{MINIUPNPC_DIR / 'src'}",
-    ])
-    upnp_headers = sorted((PORT_DIR / "include" / "lwip_posix").rglob("*.h"))
-    for source in miniupnpc_sources():
-        obj = obj_dir / "miniupnpc" / source.with_suffix(".o").name
-        objects.append(obj)
-        n.build(outputs=obj, rule="xbox_cc", inputs=source,
-                implicit=[PORT_DIR / "src" / "lwip_config" / "lwipopts.h", *upnp_headers],
-                variables={"cflags": f"{upnp_cflags} -w"})
-    # the self-updater's TLS (port/third_party/mbedtls; posix_update.c,
-    # nxdk_update.c): a client only, with the Xbox's configuration
-    # (port/xbox/src/mbedtls_xbox_config.h)
-    mbedtls_config = PORT_DIR / "src" / "mbedtls_xbox_config.h"
-    mbedtls_flags = f"-I{MBEDTLS_DIR / 'include'} '-DMBEDTLS_USER_CONFIG_FILE=\"mbedtls_xbox_config.h\"'"
-    for source in sorted((MBEDTLS_DIR / "library").glob("*.c")):
-        obj = obj_dir / "mbedtls" / source.with_suffix(".o").name
-        objects.append(obj)
-        n.build(outputs=obj, rule="xbox_cc", inputs=source, implicit=[mbedtls_config],
-                variables={"cflags": f"{nxdk_cflags} -Os -U_WIN32 -U_MSC_VER {mbedtls_flags} -I{MBEDTLS_DIR / 'library'} -w"})
-    for source in sorted((PORT_DIR / "src").glob("*.c")):
-        if source.name == "nxdk_net.c":
-            add_object(source, lwip_cflags)
-        elif source.name == "nxdk_update.c":
-            # (and the inflater for the release's zip, and the build's number)
-            add_object(source, " ".join([lwip_cflags, "-U_MSC_VER", mbedtls_flags, f"-I{ZLIB_DIR}", *ZLIB_DEFINES,
-                                         updater_defines(getattr(sln, "port_release", False))]))
-        elif source.name == "nxdk_upnp.c":
+        def add_object(source: Path, cflags: str) -> None:
             obj = obj_dir / source.with_suffix(".o")
+            objects.append(obj)
+            n.build(outputs=obj, rule="xbox_cc", inputs=inline_export_wrapper(source, build),
+                    implicit=[*implicit, source], variables={"cflags": cflags})
+
+        game_cflags = " ".join([
+            abi, " ".join(GAME_FLAGS),
+            f"-include {prefix_header}", f"-include {tags_header}",
+            # the headers of the port's own game units (port/linux/game), for the
+            # game sources that call them
+            f"-iquote {Path(linux_config['game_sources'])}",
+            game_defines_and_includes(linux_config), libc_includes, f"-I{XDK_INCLUDE}",
+        ])
+        game_objects_start = len(objects)
+        for source in game_sources(linux_config):
+            add_object(source, game_cflags)
+        for source in sorted(Path(linux_config["game_sources"]).glob("*.c")):
+            add_object(source, game_cflags)
+        add_object(STB_VORBIS_SOURCE, game_cflags)
+        game_objects = objects[game_objects_start:]
+
+        platform_cflags = " ".join([
+            abi, " ".join(PLATFORM_FLAGS),
+            f"-include {prefix_header}", posix_includes,
+            f"-I{PORT_DIR / 'src'}", f"-I{LINUX_DIR / 'src'}", "-Iport/include",
+            f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{ZLIB_DIR}", f"-I{KCP_DIR}", f"-I{MONOCYPHER_DIR}",
+            "-Isource -Isource/cseries",
+            libc_includes, f"-I{XDK_INCLUDE}",
+            # (expat linked in, not a DLL's: called directly, not through
+            # __imp_ pointers, which lld's -opt:ref does not count as uses)
+            "-DXML_STATIC",
+            # pbkit's NV2A method names (nv_regs.h) for the Direct3D device
+            # (d3d8_nv2a.c), searched last
+            f"-idirafter {_quote(nxdk_lib / 'pbkit')}",
+        ])
+        # nxdk-cc's own flags (nxdk/bin/nxdk-cc)
+        nxdk_cflags = " ".join([
+            abi, "-std=gnu11", "-Wall", "-ffreestanding", "-fno-builtin", posix_includes,
+            f"-I{PORT_DIR / 'src'}", f"-I{PORT_DIR / 'common'}", f"-I{LINUX_DIR / 'src'}", f"-I{PORT_DIR / 'include'}",
+            f"-I{_quote(nxdk_lib)}", f"-I{_quote(nxdk_lib / 'xboxrt' / 'libc_extensions')}",
+            f"-isystem {_quote(nxdk_lib / 'pdclib' / 'include')}",
+            f"-I{_quote(nxdk_lib / 'pdclib' / 'platform' / 'xbox' / 'include')}",
+            f"-I{_quote(nxdk_lib / 'winapi')}", f"-I{_quote(nxdk_lib / 'xboxrt' / 'vcruntime')}",
+            "-U__STDC_NO_THREADS__",
+            # nxdk's USB host stack (nxdk_gamepads.c; nxdk/lib/usb/Makefile)
+            f"-I{_quote(nxdk_lib / 'usb' / 'libusbohci' / 'inc')}", f"-I{_quote(nxdk_lib / 'usb' / 'libusbohci_xbox')}",
+            "'-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\"'",
+        ])
+        for source in config.get("platform_sources", []):
+            add_object(Path(source), platform_cflags)
+        # lwIP, with the Xbox build's options ahead of nxdk's
+        # (port/xbox/src/lwip_config/lwipopts.h: the loopback interface), and
+        # nxdk's Ethernet driver for it: built here, not nxdk's libnxdk_net.lib
+        lwip_cflags = " ".join([
+            nxdk_cflags, f"-I{PORT_DIR / 'src' / 'lwip_config'}",
+            f"-I{_quote(nxdk_lib / 'net' / 'lwip' / 'src' / 'include')}",
+            f"-I{_quote(nxdk_lib / 'net' / 'nforceif' / 'include')}", f"-I{_quote(nxdk_lib / 'net' / 'nvnetdrv')}",
+        ])
+
+        def add_nxdk_object(source: Path) -> None:
+            obj = obj_dir / "nxdk" / source.relative_to(nxdk_lib).with_suffix(".o")
+            objects.append(obj)
+            cflags = f"{lwip_cflags} -w"
+            # (its driver started by nxdk_net.c's xbox_nvnetdrv_init, which gives
+            # the NIC's frames to lwIP as copies, not its zero-copy buffers)
+            if source.name == "nvnetdrv_lwip.c":
+                cflags += " -Dnvnetdrv_init=xbox_nvnetdrv_init"
+            n.build(outputs=obj, rule="xbox_cc", inputs=source, implicit=[PORT_DIR / "src" / "lwip_config" / "lwipopts.h"],
+                    variables={"cflags": cflags})
+
+        for source in lwip_sources(nxdk_lib):
+            add_nxdk_object(source)
+        # internet play's UPnP (nxdk_upnp.c, port/linux/src/posix_upnp.c) and
+        # miniupnpc, as on a POSIX system: lwIP's sockets by their POSIX names
+        # (port/xbox/include/lwip_posix, ahead of the other headers), _WIN32 not
+        # defined
+        upnp_cflags = " ".join([
+            f"-I{PORT_DIR / 'include' / 'lwip_posix'}", lwip_cflags, "-U_WIN32", *MINIUPNPC_DEFINES,
+            "-DNEED_STRUCT_IP_MREQN", f"-I{MINIUPNPC_DIR / 'include'}", f"-I{MINIUPNPC_DIR / 'src'}",
+        ])
+        upnp_headers = sorted((PORT_DIR / "include" / "lwip_posix").rglob("*.h"))
+        for source in miniupnpc_sources():
+            obj = obj_dir / "miniupnpc" / source.with_suffix(".o").name
             objects.append(obj)
             n.build(outputs=obj, rule="xbox_cc", inputs=source,
                     implicit=[PORT_DIR / "src" / "lwip_config" / "lwipopts.h", *upnp_headers],
-                    variables={"cflags": upnp_cflags})
-        else:
-            add_object(source, nxdk_cflags if source.name.startswith("nxdk_") else platform_cflags)
-    for source in sorted((PORT_DIR / "common").glob("*.c")):
-        add_object(source, nxdk_cflags)
-    # the self-updater's download, the Linux build's (over nxdk_update.c's
-    # connection and certificate authorities), with lwIP's POSIX names
-    add_object(LINUX_DIR / "src" / "posix_update.c",
-               f"-I{PORT_DIR / 'include' / 'lwip_posix'} {lwip_cflags} -U_MSC_VER {mbedtls_flags}")
-    for source in config.get("windows_platform_sources", []):
-        add_object(Path(source), nxdk_cflags)
-    # the menus' files (port/assets/menus; menu_files.c), without the
-    # high-res HUD and text the other ports embed beside them, and with the
-    # Xbox's own copies of their pictures (tools/xbox_menu_art.py)
-    menus = BUILD / "generated" / "menu_files_assets.c"
-    n.rule(
-        name="xbox_embed_menus",
-        command="$python tools/embed_assets.py --menus-only --xbox $out",
-        description="XBOX EMBED $out",
-    )
-    n.build(outputs=menus, rule="xbox_embed_menus", implicit=[Path("tools/embed_assets.py"), *xbox_menu_inputs()])
-    add_object(menus, platform_cflags)
-    # the settings file's parser (port_config.c)
-    add_object(TOML_DIR / "tomlc17.c", " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
-    # internet play's reliable streams (port/third_party/kcp; p2p.c) and
-    # its signatures (port/third_party/monocypher; p2p_crypto.c)
-    add_object(KCP_DIR / "ikcp.c", " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
-    for name in ("monocypher.c", "monocypher-ed25519.c"):
-        add_object(MONOCYPHER_DIR / name, " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
-    # the port's zlib (port/third_party/zlib/zlib_prefixed.h), which inflates
-    # the menus' pictures (png_decode.c)
-    for name in ZLIB_SOURCES:
-        add_object(ZLIB_DIR / name, " ".join([abi, "-std=gnu11", *ZLIB_DEFINES, "-U_WIN32", "-U_MSC_VER", "-w", pdclib_includes]))
-    # the menus' XML parser (menu_files.c), built as on Windows (clang's
-    # Microsoft target defines _WIN32): with nxdk's windows.h, and its hash
-    # salt from nxdk's rand_s (its fallback's process id, which nxdk has no
-    # call for, is the one process's)
-    for name in EXPAT_SOURCES:
-        add_object(EXPAT_DIR / name, f"{nxdk_cflags} -w -I{EXPAT_DIR} -DXML_STATIC '-DGetCurrentProcessId()=1'")
-    # printf's floating point and strtod, which nxdk's C library lacks
-    # (nxdk_libc.c)
-    musl_stdio_cflags = " ".join([abi, "-std=gnu11", "-w", f"-include {MUSL_STDIO_DIR}/include/musl_stdio.h",
-                                  f"-I{MUSL_STDIO_DIR}/include", f"-I{MUSL_STDIO_DIR}/src", pdclib_includes])
-    for source in [*sorted((MUSL_STDIO_DIR / "src").glob("*.c")), MUSL_STDIO_DIR / "support.c"]:
-        add_object(source, musl_stdio_cflags)
-    # the game's sin, pow and the rest, the same on every port
-    # (port/include/halo_math.h)
-    musl_cflags = " ".join([abi, "-std=gnu11", "-w", pdclib_includes, f"-I{MUSL_MATH_DIR}/include",
-                            f"-include {MUSL_MATH_DIR}/include/libm.h"])
-    for source in musl_math_sources():
-        add_object(source, musl_cflags)
+                    variables={"cflags": f"{upnp_cflags} -w"})
+        # the self-updater's TLS (port/third_party/mbedtls; posix_update.c,
+        # nxdk_update.c): a client only, with the Xbox's configuration
+        # (port/xbox/src/mbedtls_xbox_config.h)
+        mbedtls_config = PORT_DIR / "src" / "mbedtls_xbox_config.h"
+        mbedtls_flags = f"-I{MBEDTLS_DIR / 'include'} '-DMBEDTLS_USER_CONFIG_FILE=\"mbedtls_xbox_config.h\"'"
+        for source in sorted((MBEDTLS_DIR / "library").glob("*.c")):
+            obj = obj_dir / "mbedtls" / source.with_suffix(".o").name
+            objects.append(obj)
+            n.build(outputs=obj, rule="xbox_cc", inputs=source, implicit=[mbedtls_config],
+                    variables={"cflags": f"{nxdk_cflags} -Os -U_WIN32 -U_MSC_VER {mbedtls_flags} -I{MBEDTLS_DIR / 'library'} -w"})
+        for source in sorted((PORT_DIR / "src").glob("*.c")):
+            if source.name == "nxdk_net.c":
+                add_object(source, lwip_cflags)
+            elif source.name == "nxdk_update.c":
+                # (and the inflater for the release's zip, and the build's number)
+                add_object(source, " ".join([lwip_cflags, "-U_MSC_VER", mbedtls_flags, f"-I{ZLIB_DIR}", *ZLIB_DEFINES,
+                                             updater_defines(getattr(sln, "port_release", False))]))
+            elif source.name == "nxdk_upnp.c":
+                obj = obj_dir / source.with_suffix(".o")
+                objects.append(obj)
+                n.build(outputs=obj, rule="xbox_cc", inputs=source,
+                        implicit=[PORT_DIR / "src" / "lwip_config" / "lwipopts.h", *upnp_headers],
+                        variables={"cflags": upnp_cflags})
+            else:
+                add_object(source, nxdk_cflags if source.name.startswith("nxdk_") else platform_cflags)
+        for source in sorted((PORT_DIR / "common").glob("*.c")):
+            add_object(source, nxdk_cflags)
+        # the self-updater's download, the Linux build's (over nxdk_update.c's
+        # connection and certificate authorities), with lwIP's POSIX names
+        add_object(LINUX_DIR / "src" / "posix_update.c",
+                   f"-I{PORT_DIR / 'include' / 'lwip_posix'} {lwip_cflags} -U_MSC_VER {mbedtls_flags}")
+        for source in config.get("windows_platform_sources", []):
+            add_object(Path(source), nxdk_cflags)
+        # the menus' files (port/assets/menus; menu_files.c), without the
+        # high-res HUD and text the other ports embed beside them, and with the
+        # Xbox's own copies of their pictures (tools/xbox_menu_art.py)
+        # (made once: the builds share them)
+        menus = BUILD / "generated" / "menu_files_assets.c"
+        if build == BUILD:
+            n.rule(
+                name="xbox_embed_menus",
+                command="$python tools/embed_assets.py --menus-only --xbox $out",
+                description="XBOX EMBED $out",
+            )
+            n.build(outputs=menus, rule="xbox_embed_menus", implicit=[Path("tools/embed_assets.py"), *xbox_menu_inputs()])
+        add_object(menus, platform_cflags)
+        # the settings file's parser (port_config.c)
+        add_object(TOML_DIR / "tomlc17.c", " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
+        # internet play's reliable streams (port/third_party/kcp; p2p.c) and
+        # its signatures (port/third_party/monocypher; p2p_crypto.c)
+        add_object(KCP_DIR / "ikcp.c", " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
+        for name in ("monocypher.c", "monocypher-ed25519.c"):
+            add_object(MONOCYPHER_DIR / name, " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
+        # the port's zlib (port/third_party/zlib/zlib_prefixed.h), which inflates
+        # the menus' pictures (png_decode.c)
+        for name in ZLIB_SOURCES:
+            add_object(ZLIB_DIR / name, " ".join([abi, "-std=gnu11", *ZLIB_DEFINES, "-U_WIN32", "-U_MSC_VER", "-w", pdclib_includes]))
+        # the menus' XML parser (menu_files.c), built as on Windows (clang's
+        # Microsoft target defines _WIN32): with nxdk's windows.h, and its hash
+        # salt from nxdk's rand_s (its fallback's process id, which nxdk has no
+        # call for, is the one process's)
+        for name in EXPAT_SOURCES:
+            add_object(EXPAT_DIR / name, f"{nxdk_cflags} -w -I{EXPAT_DIR} -DXML_STATIC '-DGetCurrentProcessId()=1'")
+        # printf's floating point and strtod, which nxdk's C library lacks
+        # (nxdk_libc.c)
+        musl_stdio_cflags = " ".join([abi, "-std=gnu11", "-w", f"-include {MUSL_STDIO_DIR}/include/musl_stdio.h",
+                                      f"-I{MUSL_STDIO_DIR}/include", f"-I{MUSL_STDIO_DIR}/src", pdclib_includes])
+        for source in [*sorted((MUSL_STDIO_DIR / "src").glob("*.c")), MUSL_STDIO_DIR / "support.c"]:
+            add_object(source, musl_stdio_cflags)
+        # the game's sin, pow and the rest, the same on every port
+        # (port/include/halo_math.h)
+        musl_cflags = " ".join([abi, "-std=gnu11", "-w", pdclib_includes, f"-I{MUSL_MATH_DIR}/include",
+                                f"-include {MUSL_MATH_DIR}/include/libm.h"])
+        for source in musl_math_sources():
+            add_object(source, musl_cflags)
 
-    libs = " ".join(_quote(nxdk_lib / name) for name in config.get("libraries", []))
-    ldflags = " ".join(f"-include:{symbol}" for symbol in config.get("include_symbols", []))
-    n.build(outputs=exe, rule="xbox_link", inputs=objects, variables={"libs": libs, "ldflags": ldflags})
-    n.build(outputs=xbe, rule="xbox_xbe", inputs=exe, implicit=[Path("tools/xbox_xbe.py")])
-    # internet play's MQTT brokers, beside the game (D:; p2p_signal.c)
-    brokers = xbe.parent / "brokers.txt"
-    n.rule(name="xbox_copy", command="cp $in $out", description="XBOX COPY $out")
-    n.build(outputs=brokers, rule="xbox_copy", inputs=Path("port/assets/network/brokers.txt"))
-    # the game's units alone, which compile before the platform layer links
-    n.build(outputs="xbox-game", rule="phony", inputs=game_objects)
-    n.build(outputs="xbox", rule="phony", inputs=[xbe, brokers])
+        libs = " ".join(_quote(nxdk_lib / name) for name in config.get("libraries", []))
+        ldflags = " ".join(f"-include:{symbol}" for symbol in config.get("include_symbols", []))
+        n.build(outputs=exe, rule="xbox_link", inputs=objects, variables={"libs": libs, "ldflags": ldflags})
+        n.build(outputs=xbe, rule="xbox_xbe", inputs=exe, implicit=[Path("tools/xbox_xbe.py")],
+                variables={"memory": memory})
+        # internet play's MQTT brokers, beside the game (D:; p2p_signal.c)
+        brokers = xbe.parent / "brokers.txt"
+        if build == BUILD:
+            n.rule(name="xbox_copy", command="cp $in $out", description="XBOX COPY $out")
+        n.build(outputs=brokers, rule="xbox_copy", inputs=Path("port/assets/network/brokers.txt"))
+        # the game's units alone, which compile before the platform layer links
+        n.build(outputs=f"{target}-game", rule="phony", inputs=game_objects)
+        n.build(outputs=target, rule="phony", inputs=[xbe, brokers])
     n.newline()

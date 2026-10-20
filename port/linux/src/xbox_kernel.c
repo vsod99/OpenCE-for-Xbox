@@ -818,9 +818,27 @@ struct global_block
 	/* 16 byte header keeps the payload 16 byte aligned */
 };
 
+#ifdef HALO_XBOX
+/* The original Xbox port's large blocks are sparse: their pages are backed
+only once written, and read as zeros until then (port/xbox/src/nxdk_memory.c).
+The game's debug records and pools sized for the worst case are most of its
+heap, and seldom filled. */
+#define SPARSE_BLOCK_BYTES (256 * 1024)
+void *xbox_sparse_allocate(unsigned long size);
+unsigned long xbox_sparse_size(const void *address);
+void xbox_sparse_free(void *address);
+#endif
+
 HGLOBAL WINAPI GlobalAlloc(UINT flags, SIZE_T size)
 {
-	struct global_block *block = (flags & GMEM_ZEROINIT) ?
+	struct global_block *block =
+#ifdef HALO_XBOX
+		size >= SPARSE_BLOCK_BYTES ? xbox_sparse_allocate(sizeof(*block) + 8 + size) : NULL;
+
+	if (!block)
+		block =
+#endif
+		(flags & GMEM_ZEROINIT) ?
 		calloc(1, sizeof(*block) + 8 + size) :
 		malloc(sizeof(*block) + 8 + size);
 
@@ -847,6 +865,19 @@ HGLOBAL WINAPI GlobalReAlloc(HGLOBAL memory, SIZE_T size, UINT flags)
 		return GlobalAlloc(flags, size);
 	block = global_block_from_pointer(memory);
 	old_size = block->size;
+#ifdef HALO_XBOX
+	/* (to or from a sparse block: a new block, the bytes copied) */
+	if (xbox_sparse_size(block) || size >= SPARSE_BLOCK_BYTES)
+	{
+		HGLOBAL moved = GlobalAlloc(flags, size);
+
+		if (!moved)
+			return NULL;
+		memcpy(moved, memory, old_size < size ? old_size : size);
+		LocalFree(memory);
+		return moved;
+	}
+#endif
 	block = realloc(block, sizeof(*block) + 8 + size);
 	if (!block)
 	{
@@ -861,8 +892,16 @@ HGLOBAL WINAPI GlobalReAlloc(HGLOBAL memory, SIZE_T size, UINT flags)
 
 HLOCAL WINAPI LocalFree(HLOCAL memory)
 {
-	if (memory)
-		free(global_block_from_pointer(memory));
+	if (!memory)
+		return NULL;
+#ifdef HALO_XBOX
+	if (xbox_sparse_size(global_block_from_pointer(memory)))
+	{
+		xbox_sparse_free(global_block_from_pointer(memory));
+		return NULL;
+	}
+#endif
+	free(global_block_from_pointer(memory));
 	return NULL;
 }
 

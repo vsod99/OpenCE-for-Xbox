@@ -1202,7 +1202,7 @@ static void validation_begin(
 	tag_validate_globals.tag_cache_size = tag_cache_size;
 	tag_validate_globals.custom_edition = custom_edition;
 	snprintf(tag_validate_globals.map_name, sizeof(tag_validate_globals.map_name), "%s", map_name);
-	memset(tag_validate_claims, 0, sizeof(tag_validate_claims));
+	HALO_PORT_SPARSE_ZERO(tag_validate_claims, sizeof(tag_validate_claims));
 	validation_new(validation, tag_header, (unsigned long)tag_data_size);
 
 	return;

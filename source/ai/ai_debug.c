@@ -320,10 +320,12 @@ void ai_debug_clear_storage(
 {
 	match_assert("c:\\halo\\SOURCE\\ai\\ai_debug.c", 208, actor_debug_array);
 
-	memset(actor_debug_array, 0, sizeof(*actor_debug_array) * ACTOR_DEBUG_RECORD_COUNT);
+	/* port: HALO_PORT_SPARSE_ZERO, memset but on the original Xbox port,
+	whose large blocks are sparse (halo_port_capacity.h) */
+	HALO_PORT_SPARSE_ZERO(actor_debug_array, sizeof(*actor_debug_array) * ACTOR_DEBUG_RECORD_COUNT);
 	match_assert("c:\\halo\\SOURCE\\ai\\ai_debug.c", 211, actor_path_debug_array)
 
-	memset(actor_path_debug_array, 0, sizeof(*actor_path_debug_array) * MAXIMUM_NUMBER_OF_ACTOR_PATHS);
+	HALO_PORT_SPARSE_ZERO(actor_path_debug_array, sizeof(*actor_path_debug_array) * MAXIMUM_NUMBER_OF_ACTOR_PATHS); /* port: (above) */
 
 	return;
 }

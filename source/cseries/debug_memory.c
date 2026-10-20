@@ -448,6 +448,10 @@ void debug_check_memory(
 	return;
 }
 
+#ifdef HALO_XBOX
+int xbox_sparse_contains(const void *address); /* port: port/xbox/src/nxdk_memory.c */
+#endif
+
 void *debug_malloc(
 	unsigned int size,
 	boolean clear,
@@ -478,6 +482,15 @@ void *debug_malloc(
 		debug_memory_add_pointer(header);
 
 		pointer = header + 1;
+#ifdef HALO_XBOX
+		/* port: the original Xbox port's large blocks are sparse, zeros until
+		written (port/xbox/src/nxdk_memory.c): filled, every page would be
+		backed */
+		if (xbox_sparse_contains(header))
+		{
+		}
+		else
+#endif
 		if (clear)
 		{
 			csmemset(pointer, 0, size);

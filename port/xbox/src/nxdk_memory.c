@@ -445,7 +445,11 @@ sparse ranges through a buffer of their own (xbox_sparse_read_through), and
 no static array a device writes to is made sparse. */
 #define GAME_STATE_ON_DEMAND 1
 #define GAME_STATE_MAXIMUM_PAGES (0x02000000UL / PAGE_BYTES)
-#define SPARSE_MAXIMUM_RANGES 64
+#define SPARSE_MAXIMUM_RANGES 128
+/* the heap's large blocks (xbox_sparse_allocate), in an address range of
+their own */
+#define SPARSE_HEAP_BASE 0x44000000UL
+#define SPARSE_HEAP_BYTES 0x04000000UL
 #define STOCK_TARGET_PAGES 256
 #define STOCK_MAXIMUM_PAGES 1024
 #define CR0_WRITE_PROTECT 0x00010000UL
@@ -472,7 +476,7 @@ static struct
 	{
 		void *address;
 		unsigned long size;
-	} statics[SPARSE_MAXIMUM_RANGES];
+	} statics[64];
 	unsigned long static_count;
 	void *stock[STOCK_MAXIMUM_PAGES];
 	unsigned long stock_count;
@@ -480,6 +484,8 @@ static struct
 } demand;
 
 static void *game_state_pages[GAME_STATE_MAXIMUM_PAGES];
+
+static BOOL sparse_heap_start(void);
 
 /* (the kernel's page fault handler: the entry below goes on to it) */
 unsigned long xbox_page_fault_original;
@@ -665,18 +671,20 @@ static void sparse_reclaim(void)
 /* page tables for the 4 MB steps of [first, end) the kernel has none for */
 static BOOL page_tables_make(unsigned long first, unsigned long end)
 {
-	unsigned long page_tables = (end - first) / PAGE_TABLE_SPAN;
-	unsigned char *tables = MmAllocateContiguousMemoryEx(page_tables * PAGE_BYTES, 0, 0xFFFFFFFF, PAGE_BYTES,
-		PAGE_READWRITE);
-	unsigned long index;
+	unsigned long address;
 
-	if (!tables)
-		return FALSE;
-	memset(tables, 0, page_tables * PAGE_BYTES);
-	for (index = 0; index < page_tables; index++)
+	/* (a page each: little contiguous memory is left once the caches are had) */
+	for (address = first; address < end; address += PAGE_TABLE_SPAN)
 	{
-		*page_directory_entry(first + index * PAGE_TABLE_SPAN) =
-			((unsigned long)MmGetPhysicalAddress(tables + index * PAGE_BYTES) & PAGE_FRAME) |
+		unsigned char *table = MmAllocateContiguousMemoryEx(PAGE_BYTES, 0, 0xFFFFFFFF, PAGE_BYTES, PAGE_READWRITE);
+
+		if (!table)
+		{
+			platform_log("memory: no page for the page table of %08lx", address);
+			return FALSE;
+		}
+		memset(table, 0, PAGE_BYTES);
+		*page_directory_entry(address) = ((unsigned long)MmGetPhysicalAddress(table) & PAGE_FRAME) |
 			PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED;
 	}
 	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
@@ -707,7 +715,7 @@ static void page_fault_hook(void)
 constructor: before main) */
 void xbox_sparse_register(void *address, unsigned long size)
 {
-	if (demand.static_count < SPARSE_MAXIMUM_RANGES - 1)
+	if (demand.static_count < sizeof(demand.statics) / sizeof(demand.statics[0]))
 	{
 		demand.statics[demand.static_count].address = address;
 		demand.statics[demand.static_count].size = size;
@@ -813,7 +821,10 @@ static BOOL game_state_on_demand_start(unsigned long address, unsigned long size
 	/* (the static arrays only with the page of zeros: a page not present
 	would fault on every read) */
 	if (demand.zero_entry)
+	{
 		sparse_statics_start();
+		sparse_heap_start();
+	}
 	return TRUE;
 }
 
@@ -822,6 +833,193 @@ void *xbox_game_state_allocate(unsigned long address, unsigned long size)
 	if (GAME_STATE_ON_DEMAND && game_state_on_demand_start(address, size))
 		return (void *)address;
 	return game_state_allocate_committed(address, size);
+}
+
+/* ---------- the heap's large blocks
+
+Blocks of the game's heap of 256 KB or more (GlobalAlloc: the game's
+debug_malloc) are sparse too: the AI's and the renderer's debug records, a
+few pools sized for the worst case (xbox_kernel.c). Each is a range of its
+own in [SPARSE_HEAP_BASE, +SPARSE_HEAP_BYTES), which has its own page
+tables and is reserved from the kernel. */
+static BOOL sparse_heap_ready;
+/* (taken while the ranges are added, removed or walked between frames; the
+fault reads them with interrupts off) */
+static RTL_CRITICAL_SECTION sparse_heap_lock;
+
+static BOOL sparse_heap_start(void)
+{
+	PVOID base = (PVOID)SPARSE_HEAP_BASE;
+	SIZE_T region_size = SPARSE_HEAP_BYTES;
+
+	if (!demand.zero_entry)
+		return FALSE;
+	if (!NT_SUCCESS(NtAllocateVirtualMemory(&base, 0, &region_size, MEM_RESERVE, PAGE_READWRITE)) ||
+		(unsigned long)base != SPARSE_HEAP_BASE)
+	{
+		platform_log("memory: cannot reserve %08lx-%08lx for the heap's large blocks", SPARSE_HEAP_BASE,
+			SPARSE_HEAP_BASE + SPARSE_HEAP_BYTES);
+		return FALSE;
+	}
+	if (!page_tables_make(SPARSE_HEAP_BASE, SPARSE_HEAP_BASE + SPARSE_HEAP_BYTES))
+		return FALSE;
+	platform_log("memory: blocks of the heap of 256 KB or more sparse, at %08lx", SPARSE_HEAP_BASE);
+	RtlInitializeCriticalSection(&sparse_heap_lock);
+	sparse_heap_ready = TRUE;
+	return TRUE;
+}
+
+void *xbox_sparse_allocate(unsigned long size)
+{
+	unsigned long pages = (size + PAGE_BYTES - 1) / PAGE_BYTES, address = SPARSE_HEAP_BASE, page, flags;
+	void **backing;
+	struct sparse_range *range;
+
+	if (!sparse_heap_ready || demand.range_count >= SPARSE_MAXIMUM_RANGES)
+		return NULL;
+	backing = calloc(pages, sizeof(void *));
+	if (!backing)
+		return NULL;
+	RtlEnterCriticalSection(&sparse_heap_lock);
+	/* the lowest gap between the blocks there are (with a page between
+	blocks, so an overrun faults) */
+	flags = interrupts_disable();
+	for (;;)
+	{
+		unsigned long index, next = address;
+
+		for (index = 1; index < demand.range_count; index++)
+		{
+			range = &demand.ranges[index];
+			if (range->base >= SPARSE_HEAP_BASE && range->base < address + (pages + 1) * PAGE_BYTES &&
+				range->end + PAGE_BYTES > address)
+				next = range->end + PAGE_BYTES > next ? range->end + PAGE_BYTES : next;
+		}
+		if (next == address)
+			break;
+		address = next;
+	}
+	if (address + pages * PAGE_BYTES > SPARSE_HEAP_BASE + SPARSE_HEAP_BYTES)
+	{
+		interrupts_restore(flags);
+		RtlLeaveCriticalSection(&sparse_heap_lock);
+		free(backing);
+		return NULL;
+	}
+	range = &demand.ranges[demand.range_count];
+	range->base = address;
+	range->end = address + pages * PAGE_BYTES;
+	range->pages = backing;
+	for (page = range->base; page < range->end; page += PAGE_BYTES)
+	{
+		*page_table_entry(page) = demand.zero_entry;
+		page_invalidate(page);
+	}
+	demand.range_count++;
+	interrupts_restore(flags);
+	RtlLeaveCriticalSection(&sparse_heap_lock);
+	return (void *)address;
+}
+
+/* the size of a block of xbox_sparse_allocate's, or 0 */
+unsigned long xbox_sparse_size(const void *address)
+{
+	struct sparse_range *range = sparse_heap_ready ? sparse_range_find((unsigned long)address) : NULL;
+
+	return range && range->base == (unsigned long)address && range->base >= SPARSE_HEAP_BASE ?
+		range->end - range->base : 0;
+}
+
+/* [address, address+size) made zeros: in a sparse range, its whole pages
+given back to the page of zeros instead of written (HALO_PORT_SPARSE_ZERO) */
+void xbox_sparse_zero(void *address, unsigned long size)
+{
+	unsigned long start = (unsigned long)address, end = start + size, page;
+	unsigned long first = (start + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1), last = end & ~(PAGE_BYTES - 1);
+	struct sparse_range *range = sparse_range_find(start);
+
+	if (!range || last <= first || end > range->end)
+	{
+		memset(address, 0, size);
+		return;
+	}
+	memset(address, 0, first - start);
+	memset((void *)last, 0, end - last);
+	for (page = first; page < last; page += PAGE_BYTES)
+	{
+		unsigned long index = (page - range->base) / PAGE_BYTES, flags;
+		void *memory, *release = NULL;
+
+		if (!range->pages[index])
+			continue;
+		flags = interrupts_disable();
+		memory = range->pages[index];
+		if (memory)
+		{
+			*page_table_entry(page) = demand.zero_entry;
+			page_invalidate(page);
+			range->pages[index] = NULL;
+			demand.backed--;
+			demand.reclaimed++;
+			if (demand.stock_count < STOCK_MAXIMUM_PAGES)
+				demand.stock[demand.stock_count++] = memory;
+			else
+				release = memory;
+		}
+		interrupts_restore(flags);
+		if (release)
+			MmFreeSystemMemory(release, PAGE_BYTES);
+	}
+}
+
+/* whether an address lies in a block of xbox_sparse_allocate's */
+int xbox_sparse_contains(const void *address)
+{
+	return sparse_heap_ready && (unsigned long)address >= SPARSE_HEAP_BASE &&
+		(unsigned long)address < SPARSE_HEAP_BASE + SPARSE_HEAP_BYTES;
+}
+
+void xbox_sparse_free(void *address)
+{
+	struct sparse_range *range;
+	unsigned long index, page, pages, flags;
+	void **backing;
+
+	if (!xbox_sparse_size(address))
+		return;
+	RtlEnterCriticalSection(&sparse_heap_lock);
+	flags = interrupts_disable();
+	range = sparse_range_find((unsigned long)address);
+	backing = range->pages;
+	for (page = range->base; page < range->end; page += PAGE_BYTES)
+	{
+		void *memory = backing[(page - range->base) / PAGE_BYTES];
+
+		*page_table_entry(page) = 0;
+		page_invalidate(page);
+		if (memory)
+		{
+			demand.backed--;
+			if (demand.stock_count < STOCK_MAXIMUM_PAGES)
+			{
+				demand.stock[demand.stock_count++] = memory;
+				backing[(page - range->base) / PAGE_BYTES] = NULL;
+			}
+		}
+	}
+	pages = (range->end - range->base) / PAGE_BYTES;
+	index = range - demand.ranges;
+	memmove(range, range + 1, (demand.range_count - index - 1) * sizeof(*range));
+	demand.range_count--;
+	interrupts_restore(flags);
+	RtlLeaveCriticalSection(&sparse_heap_lock);
+	/* (the pages the stock had no room for) */
+	for (index = 0; index < pages; index++)
+	{
+		if (backing[index])
+			MmFreeSystemMemory(backing[index], PAGE_BYTES);
+	}
+	free(backing);
 }
 
 static BOOL game_state_on_demand_contains(const void *address)
@@ -897,7 +1095,11 @@ void xbox_game_state_frame(unsigned long frame)
 	stock_refill();
 	if (frame % 300 == 0)
 	{
+		if (sparse_heap_ready)
+			RtlEnterCriticalSection(&sparse_heap_lock);
 		sparse_reclaim();
+		if (sparse_heap_ready)
+			RtlLeaveCriticalSection(&sparse_heap_lock);
 		platform_log("sparse memory: %lu KB backed, at most %lu KB; %lu faults, %lu without stock; %lu KB taken back",
 			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.reclaimed * 4);
 	}
@@ -984,4 +1186,3 @@ DWORD WINAPI XQueryMemoryProtect(LPVOID address)
 		return PAGE_READWRITE;
 	return MmQueryAddressProtect(address);
 }
-

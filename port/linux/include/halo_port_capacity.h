@@ -166,8 +166,13 @@ a file's static array, lets the original Xbox port give those pages back
 and back them again only once written (port/xbox/src/nxdk_memory.c); it
 does nothing in the other builds. Never for an array a device writes to. */
 
+/* HALO_PORT_SPARSE_ZERO(address, size) empties a sparse array (or any
+memory) without writing its pages: memset elsewhere */
+
 #ifdef HALO_XBOX
 void xbox_sparse_register(void *address, unsigned long size);
+void xbox_sparse_zero(void *address, unsigned long size);
+#define HALO_PORT_SPARSE_ZERO(address, size) xbox_sparse_zero((address), (size))
 #define HALO_PORT_SPARSE(name) \
 	static void __attribute__((constructor)) name##_sparse(void) \
 	{ \
@@ -176,6 +181,7 @@ void xbox_sparse_register(void *address, unsigned long size);
 	extern int halo_port_sparse_declared
 #else
 #define HALO_PORT_SPARSE(name) extern int halo_port_sparse_declared
+#define HALO_PORT_SPARSE_ZERO(address, size) memset((address), 0, (size))
 #endif
 
 #endif /* __HALO_PORT_CAPACITY_H */
