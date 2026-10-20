@@ -436,6 +436,16 @@ void *texture_cache_steal_memory(
 		base_address + XBOX_TEXTURE_CACHE_STEAL_GUARD_SIZE;
 	byte *end_guard_address =
 		base_address + XBOX_TEXTURE_CACHE_STEAL_GUARD_SIZE + stolen_size;
+#ifdef HALO_XBOX_64MB
+	/* port: the 64 MB console's smaller cache, in the tag cache
+	(halo_port_capacity.h), lends no more than it has: Bink's 16 MB would
+	reach the map's tags (the port plays no Bink movie, which goes without) */
+	if (remaining_page_count < 0)
+	{
+		error(_error_silent, "the texture cache has no %ld bytes to lend", size);
+		return NULL;
+	}
+#endif
 
 	match_assert(
 		"c:\\halo\\SOURCE\\cache\\xbox_texture_cache.c",

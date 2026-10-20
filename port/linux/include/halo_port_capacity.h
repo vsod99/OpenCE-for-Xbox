@@ -57,7 +57,15 @@ window (port/linux/src/platform.h), whose pages are backed as they are used.
 Android's window is 128 MB, as the web build's, and its cache the Xbox's,
 as is the original Xbox port's (128 MB in all). */
 
-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB) || defined(HALO_XBOX)
+#if defined(HALO_XBOX_64MB)
+/* The 64 MB console's has no memory of its own: it lies in the tag cache,
+between a multiplayer map's tags (7.1 MB at most) and its structure bsp
+(loaded at the top, from 20.1 MB on: sidewinder), so only maps whose tags
+and bsps leave that room are played there (cache/cache_files.c). Blood
+Gulch draws about 9 MB of textures a frame. */
+#define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x342 /* (0x580) */
+#define HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET 0x710000
+#elif defined(HALO_ARM64_GUEST) || defined(HALO_WEB) || defined(HALO_XBOX)
 #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x580 /* (0x580) */
 #else
 #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x4000 /* (0x580) */
@@ -74,7 +82,10 @@ campaign map's dialogue and music did, "SOUND CACHE BLOWN" in debug.txt).
 The desktop builds' cache is 16 MB; Android's and the web build's windows and
 the original Xbox port keep the Xbox's. */
 
-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB) || defined(HALO_XBOX)
+#if defined(HALO_XBOX_64MB)
+/* (a multiplayer game plays about 1 MB of sounds in ten seconds) */
+#define HALO_PORT_SOUND_CACHE_SIZE 0x200000 /* (0x400000) */
+#elif defined(HALO_ARM64_GUEST) || defined(HALO_WEB) || defined(HALO_XBOX)
 #define HALO_PORT_SOUND_CACHE_SIZE 0x400000 /* (0x400000) */
 #else
 #define HALO_PORT_SOUND_CACHE_SIZE 0x1000000 /* (0x400000) */

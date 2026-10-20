@@ -296,7 +296,9 @@ void WINAPI D3DDevice_SetVerticalBlankCallback(D3DCALLBACK callback)
 	vertical_blank_callback = callback;
 	if (!vertical_blank_thread_started && xbox_gpu_ready())
 	{
-		HANDLE thread = CreateThread(NULL, 0, vertical_blank_thread, NULL, 0, NULL);
+		/* (a stack of its own size: 0 would be the XBE's, the main thread's
+		1 MB, all of it physical memory here) */
+		HANDLE thread = CreateThread(NULL, 64 * 1024, vertical_blank_thread, NULL, 0, NULL);
 
 		if (thread)
 		{
@@ -1141,7 +1143,12 @@ static DWORD texture_mag_filter(DWORD mag)
 /* the most memory the decoded pictures keep (contiguous memory, which a
 map's render targets need too: the server browser's hold 2.3 MB), and the
 largest side one has (a picture from a menus folder may be a desktop's) */
+#ifdef HALO_XBOX_64MB
+/* (and those not drawn for a second given back: art_frame) */
+#define ART_BUDGET (3UL * 1024 * 1024 / 2)
+#else
 #define ART_BUDGET (4UL * 1024 * 1024)
+#endif
 #define ART_LARGEST 1024
 #define ART_TEXTURES 256
 
@@ -1225,6 +1232,27 @@ static void art_make_room(unsigned long bytes, unsigned long budget)
 		art_release(oldest);
 	}
 }
+
+#ifdef HALO_XBOX_64MB
+/* between frames, now and then: the pictures no menu has drawn for a
+second given back (a menu draws its own every frame; a game's frames and a
+map's loading draw none) */
+static void art_frame(void)
+{
+	int index;
+
+	if (frame_number % 30)
+		return;
+	for (index = 0; index < ART_TEXTURES; index++)
+	{
+		struct art_texture *art = &art_textures[index];
+
+		/* (as art_make_room's: decoded again when next drawn) */
+		if (art->texels && art->last_frame + 30 <= frame_number)
+			art_release(art);
+	}
+}
+#endif
 
 static void art_decode(struct art_texture *art, const unsigned char *png, unsigned long png_size)
 {
@@ -2193,6 +2221,9 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	flip_count++;
 	frame++;
 	frame_number = frame;
+#ifdef HALO_XBOX_64MB
+	art_frame();
+#endif
 	/* how far a run got, now and then, how fast since the last time (by
 	the vertical blanks: 60 a second), the share of that time the processor
 	waited on the GPU, and the memory left */

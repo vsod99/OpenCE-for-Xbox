@@ -94,7 +94,16 @@ void physical_memory_allocate(
 		/* (Custom Edition maps' tags run at 0x40440000 in the tag cache's own
 		pages, and the memory after them: nxdk_memory.c) */
 		xbox_custom_edition_tag_cache_map(physical_memory_map_globals.tag_cache_base_address, TAG_CACHE_SIZE);
+#ifdef HALO_XBOX_64MB
+		/* (the 64 MB console's texture cache lies in the tag cache, between a
+		multiplayer map's tags and its structure bsp: halo_port_capacity.h) */
+		physical_memory_map_globals.texture_cache_base_address =
+			(byte *)physical_memory_map_globals.tag_cache_base_address + HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET;
+		XPhysicalProtect(physical_memory_map_globals.texture_cache_base_address, TEXTURE_CACHE_SIZE,
+			PAGE_READWRITE | PAGE_WRITECOMBINE);
+#else
 		physical_memory_map_globals.texture_cache_base_address = XPhysicalAlloc(TEXTURE_CACHE_SIZE, -1, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+#endif
 		match_assert(__FILE__, __LINE__, physical_memory_map_globals.texture_cache_base_address);
 		xbox_contiguous_reserve();
 		/* (the sounds are mixed by the processor, not the sound hardware:

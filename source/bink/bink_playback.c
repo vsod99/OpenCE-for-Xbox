@@ -647,7 +647,14 @@ void bink_playback_start(
 	}
 	else
 	{
+#ifdef HALO_XBOX_64MB
+		/* port: the 64 MB console's texture cache has no 16 MB to lend
+		(xbox_texture_cache.c): the movie goes without, as one not found does,
+		not stopping the game on the error */
+		error(_error_silent, "### ERROR bink failed to fucking steal some fucking memory from the fucking texture cache");
+#else
 		error(_error_immediate, "### ERROR bink failed to fucking steal some fucking memory from the fucking texture cache");
+#endif
 		bink_free_texture_cache();
 	}
 

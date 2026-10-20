@@ -73,6 +73,12 @@ void xbox_contiguous_reserve(void)
 	unsigned long count = 0, index, low = 0xffffffffUL, high = 0;
 
 	RtlInitializeCriticalSection(&pool.lock);
+#ifdef HALO_XBOX_64MB
+	/* (a 64 MB console's memory is all the low 64 MB: virtual memory takes
+	nothing the kernel could not give as contiguous, and the pool would only
+	take what is left) */
+	return;
+#endif
 	while (count < POOL_MAXIMUM_BYTES / POOL_BLOCK_BYTES)
 	{
 		void *block = MmAllocateContiguousMemoryEx(POOL_BLOCK_BYTES, 0, 0xFFFFFFFF, 0, PAGE_READWRITE);
@@ -332,6 +338,12 @@ void xbox_custom_edition_tag_cache_map(void *tag_cache, unsigned long tag_cache_
 
 	if (!config_boolean("game.custom_edition"))
 		return;
+#ifdef HALO_XBOX_64MB
+	/* (the 64 MB console's texture cache lies in the tag cache, where a
+	Custom Edition map's tags would be: halo_port_capacity.h) */
+	platform_log("custom edition: not on a 64 MB console");
+	return;
+#endif
 	/* (the 1 MB more is had only when there are Custom Edition maps) */
 	attributes = GetFileAttributesA(CUSTOM_EDITION_MAP_DIRECTORY);
 	if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -450,7 +462,13 @@ no static array a device writes to is made sparse. */
 their own */
 #define SPARSE_HEAP_BASE 0x44000000UL
 #define SPARSE_HEAP_BYTES 0x04000000UL
+#ifdef HALO_XBOX_64MB
+/* (a fault with the stock out asks the kernel itself: the 64 MB console
+keeps less idle) */
+#define STOCK_TARGET_PAGES 64
+#else
 #define STOCK_TARGET_PAGES 256
+#endif
 #define STOCK_MAXIMUM_PAGES 1024
 #define CR0_WRITE_PROTECT 0x00010000UL
 #define PAGE_FAULT_VECTOR 14
@@ -936,9 +954,10 @@ void xbox_sparse_zero(void *address, unsigned long size)
 {
 	unsigned long start = (unsigned long)address, end = start + size, page;
 	unsigned long first = (start + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1), last = end & ~(PAGE_BYTES - 1);
-	struct sparse_range *range = sparse_range_find(start);
+	/* (by its first whole page: a static array's range starts there) */
+	struct sparse_range *range = last > first ? sparse_range_find(first) : NULL;
 
-	if (!range || last <= first || end > range->end)
+	if (!range || last > range->end)
 	{
 		memset(address, 0, size);
 		return;

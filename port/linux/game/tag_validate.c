@@ -411,16 +411,21 @@ static void unclaim(
 
 	if (first > tag_validate_globals.tag_cache_size || size > tag_validate_globals.tag_cache_size - first)
 		return;
+	/* (only words with claims in them are written: the claims are sparse on
+	the original Xbox, HALO_PORT_SPARSE, and a bsp's unclaiming covers the
+	whole tag cache above the tags) */
 	for (bit = first; bit < end; )
 	{
 		if (bit % CLAIM_BITS == 0 && end - bit >= CLAIM_BITS)
 		{
-			tag_validate_claims[bit / CLAIM_BITS] = 0;
+			if (tag_validate_claims[bit / CLAIM_BITS])
+				tag_validate_claims[bit / CLAIM_BITS] = 0;
 			bit += CLAIM_BITS;
 		}
 		else
 		{
-			tag_validate_claims[bit / CLAIM_BITS] &= ~(1UL << (bit % CLAIM_BITS));
+			if (tag_validate_claims[bit / CLAIM_BITS] & (1UL << (bit % CLAIM_BITS)))
+				tag_validate_claims[bit / CLAIM_BITS] &= ~(1UL << (bit % CLAIM_BITS));
 			bit++;
 		}
 	}

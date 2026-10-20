@@ -26,8 +26,13 @@ after them.
 
 #include "nxdk_platform.h"
 
-/* (a power of two; a frame of the menus or a map is far less) */
+/* (a power of two; a frame of the menus or a map is far less; 1 MB on the
+64 MB console, where every megabyte counts) */
+#ifdef HALO_XBOX_64MB
+#define PUSH_BUFFER_BYTES (1UL * 1024 * 1024)
+#else
 #define PUSH_BUFFER_BYTES (2UL * 1024 * 1024)
+#endif
 /* left free at the end for pbkit's jump back to the head */
 #define PUSH_BUFFER_MARGIN 64
 /* the GPU is told of new methods once this many bytes are written */

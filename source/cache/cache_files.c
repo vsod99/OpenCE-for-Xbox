@@ -154,6 +154,19 @@ enum
 
 /* ---------- macros */
 
+/* port: the 64 MB console's texture cache lies in the tag cache, between a
+multiplayer map's tags and its structure bsps (halo_port_capacity.h): its
+tags must end below it, its bsps load above it, and what is done to the
+whole tag cache is done to the parts around it */
+#ifdef HALO_XBOX_64MB
+#define CACHE_FILE_TAG_ROOM HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET
+#define CACHE_FILE_BSP_FLOOR (HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET + HALO_PORT_TEXTURE_CACHE_SIZE)
+#else
+#define CACHE_FILE_TAG_ROOM TAG_CACHE_SIZE
+#define CACHE_FILE_BSP_FLOOR 0
+#endif
+
+
 #define STRUCTURE_BSP_TAG 'sbsp'
 #define CACHE_FILE_TAG_HEADER_SIGNATURE 'tags'
 #define CACHE_FILE_STRUCTURE_BSP_HEADER_SIGNATURE 'sbsp'
@@ -510,6 +523,9 @@ static boolean cache_file_structure_bsp_reference_verify(
 	}
 
 	read_size = (reference->file_size + CACHE_FILE_SECTOR_SIZE - 1) & ~(CACHE_FILE_SECTOR_SIZE - 1);
+	/* port: (and above the 64 MB console's texture cache) */
+	if (tag_data_size < CACHE_FILE_BSP_FLOOR)
+		tag_data_size = CACHE_FILE_BSP_FLOOR;
 	if (!cache_file_region_contains(
 		tag_cache_base_address + tag_data_size,
 		TAG_CACHE_SIZE - tag_data_size,
@@ -718,10 +734,21 @@ long tag_loaded(
 	return result;
 }
 
+static void cache_files_protect(
+	unsigned long protection)
+{
+#ifdef HALO_XBOX_64MB
+	XPhysicalProtect((void *)0x803A6000, CACHE_FILE_TAG_ROOM, protection);
+	XPhysicalProtect((void *)(0x803A6000 + CACHE_FILE_BSP_FLOOR), 0x01600000 - CACHE_FILE_BSP_FLOOR, protection);
+#else
+	XPhysicalProtect((void *)0x803A6000, 0x01600000, protection);
+#endif
+}
+
 void cache_files_enable_writes(
 	void)
 {
-	XPhysicalProtect((void *)0x803A6000, 0x01600000, PAGE_READWRITE);
+	cache_files_protect(PAGE_READWRITE); /* port: (above) */
 
 	return;
 }
@@ -729,7 +756,7 @@ void cache_files_enable_writes(
 void cache_files_disable_writes(
 	void)
 {
-	XPhysicalProtect((void *)0x803A6000, 0x01600000, PAGE_READONLY);
+	cache_files_protect(PAGE_READONLY); /* port: (above) */
 	XPhysicalProtect(
 		cache_file_globals.tag_header->vertex_buffers,
 		cache_file_globals.tag_header->vertex_buffer_count * 12,
@@ -934,6 +961,21 @@ boolean cache_file_header_verify(
 
 		return FALSE;
 	}
+#ifdef HALO_XBOX_64MB
+	/* port: a map whose tags reach the 64 MB console's texture cache (a
+	campaign map's) is not played there (halo_port_capacity.h) */
+	if (header->tag_data_size > CACHE_FILE_TAG_ROOM)
+	{
+		error(
+			_error_silent,
+			"the map '%s' is too large for a 64 MB console: %08x bytes of tag data, room for %08x",
+			scenario_name,
+			header->tag_data_size,
+			CACHE_FILE_TAG_ROOM);
+
+		return FALSE;
+	}
+#endif
 
 	return TRUE;
 }
@@ -1253,7 +1295,12 @@ long scenario_tags_load(
 		tag_cache_base_address = physical_memory_get_tag_cache_base_address();
 		if (cache_file_header_verify(&cache_file_globals.header, scenario_name, TRUE))
 		{
+#ifdef HALO_XBOX_64MB
+			csmemset(tag_cache_base_address, 0xCD, CACHE_FILE_TAG_ROOM); /* port: (above) */
+			csmemset(tag_cache_base_address + CACHE_FILE_BSP_FLOOR, 0xCD, 0x01600000 - CACHE_FILE_BSP_FLOOR);
+#else
 			csmemset(tag_cache_base_address, 0xCD, 0x01600000);
+#endif
 			cache_file_read(
 				NONE,
 				cache_file_globals.header.tag_data_offset,
@@ -1399,10 +1446,14 @@ boolean scenario_structure_bsp_load(
 	tag_cache_base_address = physical_memory_get_tag_cache_base_address();
 	if (!custom_edition_cache_tags_loaded())
 	{
+		/* port: (and from above the 64 MB console's texture cache) */
+		long fill_start = cache_file_globals.header.tag_data_size > CACHE_FILE_BSP_FLOOR ?
+			cache_file_globals.header.tag_data_size : CACHE_FILE_BSP_FLOOR;
+
 		csmemset(
-			tag_cache_base_address + cache_file_globals.header.tag_data_size,
+			tag_cache_base_address + fill_start,
 			0xCD,
-			0x01600000 - cache_file_globals.header.tag_data_size);
+			0x01600000 - fill_start);
 	}
 	{
 		boolean read_complete;

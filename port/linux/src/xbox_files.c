@@ -511,8 +511,14 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 	faulting. Guest memory is therefore filled through a bounce buffer: the
 	copy faults like any other write, at the moment the data really lands,
 	so a texture uploaded while the read is in flight is refreshed. */
+#ifdef HALO_XBOX
+	/* (the original Xbox's memory is the console's own, which nothing
+	watches: read where asked, without a buffer to spare) */
+	BOOL bounce = FALSE;
+#else
 	BOOL bounce = platform_is_contiguous(buffer) ||
 		platform_is_contiguous((char *)buffer + (count ? count - 1 : 0));
+#endif
 	char *staging = bounce ? malloc(count < READ_BOUNCE_SIZE ? count : READ_BOUNCE_SIZE) : NULL;
 
 	if (bounce && !staging)

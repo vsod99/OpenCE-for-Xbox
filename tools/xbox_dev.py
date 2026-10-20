@@ -212,18 +212,32 @@ def write_environment(bin_dir: Path, environment: list) -> None:
         path.write_text("".join(f"{setting}\n" for setting in environment))
 
 
+# the game's builds: the 128 MB console's and the 64 MB console's
+# (tools/xbox_build.py), each by its ninja target
+GAME_PROJECTS = {"build/xbox/halo": "xbox", "build/xbox64/halo": "xbox64"}
+
+
+def game_target(project: Path):
+    """the ninja target of one of the game's builds, or None"""
+    for path, target in GAME_PROJECTS.items():
+        if project == ROOT / path:
+            return target
+    return None
+
+
 def build(config: dict, project: Path, environment: list = ()) -> Path:
     """make the project's bin/default.xbe (an nxdk project with its
-    Makefile, or the game, build/xbox/halo, with `ninja xbox`), set its
+    Makefile, or the game, build/xbox/halo or build/xbox64/halo, with `ninja
+    xbox` or `ninja xbox64`), set its
     memory limit to the configured console's, and pack bin/ into an ISO;
     returns the ISO"""
     jobs = str(os.cpu_count() or 4)
     if (project / "Makefile").is_file():
         command = ["make", "-C", tool_path(config, project), "-j", jobs]
-    elif project == ROOT / "build/xbox/halo":
-        command = ["ninja", "-C", tool_path(config, ROOT), "xbox"]
+    elif game_target(project):
+        command = ["ninja", "-C", tool_path(config, ROOT), game_target(project)]
     else:
-        sys.exit(f"{project} is neither an nxdk project (no Makefile) nor build/xbox/halo")
+        sys.exit(f"{project} is neither an nxdk project (no Makefile) nor one of {', '.join(GAME_PROJECTS)}")
     command, env = tool_command(config, command)
     result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace")
@@ -232,7 +246,7 @@ def build(config: dict, project: Path, environment: list = ()) -> Path:
     if result.returncode != 0:
         print("\n".join(lines[-40:]))
         sys.exit(f"build of {project} failed")
-    if project == ROOT / "build/xbox/halo":
+    if game_target(project):
         add_maps(config, project / "bin/maps")
         add_custom_maps(config, project / "bin/custom_maps")
     return pack(config, project, environment, project.name)
