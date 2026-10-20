@@ -15,10 +15,10 @@ version are the same, an Xbox plays with the PC builds over system link and
 internet play.
 
 The Xbox port lives on the
-[`xbox-backport`](https://github.com/vsod99/halo-ce-universal/tree/xbox-backport)
+[`xbox-backport`](https://github.com/vsod99/OpenCE-for-Xbox/tree/xbox-backport)
 branch, which is rebased onto OpenCE's `main` as upstream moves. Its full
 documentation is
-[`port/xbox/README.md`](https://github.com/vsod99/halo-ce-universal/blob/xbox-backport/port/xbox/README.md).
+[`port/xbox/README.md`](https://github.com/vsod99/OpenCE-for-Xbox/blob/xbox-backport/port/xbox/README.md).
 For the PC, Android and web builds, use [OpenCE](https://github.com/OpenCommunityEdition/OpenCE)
 itself.
 
@@ -102,8 +102,8 @@ The build runs on macOS, Linux, or Windows through WSL. On macOS:
    program 128 MB (Cerbios is what this is tested with), a hard disk image,
    and your Halo maps folder:
 
-       git clone -b xbox-backport https://github.com/vsod99/halo-ce-universal
-       cd halo-ce-universal
+       git clone -b xbox-backport https://github.com/vsod99/OpenCE-for-Xbox
+       cd OpenCE-for-Xbox
        python3 tools/xbox_dev.py doctor
 
 4. Build:
@@ -120,11 +120,11 @@ The build runs on macOS, Linux, or Windows through WSL. On macOS:
 
 Windows (WSL) setup, the test tools (two-Xbox system link, profiling,
 screenshots) and the platform layer are described in
-[`port/xbox/README.md`](https://github.com/vsod99/halo-ce-universal/blob/xbox-backport/port/xbox/README.md).
+[`port/xbox/README.md`](https://github.com/vsod99/OpenCE-for-Xbox/blob/xbox-backport/port/xbox/README.md).
 
 GitHub Actions also builds the Xbox on every push to `xbox-backport`. The
 `halo-xbox-release` and `halo-xbox-debug` artifacts are on the branch's
-[workflow runs](https://github.com/vsod99/halo-ce-universal/actions?query=branch%3Axbox-backport).
+[workflow runs](https://github.com/vsod99/OpenCE-for-Xbox/actions?query=branch%3Axbox-backport).
 
 ### On a console
 
