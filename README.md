@@ -11,9 +11,8 @@ Xbox unchanged. A new platform layer (`port/xbox/src`) stands in for the
 desktop's OpenGL, SDL and sockets: Direct3D 8 drawn on the NV2A through
 pbkit, sound through the AC'97 controller, controllers through nxdk's USB
 stack, and networking through lwIP. Because the netcode and its network
-version are the same, an Xbox is meant to play with the PC builds over system
-link and internet play (two Xboxes play together; an Xbox with a PC is still
-to be tried).
+version are the same, an Xbox plays with the PC builds over system link and
+internet play.
 
 The Xbox port lives on the
 [`xbox-backport`](https://github.com/vsod99/halo-ce-universal/tree/xbox-backport)
@@ -23,8 +22,9 @@ documentation is
 For the PC, Android and web builds, use [OpenCE](https://github.com/OpenCommunityEdition/OpenCE)
 itself.
 
-> **Work in progress.** Everything below runs in [xemu](https://xemu.app).
-> It has not yet been tried on a real console.
+> **Work in progress.** Everything below runs in [xemu](https://xemu.app),
+> including games between an Xbox and the PC builds. It has not yet run on a
+> real console: it needs one upgraded to 128 MB.
 
 ## Screenshots
 
@@ -45,7 +45,8 @@ All three are frames the Xbox build saved from inside xemu (640×480).
   (anamorphic, following the dashboard's setting).
 - Sound and music, mixed by OpenCE's mixer onto the AC'97 controller.
 - System link and internet play, including joining games in progress, the
-  server browser and UPnP. Two Xboxes play together in xemu.
+  server browser and UPnP, with other Xboxes and with the PC builds (tried in
+  xemu).
 - Most Halo Custom Edition maps. Large ones have their textures and model
   geometry loaded as they are needed.
 - Starting from the Halo disc: with no `maps` folder beside the program,
