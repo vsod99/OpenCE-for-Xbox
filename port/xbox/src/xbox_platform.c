@@ -16,6 +16,7 @@ have yet:
 #include "halo_ui_pointer.h"
 #include "hud_hires.h"
 #include "nxdk_platform.h"
+#include "port_mods.h"
 #include "text_hires.h"
 #include "voice_audio.h"
 
@@ -244,6 +245,220 @@ void hud_hires_register_placeholder(long asset, unsigned long const *texture)
 {
 	(void)asset;
 	(void)texture;
+}
+
+int hud_hires_asset_custom_edition(long asset)
+{
+	(void)asset;
+	return 0;
+}
+
+void hud_hires_map_loaded(const long *assets, long count)
+{
+	(void)assets;
+	(void)count;
+}
+
+void hud_hires_map_unloaded(void)
+{
+}
+
+int text_hires_enabled(void)
+{
+	return 0;
+}
+
+/* ---------- the GL renderer's additions: the Xbox's own picture
+
+Models at the detail the Xbox's 480 lines choose (stock: display.model_detail
+is not offered on the Xbox), no HDR tone mapping (display.hdr, GL's), and the
+plasma shader's height fade (GL's) not drawn. */
+
+float halo_model_detail_scale(int level)
+{
+	(void)level;
+	return 1.0f;
+}
+
+int halo_model_detail_stock(void)
+{
+	return 1;
+}
+
+void halo_screen_tone_map(short x0, short y0, short x1, short y1)
+{
+	(void)x0;
+	(void)y0;
+	(void)x1;
+	(void)y1;
+}
+
+void d3d8_gl_set_height_fade(float inverse_softness, float height, float offset, float scale)
+{
+	(void)inverse_softness;
+	(void)height;
+	(void)offset;
+	(void)scale;
+}
+
+/* ---------- mods: none on the Xbox
+
+port/linux/src/port_mods.c reads the mods folder through SDL, and a mod's
+tags and files would not fit beside a map in the Xbox's memory: the Mods
+menu lists none, and maps play as they are. */
+
+long port_mods_scan(void)
+{
+	return 0;
+}
+
+unsigned long port_mods_scans(void)
+{
+	return 0;
+}
+
+long port_mods_played(void)
+{
+	return 0;
+}
+
+long port_mods_file_find(const char *tag_file, const char *map_name)
+{
+	(void)tag_file;
+	(void)map_name;
+	return -1;
+}
+
+int port_mods_file_stamp(long file, unsigned long *size, unsigned long stamp[2])
+{
+	(void)file;
+	(void)size;
+	(void)stamp;
+	return 0;
+}
+
+int port_mods_file_read(long file, unsigned long offset, void *buffer, unsigned long size)
+{
+	(void)file;
+	(void)offset;
+	(void)buffer;
+	(void)size;
+	return 0;
+}
+
+long port_mods_file_order(long file)
+{
+	(void)file;
+	return -1;
+}
+
+const char *port_mods_file_mod(long file)
+{
+	(void)file;
+	return "";
+}
+
+const char *port_mods_file_path(long file)
+{
+	(void)file;
+	return "";
+}
+
+long port_mods_count(void)
+{
+	return 0;
+}
+
+const char *port_mods_folder(long index)
+{
+	(void)index;
+	return "";
+}
+
+int port_mods_describe(long index, char *text, unsigned long size, const char *map_name)
+{
+	(void)index;
+	(void)map_name;
+	if (size)
+		text[0] = 0;
+	return 0;
+}
+
+long port_mods_at(long position)
+{
+	(void)position;
+	return -1;
+}
+
+const char *port_mods_name(long index)
+{
+	(void)index;
+	return "";
+}
+
+int port_mods_on(long index)
+{
+	(void)index;
+	return 0;
+}
+
+int port_mods_status(long index, char *text, unsigned long size)
+{
+	(void)index;
+	if (size)
+		text[0] = 0;
+	return 0;
+}
+
+int port_mods_details(long index, char *text, unsigned long size)
+{
+	(void)index;
+	if (size)
+		text[0] = 0;
+	return 0;
+}
+
+long port_mods_move(long position, long places)
+{
+	(void)places;
+	return position;
+}
+
+void port_mods_turn(long index, int on)
+{
+	(void)index;
+	(void)on;
+}
+
+int port_mods_save(void)
+{
+	return 1;
+}
+
+void port_mods_revert(void)
+{
+}
+
+int port_mods_conflicts(char *text, unsigned long size)
+{
+	if (size)
+		text[0] = 0;
+	return 0;
+}
+
+int port_mods_conflicting_names(char *text, unsigned long size)
+{
+	if (size)
+		text[0] = 0;
+	return 0;
+}
+
+void port_mods_disable_conflicting(void)
+{
+}
+
+void port_mods_startup(void)
+{
 }
 
 /* (the NV2A renderer keeps no GL texture names to forget) */

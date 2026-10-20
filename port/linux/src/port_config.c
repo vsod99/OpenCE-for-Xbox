@@ -1492,9 +1492,10 @@ static int config_skip_line(char *text, int line_number, const char *message)
 	return 1;
 }
 
-#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB) && !defined(HALO_XBOX)
 /* a config.toml the game never reads, likely edited in its place: said in
-the log, with the one it reads (path) */
+the log, with the one it reads (path; not on the original Xbox, whose
+settings are on its own hard disk, out of an editor's reach) */
 static void config_report_unread(const char *path)
 {
 	char other[1100];
@@ -1648,7 +1649,7 @@ static void config_load(void)
 	}
 
 	config_path(path, sizeof(path));
-#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB) && !defined(HALO_XBOX)
 	config_report_unread(path);
 #endif
 	text = config_read_file(path, &size);

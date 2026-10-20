@@ -5,6 +5,7 @@
     "port/linux/src/d3d8_resources.c",
     "port/linux/src/dsound_sdl.c",
     "port/linux/src/halo_linker_common.c",
+    "port/linux/src/log_address.c",
     "port/linux/src/menu_files.c",
     "port/linux/src/msvc_crt.c",
     "port/linux/src/msvc_wide.c",

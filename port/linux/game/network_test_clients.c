@@ -688,7 +688,7 @@ static void test_clients_report(
 }
 
 void network_test_clients_update(
-	void)
+	boolean main_menu_loaded)
 {
 	short index;
 	boolean hosting;
@@ -710,8 +710,10 @@ void network_test_clients_update(
 	}
 	if (!test_clients.count)
 		return;
-	/* (the host's game running; with the next game, joined again) */
-	hosting = game_in_progress() && game_connection() == _game_connection_network_server &&
+	/* (the host's game running, not its lobby, which the menus' map is
+	(a lobby's machines must say they have the map before it starts);
+	with the next game, joined again) */
+	hosting = !main_menu_loaded && game_in_progress() && game_connection() == _game_connection_network_server &&
 		global_network_game_server_get() != NULL;
 	if (test_clients.running && (!hosting || game_time_get() < test_clients.started_time))
 		test_clients_stop();

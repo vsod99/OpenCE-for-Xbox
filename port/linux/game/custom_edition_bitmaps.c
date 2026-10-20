@@ -815,15 +815,14 @@ short custom_edition_bitmap_channel_order(
 		_custom_edition_channels_xbox;
 }
 
-short custom_edition_bitmap_channel_order(
+short custom_edition_bitmap_sequence_channel_order(
 	long tag_index,
 	long sequence_index)
 {
-	struct custom_edition_bitmaps_globals *globals = &custom_edition_bitmaps_globals;
 	long bitmap_count;
-	long reordered_index;
 
-	if (!globals->reordered_bitmap_count || tag_index == NONE || !custom_edition_cache_tags_loaded())
+	if (!custom_edition_bitmaps_globals.reordered_bitmap_count || tag_index == NONE ||
+		!custom_edition_cache_tags_loaded())
 	{
 		return _custom_edition_channels_xbox;
 	}
@@ -832,11 +831,8 @@ short custom_edition_bitmap_channel_order(
 	{
 		return _custom_edition_channels_xbox;
 	}
-	reordered_index = reordered_bitmap_index(tag_index, sequence_index % bitmap_count);
 
-	return reordered_index != NONE ?
-		globals->reordered_bitmaps[reordered_index].channel_order :
-		_custom_edition_channels_xbox;
+	return custom_edition_bitmap_channel_order(tag_index, sequence_index % bitmap_count);
 }
 
 void custom_edition_bitmaps_dispose(

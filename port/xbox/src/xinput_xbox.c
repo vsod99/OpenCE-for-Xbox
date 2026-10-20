@@ -399,3 +399,37 @@ void test_input_hold_action(int hold)
 {
 	(void)hold;
 }
+
+/* (the scripted player's presses on the text chat's keyboard: the desktop's
+bot, xinput_sdl.c; the Xbox's scripted presses are debug.test_input "press:") */
+void test_input_press(unsigned long buttons)
+{
+	(void)buttons;
+}
+
+/* the text chat's controller and touch input (xinput_sdl.c): the Xbox's
+chat keyboard reads the controller as the game's other menus do */
+unsigned long halo_chat_pad_buttons(void)
+{
+	return 0;
+}
+
+int halo_chat_taps(float *x, float *y)
+{
+	(void)x;
+	(void)y;
+	return 0;
+}
+
+int halo_chat_touch_layout(void)
+{
+	return 0;
+}
+
+/* a key binding's name as the menus show it (xinput_sdl.c: a keyboard's
+printed character): the Xbox has no keyboard's bindings to show */
+void halo_input_shown_name(const char *binding, char *shown, size_t size)
+{
+	if (size)
+		snprintf(shown, size, "%s", binding ? binding : "");
+}

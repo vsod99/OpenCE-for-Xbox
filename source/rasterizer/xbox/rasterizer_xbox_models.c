@@ -1922,7 +1922,7 @@ void _rasterizer_model_draw(
 #ifdef HALO_XBOX
 				/* port: its channels' order (local_multipurpose_map_custom_edition) */
 				local_multipurpose_map_custom_edition =
-					custom_edition_bitmap_channel_order(
+					custom_edition_bitmap_sequence_channel_order(
 						shader_model->model.multipurpose_map.index,
 						shader_permutation_index) == _custom_edition_channels_multipurpose;
 #endif

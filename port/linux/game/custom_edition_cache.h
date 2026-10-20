@@ -239,7 +239,7 @@ modulo the group's bitmaps), an enum custom_edition_channel_order: Halo PC's
 for a Custom Edition multipurpose map or HUD meter, else this build's. For a
 renderer that cannot sample a texture's channels in another order (the
 original Xbox's) and reads them in its shaders instead. */
-short custom_edition_bitmap_channel_order(
+short custom_edition_bitmap_sequence_channel_order(
 	long tag_index,
 	long sequence_index);
 boolean custom_edition_reordered_bitmaps_find(

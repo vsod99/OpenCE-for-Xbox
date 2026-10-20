@@ -1753,8 +1753,10 @@ static void *silent_clock_thread(void *parameter)
 	return NULL;
 }
 
+#ifndef HALO_XBOX
 /* audio.channels: "stereo", "5.1", or "auto" for 5.1 when the device has
-at least six channels. Android and the browser play stereo */
+at least six channels. Android and the browser play stereo (and the
+original Xbox, through its AC'97 controller: nxdk_audio.c) */
 static unsigned long choose_output_channels(SDL_AudioDeviceID device)
 {
 #if defined(HALO_ANDROID) || defined(HALO_WEB) || defined(HALO_ARM64_GUEST)
@@ -1778,6 +1780,7 @@ static unsigned long choose_output_channels(SDL_AudioDeviceID device)
 	return 2;
 #endif
 }
+#endif
 
 static void audio_start(void)
 {
