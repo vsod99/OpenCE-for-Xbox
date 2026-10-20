@@ -86,6 +86,9 @@ real contrail_fade(
 
 extern boolean render_contrails_enabled;
 
+/* port: said once */
+static boolean reported_bad_change_color = FALSE;
+
 /* ---------- public code */
 
 real contrail_fade(
@@ -242,12 +245,19 @@ static void render_contrail(
 						struct object_attachment_definition);
 					short change_color_index = attachment->change_color_reference - 1;
 
-					if (change_color_index != NONE)
+					/* port: and one the object has (a map's index); said once */
+					if (change_color_index != NONE &&
+						VALID_INDEX(change_color_index, NUMBER_OF_OBJECT_CHANGE_COLORS))
 					{
 						real_rgb_color const *change_color = &object->object.outgoing_change_colors[change_color_index];
 						color.red *= change_color->red;
 						color.green *= change_color->green;
 						color.blue *= change_color->blue;
+					}
+					else if (change_color_index != NONE && !reported_bad_change_color)
+					{
+						error(_error_silent, "### ERROR a contrail attachment has a bad change color index; it is left out");
+						reported_bad_change_color = TRUE;
 					}
 				}
 
@@ -368,12 +378,13 @@ static void render_contrail(
 						_error_silent,
 						"contrail %s uses an unsupported render type.",
 						tag_get_name(contrail->definition_index));
-					/*
-					 * Original bug preserved: this return bypasses the buffer
-					 * unlock/delete calls and leaves current_lock_operation set.
-					 * A non-matching safety fix would route this arm through the
-					 * common cleanup at the end of the function.
-					 */
+					/* port: the Xbox's bug fixed: this return left the buffers
+					locked and allocated, and current_lock_operation set */
+					rasterizer_dynamic_triangles_unlock(triangle_buffer_index);
+					rasterizer_dynamic_vertices_unlock(vertex_buffer_index);
+					rasterizer_dynamic_triangles_delete(triangle_buffer_index);
+					rasterizer_dynamic_vertices_delete(vertex_buffer_index);
+					rasterizer_globals.current_lock_operation = _rasterizer_lock_none;
 					return;
 				}
 

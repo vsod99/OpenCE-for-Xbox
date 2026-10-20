@@ -548,6 +548,7 @@ symbols in this file:
 #include "bitmaps/bitmap_group_lookup.h"
 #include "effects/player_effects.h"
 #include "game_allegiance.h"
+#include "game.h"
 #include "game_globals.h"
 #include "interface/interface.h"
 #include "interface/hud.h"
@@ -566,6 +567,13 @@ symbols in this file:
 #include "math/integer_math.h"
 #include "networking/network_game_globals.h"
 #include "networking/network_server_manager.h"
+#include "networking/network_game_manager.h"
+#include "network_coop.h" /* port: port/linux/game/network_coop.c */
+#include "network_votekick.h" /* port: port/linux/game/network_votekick.c */
+#include "network_voice.h" /* port: port/linux/game/network_voice.c */
+#include "network_chat.h" /* port: port/linux/game/network_chat.c */
+/* (network_server_manager_internal.h's: the host's game record) */
+struct network_game *network_game_server_get_game(struct network_game_server *server);
 #include "objects.h"
 #include "objects/damage_effect_definitions.h"
 #include "physics/collision_features.h"
@@ -585,12 +593,16 @@ symbols in this file:
 #include "text/unicode.h"
 #include "units/bipeds.h"
 #include "units/units.h"
+#include "custom_edition_cache.h" /* port: port/linux/game/custom_edition_cache.c */
+#include "latency_meter.h" /* port: port/linux/game/latency_meter.c */
 
 /* network_game_globals.c's */
 boolean network_game_distributed_client(void);
 /* port/linux/game/network_distributed.c's */
 void network_distributed_player_killed(long *killing_player_index, long *killing_object_index,
 	long dead_player_index, boolean *friendly_fire);
+/* port/linux/game/network_damage.c's */
+boolean network_damage_killer_score(long player_index, long *score);
 
 /* ---------- constants */
 
@@ -615,11 +627,6 @@ enum
 {
 	_game_engine_9_or_more_players_bit = 3,
 	_game_engine_game_over_sound_disabled_bit,
-};
-
-enum
-{
-	_game_variant_generic_starting_equipment_bit = 5,
 };
 
 enum
@@ -673,6 +680,10 @@ enum game_engine_weapons
 	_game_engine_weapons_short_range,
 	_game_engine_weapons_human,
 	_game_engine_weapons_no_grenades,
+	/* port: the PC version's */
+	_game_engine_weapons_covenant,
+	_game_engine_weapons_classic,
+	_game_engine_weapons_heavy,
 	NUMBER_OF_GAME_ENGINE_WEAPON_SETS,
 };
 
@@ -925,11 +936,19 @@ long game_globals_get_weapon(
 	struct game_globals *game_globals,
 	long weapon_list_index)
 {
-	struct tag_reference *weapon = TAG_BLOCK_GET_ELEMENT(
+	struct tag_reference *weapon;
+	long weapon_definition_index;
+
+	/* port: none past the end of the list. A Custom Edition map's globals can
+	list fewer weapons than the Xbox's fourteen (stopping before the
+	grenades). */
+	if (weapon_list_index < 0 || weapon_list_index >= game_globals->weapon_list.count)
+		return NONE;
+	weapon = TAG_BLOCK_GET_ELEMENT(
 		&game_globals->weapon_list,
 		weapon_list_index,
 		struct tag_reference);
-	long weapon_definition_index = weapon->index;
+	weapon_definition_index = weapon->index;
 
 	return weapon_definition_index;
 }
@@ -1075,6 +1094,7 @@ static void game_engine_generate_title_string(
 {
 	wchar_t *secondary_string;
 	wchar_t life_string[128];
+	wchar_t time_left_string[160];
 	wchar_t score_string[256];
 	long string_list_index;
 	wchar_t *format_string;
@@ -1134,12 +1154,30 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				life_string,
 				NUMBEROF(life_string),
-				format_string,
+				ustring_format_checked(format_string, "d"),
 				remaining_lives);
 			life_string[NUMBEROF(life_string) - 1] = 0;
 			secondary_string = life_string;
 			break;
 		}
+	}
+
+	/* port: the gametype's time limit's time left (game_variant_options) */
+	if (game_variant_options_get()->time_limit > 0 &&
+		game_engine_globals.postgame_state == game_engine_mode_active)
+	{
+		long left = game_variant_options_get()->time_limit * 60L * TICKS_PER_SECOND - game_time_get();
+		wchar_t time_string[32];
+
+		ticks_to_unicode_time_string(MAX(left, 0), NUMBEROF(time_string), time_string);
+		if (secondary_string[0] && secondary_string != time_left_string)
+		{
+			usnprintf(time_left_string, NUMBEROF(time_left_string), L"%s, %s left", secondary_string, time_string);
+		}
+		else
+			usnprintf(time_left_string, NUMBEROF(time_left_string), L"%s left", time_string);
+		time_left_string[NUMBEROF(time_left_string) - 1] = 0;
+		secondary_string = time_left_string;
 	}
 
 	if (game_engine_globals.postgame_state == game_engine_mode_postgame_delay)
@@ -1258,7 +1296,7 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				title_string,
 				80,
-				format_string,
+				ustring_format_checked(format_string, "sss"),
 				team0_name,
 				team1_name,
 				secondary_string);
@@ -1278,7 +1316,7 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				title_string,
 				80,
-				format_string,
+				ustring_format_checked(format_string, "sss"),
 				team1_name,
 				team0_name,
 				secondary_string);
@@ -1298,7 +1336,7 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				title_string,
 				80,
-				format_string,
+				ustring_format_checked(format_string, "ss"),
 				team1_name,
 				secondary_string);
 		}
@@ -1326,7 +1364,7 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				title_string,
 				80,
-				format_string,
+				ustring_format_checked(format_string, "sss"),
 				get_place_string(&entry),
 				score_string,
 				secondary_string);
@@ -1347,7 +1385,7 @@ static void game_engine_generate_title_string(
 			usnprintf(
 				title_string,
 				80,
-				format_string,
+				ustring_format_checked(format_string, "sss"),
 				get_place_string(&entry),
 				score_string,
 				secondary_string);
@@ -1432,6 +1470,11 @@ static void rasterize_in_game_score_draw_line(
 	return;
 }
 
+/* port: the in-game scoreboard's lists (game_engine_rasterize_scoreboard,
+game_engine_rasterize_in_game_score): the players in the game, not those who
+quit, ranked and placed among themselves */
+static boolean statistic_buffer_in_game_only = FALSE;
+
 long populate_statistic_buffer(
 	struct statistic_buffer *statistic_buffer,
 	enum postgame_statistic statistic,
@@ -1450,6 +1493,8 @@ long populate_statistic_buffer(
 			"c:\\halo\\SOURCE\\game\\game_engine.c",
 			0x2C8,
 			player_count < MULTIPLAYER_MAXIMUM_PLAYERS);
+		if (statistic_buffer_in_game_only && player->quit_out_of_game)
+			continue;
 		if (player_count < MULTIPLAYER_MAXIMUM_PLAYERS)
 		{
 			statistic_buffer[player_count].player_index = player_iterator.datum_index;
@@ -1635,6 +1680,868 @@ static long select_players_to_display(
 	return MIN(maximum_count, player_count);
 }
 
+/* port: network co-op's scoreboard list (game_engine_rasterize_scoreboard):
+the players in the game, as they joined */
+static long populate_campaign_player_buffer(
+	struct statistic_buffer *statistic_buffer)
+{
+	struct data_iterator iterator;
+	struct player_datum *player;
+	long player_count = 0;
+
+	data_iterator_new(&iterator, player_data);
+	while ((player = data_iterator_next(&iterator)) != NULL && player_count < MULTIPLAYER_MAXIMUM_PLAYERS)
+	{
+		if (player->quit_out_of_game)
+			continue;
+		csmemset(&statistic_buffer[player_count], 0, sizeof(*statistic_buffer));
+		statistic_buffer[player_count++].player_index = iterator.datum_index;
+	}
+
+	return player_count;
+}
+
+/* port: the scoreboard of a full-screen view (game_engine_rasterize_in_game_score;
+a split-screen view's keeps the Xbox's six rows): SCOREBOARD_SCALE times the
+HUD's text, centred, on a panel (display.scoreboard_background). A team game's
+players in a column for each team (display.scoreboard_team_layout), else in
+order of score in one column, or two when one has too few rows; each with
+the player's ping in a network game (the host's measure:
+network_distributed.c). More players than a page are scrolled to with the
+mouse wheel and Page Up/Down (platform_scoreboard_scroll), a footer telling
+which are shown; opened, it shows the viewer's own player's page. Network
+co-op's campaign, with no game engine, lists its players as they joined,
+with only their names and pings. */
+enum
+{
+	/* the rows' widths (in the scoreboard's text, before it is scaled):
+	place, name, score, ping (the last as wide as "Ping" or three digits,
+	so that the columns centred are their text centred) */
+	SCOREBOARD_PLACE_WIDTH = 55,
+	SCOREBOARD_NAME_WIDTH = 150,
+	SCOREBOARD_SCORE_WIDTH = 95,
+	SCOREBOARD_PING_WIDTH = 40,
+	SCOREBOARD_COLUMN_WIDTH = SCOREBOARD_PLACE_WIDTH + SCOREBOARD_NAME_WIDTH + SCOREBOARD_SCORE_WIDTH + SCOREBOARD_PING_WIDTH,
+	SCOREBOARD_COLUMN_GAP = 40,
+	/* the rows a column has: as many as fit between 6 rows of the screen
+	from its top and 2 from its bottom (the motion sensor); the scoreboard
+	is centred on the screen, but never nearer its top than 4 rows (the
+	HUD's shields and health; its messages, such as "hold BACK for score",
+	are hidden while the scoreboard shows) */
+	SCOREBOARD_LAYOUT_TOP_ROWS = 6,
+	SCOREBOARD_BOTTOM_ROWS = 2,
+	SCOREBOARD_MINIMUM_TOP_ROWS = 4,
+	/* the entries (or a team column's rows) a notch of the wheel scrolls */
+	SCOREBOARD_WHEEL_STEP = 3,
+};
+
+#define SCOREBOARD_SCALE 0.75f
+
+/* network_distributed.c's */
+long distributed_player_ping(short player_index);
+/* port_config.c's */
+int config_boolean(const char *name);
+const char *config_string(const char *name);
+unsigned long config_changes(void);
+/* cinematics.c's */
+void draw_quad(rectangle2d *rectangle, pixel32 color);
+
+/* display.scoreboard_background(_color): the panel behind the scoreboard's
+text, its colour "red, green, blue, alpha" (0 to 255 each), or 0 for none */
+static pixel32 scoreboard_background_color(
+	void)
+{
+	static unsigned long read_at = (unsigned long)-1;
+	static pixel32 color = 0;
+
+	/* (read again when Settings changes it) */
+	if (read_at != config_changes())
+	{
+		char const *text = config_string("display.scoreboard_background_color");
+		long parts[4] = { 16, 16, 16, 150 };
+		short part;
+
+		read_at = config_changes();
+		color = 0;
+		if (!config_boolean("display.scoreboard_background"))
+			return color;
+		for (part = 0; part < 4 && text && *text; part++)
+		{
+			long value = 0;
+			boolean digits = FALSE;
+
+			while (*text == ' ' || *text == ',')
+				text++;
+			while (*text >= '0' && *text <= '9')
+			{
+				value = value * 10 + (*text++ - '0');
+				digits = TRUE;
+			}
+			if (digits)
+				parts[part] = PIN(value, 0, 255);
+			while (*text && *text != ',')
+				text++;
+		}
+		color = ((pixel32)parts[3] << 24) | ((pixel32)parts[0] << 16) | ((pixel32)parts[1] << 8) | (pixel32)parts[2];
+	}
+
+	return color;
+}
+
+/* a row of the scoreboard: its text (tab separated) from the column's left
+(tabs: the column's stops), on the row below the title's (at top) */
+static void scoreboard_draw_row(
+	wchar_t const *string,
+	boolean brighten,
+	real_argb_color const *row_color,
+	long row_index,
+	short top,
+	short left,
+	boolean tabs)
+{
+	rectangle2d bounds = render.camera.window_bounds;
+	long font_index = hud_get_font_index();
+	/* (brightened as a copy: the team colours serve every row) */
+	real_argb_color color = *row_color;
+	short tab_stops[4];
+	struct font_header *font;
+	long line_height;
+
+	if (font_index == NONE)
+		return;
+	offset_rectangle2d(&bounds, -render.camera.viewport_bounds.x0, -render.camera.viewport_bounds.y0);
+	font = font_definition_get(font_index);
+	line_height = font->leading_height + font->descending_height + font->ascending_height;
+	if (brighten)
+	{
+		color.red = MIN(color.red + 0.4f, 1.0f);
+		color.green = MIN(color.green + 0.4f, 1.0f);
+		color.blue = MIN(color.blue + 0.4f, 1.0f);
+	}
+	tab_stops[0] = left;
+	tab_stops[1] = (short)(left + SCOREBOARD_PLACE_WIDTH);
+	tab_stops[2] = (short)(tab_stops[1] + SCOREBOARD_NAME_WIDTH);
+	tab_stops[3] = (short)(tab_stops[2] + SCOREBOARD_SCORE_WIDTH);
+	draw_string_set_tab_stops(tabs ? tab_stops : NULL, tabs ? 4 : 0);
+	/* (the row as wide as the screen once scaled) */
+	bounds.x1 = (short)(bounds.x0 + (bounds.x1 - bounds.x0) / SCOREBOARD_SCALE);
+	if (!tabs)
+		bounds.x0 = left;
+	bounds.y0 = (short)(top + row_index * line_height);
+	bounds.y1 = (short)(bounds.y0 + line_height);
+	draw_string_set_draw_mode(font_index, NONE, 0, 0, &color);
+	rasterizer_draw_unicode_string(&bounds, NULL, NULL, 0, string);
+	draw_string_set_tab_stops(NULL, 0);
+
+	return;
+}
+
+/* sdl_platform.c's: the wheel's and Page Up/Down's moves of the open
+scoreboard (notches and pages, down positive) */
+void platform_scoreboard_scroll(int open, long *notches, long *pages);
+
+/* the scoreboard's scroll (entries of one list, or rows of the team
+columns), and whether it showed last frame (opened, it shows the viewer's
+own player) */
+static long scoreboard_scroll = 0;
+static boolean scoreboard_open = FALSE;
+
+/* display.scoreboard_team_layout: a team game's players in a column for each
+team ("teams", the red team's on the left), or all in order of score
+("score") */
+static boolean scoreboard_team_columns(
+	void)
+{
+	static short setting = NONE;
+	static unsigned long read_at = (unsigned long)-1;
+
+	if (read_at != config_changes())
+	{
+		char const *value = config_string("display.scoreboard_team_layout");
+
+		read_at = config_changes();
+		setting = value && !csstrcmp(value, "score") ? FALSE : TRUE;
+	}
+
+	return (boolean)setting;
+}
+
+/* a network game's scoreboard picks players with the mouse
+(halo_scoreboard_pointer_update: a right click frees it): a player's name
+picked opens a menu of what may be done to them, the players' vote to kick
+them (network_votekick.c), muting their voice and text chat on this
+machine (network_voice.c, network_chat.c), and the host's Mute for everyone
+(network_chat.c), Kick and Ban, Ban picked twice */
+enum
+{
+	_scoreboard_item_vote,
+	_scoreboard_item_mute,
+	_scoreboard_item_host_mute,
+	_scoreboard_item_kick,
+	_scoreboard_item_ban,
+	_scoreboard_item_cancel,
+	NUMBER_OF_SCOREBOARD_ITEMS,
+
+	/* the menu's width (the scoreboard's text, before it is scaled) */
+	SCOREBOARD_MENU_WIDTH = 220,
+};
+
+/* the menu: the player it is for (NONE: none open), the row under whose
+name it opens (from the title's), that name's left, and whether Ban was
+picked once */
+static struct
+{
+	long player_index;
+	long row_index;
+	short left;
+	boolean ban_picked;
+} scoreboard_menu = { NONE, 0, 0, FALSE };
+
+/* the scoreboard closed: its scroll forgotten, the wheel the weapons' again */
+static void game_engine_scoreboard_closed(
+	void)
+{
+	if (scoreboard_open)
+	{
+		struct halo_ui_pointer pointer;
+
+		scoreboard_open = FALSE;
+		platform_scoreboard_scroll(FALSE, NULL, NULL);
+		halo_scoreboard_pointer_update(FALSE, &pointer);
+	}
+	scoreboard_menu.player_index = NONE;
+}
+
+/* the menu's items for the player: whether each is offered, and what it says */
+static void scoreboard_menu_items(
+	wchar_t (*labels)[48],
+	boolean *offered)
+{
+	struct network_votekick_status status;
+	short item;
+
+	for (item = 0; item < NUMBER_OF_SCOREBOARD_ITEMS; item++)
+	{
+		offered[item] = FALSE;
+		labels[item][0] = 0;
+	}
+	offered[_scoreboard_item_vote] = TRUE;
+	if (network_votekick_get_status(&status) &&
+		status.player_index == DATUM_INDEX_TO_ABSOLUTE_INDEX(scoreboard_menu.player_index))
+	{
+		usprintf(labels[_scoreboard_item_vote], status.voted ? L"Voted to kick (%d of %d)" :
+			L"Vote to kick (%d of %d)", status.votes, status.needed);
+	}
+	else
+	{
+		usprintf(labels[_scoreboard_item_vote], L"Start a vote to kick");
+	}
+	/* (its machine's voice and text chat lines: this machine's own choice) */
+	{
+		struct player_datum *player = player_try_and_get(scoreboard_menu.player_index);
+
+		if (player)
+		{
+			offered[_scoreboard_item_mute] = TRUE;
+			usprintf(labels[_scoreboard_item_mute],
+				network_voice_machine_muted(player->network_player_data.machine_index) ? L"Unmute voice and chat" :
+					L"Mute voice and chat");
+		}
+	}
+	if (network_votekick_host())
+	{
+		/* (the host's mute of their voice and lines, for every machine:
+		network_chat.c) */
+		offered[_scoreboard_item_host_mute] = TRUE;
+		usprintf(labels[_scoreboard_item_host_mute],
+			network_chat_host_mute_minutes((short)DATUM_INDEX_TO_ABSOLUTE_INDEX(scoreboard_menu.player_index)) ?
+				L"Unmute for everyone" : L"Mute for everyone");
+		offered[_scoreboard_item_kick] = TRUE;
+		offered[_scoreboard_item_ban] = TRUE;
+		usprintf(labels[_scoreboard_item_kick], L"Kick");
+		usprintf(labels[_scoreboard_item_ban], scoreboard_menu.ban_picked ? L"Ban: pick again to ban" : L"Ban");
+	}
+	offered[_scoreboard_item_cancel] = TRUE;
+	usprintf(labels[_scoreboard_item_cancel], L"Cancel");
+}
+
+/* the menu's first row (from the title's): under the name, or above it when
+there is no room below (last_row: the screen's) */
+static long scoreboard_menu_first_row(
+	short item_count,
+	long last_row)
+{
+	if (scoreboard_menu.row_index + 1 + item_count <= last_row)
+		return scoreboard_menu.row_index + 1;
+	return MAX(scoreboard_menu.row_index - item_count, 0);
+}
+
+/* a rectangle of the scoreboard's text (laid out at full size, from left
+and the row from the title's) as it is drawn: scaled about the title's top
+left (bounds_left, top) */
+static void scoreboard_rectangle(
+	rectangle2d *rectangle,
+	short bounds_left,
+	short top,
+	long line_height,
+	short left,
+	short width,
+	long row_index,
+	long row_count)
+{
+	rectangle->x0 = (short)(bounds_left + (left - bounds_left) * SCOREBOARD_SCALE);
+	rectangle->x1 = (short)(rectangle->x0 + width * SCOREBOARD_SCALE);
+	rectangle->y0 = (short)(top + row_index * line_height * SCOREBOARD_SCALE);
+	rectangle->y1 = (short)(top + (row_index + row_count) * line_height * SCOREBOARD_SCALE);
+}
+
+static boolean scoreboard_point_in(
+	rectangle2d const *rectangle,
+	short x,
+	short y)
+{
+	return x >= rectangle->x0 && x < rectangle->x1 && y >= rectangle->y0 && y < rectangle->y1;
+}
+
+/* the item picked, done */
+static void scoreboard_menu_pick(
+	short item)
+{
+	short player_index = (short)DATUM_INDEX_TO_ABSOLUTE_INDEX(scoreboard_menu.player_index);
+
+	switch (item)
+	{
+	case _scoreboard_item_vote:
+		network_votekick_request(player_index);
+		break;
+	case _scoreboard_item_mute:
+	{
+		struct player_datum *player = player_try_and_get(scoreboard_menu.player_index);
+
+		if (player)
+		{
+			long machine_index = player->network_player_data.machine_index;
+
+			network_voice_mute_machine(machine_index, !network_voice_machine_muted(machine_index));
+		}
+		break;
+	}
+	case _scoreboard_item_host_mute:
+		network_chat_host_mute(player_index, !network_chat_host_mute_minutes(player_index));
+		break;
+	case _scoreboard_item_kick:
+		network_votekick_host_kick(player_index, FALSE);
+		break;
+	case _scoreboard_item_ban:
+		/* (a ban lasts: picked twice) */
+		if (!scoreboard_menu.ban_picked)
+		{
+			scoreboard_menu.ban_picked = TRUE;
+			return;
+		}
+		network_votekick_host_kick(player_index, TRUE);
+		break;
+	default:
+		break;
+	}
+	scoreboard_menu.player_index = NONE;
+}
+
+static void game_engine_rasterize_scoreboard(
+	long player_index,
+	real alpha)
+{
+	struct statistic_buffer ranked[MULTIPLAYER_MAXIMUM_PLAYERS];
+	/* (the players of each column's list, as indices into ranked: a team
+	game's by team, else all in one list over both columns) */
+	short lists[2][MULTIPLAYER_MAXIMUM_PLAYERS];
+	long list_counts[2] = { 0, 0 };
+	wchar_t row_string[256];
+	wchar_t score_string[256];
+	wchar_t title_string[80];
+	wchar_t ping_string[16];
+	real_argb_color text_color;
+	real_argb_color team_colors[2];
+	real_argb_color color;
+	rectangle2d bounds = render.camera.window_bounds;
+	boolean has_teams = game_engine_has_teams();
+	boolean network = game_connection() == _game_connection_network_client ||
+		game_connection() == _game_connection_network_server;
+	boolean campaign = !game_engine;
+	boolean team_columns;
+	long font_index = hud_get_font_index();
+	long string_list_index;
+	long line_height;
+	long rows;
+	long columns;
+	long ranked_count;
+	long total;
+	long page;
+	long shown_rows;
+	long index;
+	short width;
+	short left;
+	short top;
+	wchar_t *column_name;
+	wchar_t *score_name;
+	/* port: the pointer (1: picking; -1: none on this platform), where it
+	is in the drawing's coordinates, and whether its click was taken */
+	struct halo_ui_pointer pointer;
+	int pointer_state;
+	short pointer_x;
+	short pointer_y;
+	short click_x;
+	short click_y;
+	boolean clicked;
+	struct network_votekick_status vote;
+	boolean voting;
+	long extra_rows;
+	long next_row;
+	wchar_t menu_labels[NUMBER_OF_SCOREBOARD_ITEMS][48];
+	boolean menu_offered[NUMBER_OF_SCOREBOARD_ITEMS];
+	short menu_item_count = 0;
+	long menu_first_row = 0;
+	long last_row;
+
+	if (font_index == NONE)
+		return;
+	offset_rectangle2d(&bounds, -render.camera.viewport_bounds.x0, -render.camera.viewport_bounds.y0);
+	{
+		struct font_header *font = font_definition_get(font_index);
+
+		line_height = font->leading_height + font->descending_height + font->ascending_height;
+	}
+	if (line_height <= 0)
+		return;
+	/* (laid out at full size, then drawn scaled about the title's top left:
+	the screen holds 1/SCOREBOARD_SCALE as much) */
+	width = (short)((bounds.x1 - bounds.x0) / SCOREBOARD_SCALE);
+	/* (port: a network game's lines beneath, the vote running and how to
+	pick a player, have their rows) */
+	pointer_state = halo_scoreboard_pointer_update(network && network_votekick_available(), &pointer);
+	voting = network && network_votekick_get_status(&vote);
+	extra_rows = (voting ? 1 : 0) + (network && pointer_state >= 0 ? 1 : 0);
+	rows = (long)((bounds.y1 - SCOREBOARD_LAYOUT_TOP_ROWS * line_height) / SCOREBOARD_SCALE / line_height) - 2 -
+		SCOREBOARD_BOTTOM_ROWS - extra_rows;
+	rows = MAX(rows, 1);
+	if (campaign)
+	{
+		ranked_count = populate_campaign_player_buffer(ranked);
+	}
+	else
+	{
+		statistic_buffer_in_game_only = TRUE;
+		ranked_count = populate_statistic_buffer(ranked, _postgame_statistic_ranking, FALSE);
+		statistic_buffer_in_game_only = FALSE;
+	}
+	team_columns = has_teams && scoreboard_team_columns() && width >= 2 * SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP;
+	for (index = 0; index < ranked_count; index++)
+	{
+		struct player_datum *player = player_try_and_get(ranked[index].player_index);
+		short list = team_columns && player ? (short)PIN(player->team_index, 0, 1) : 0;
+
+		lists[list][list_counts[list]++] = (short)index;
+	}
+	/* (a page: the rows of both team columns, or both columns of one list;
+	the scroll in rows of the team columns, or entries of the list) */
+	if (team_columns)
+	{
+		columns = 2;
+		total = MAX(list_counts[0], list_counts[1]);
+		page = rows;
+	}
+	else
+	{
+		columns = list_counts[0] > rows && width >= 2 * SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP ? 2 : 1;
+		total = list_counts[0];
+		page = rows * columns;
+	}
+	/* (opened, at the viewer's own player's page; then where the wheel and
+	Page Up/Down take it) */
+	{
+		long notches = 0;
+		long pages = 0;
+
+		platform_scoreboard_scroll(TRUE, &notches, &pages);
+		if (!scoreboard_open)
+		{
+			scoreboard_open = TRUE;
+			scoreboard_scroll = 0;
+			for (index = 0; index < 2; index++)
+			{
+				long position;
+
+				for (position = 0; position < list_counts[index]; position++)
+				{
+					if (ranked[lists[index][position]].player_index == player_index)
+						scoreboard_scroll = position / page * page;
+				}
+			}
+		}
+		scoreboard_scroll += notches * SCOREBOARD_WHEEL_STEP + pages * page;
+		scoreboard_scroll = PIN(scoreboard_scroll, 0, MAX(total - page, 0));
+	}
+	left = (short)(bounds.x0 + (width - (columns * SCOREBOARD_COLUMN_WIDTH + (columns - 1) * SCOREBOARD_COLUMN_GAP)) / 2);
+	/* (centred on the rows shown: the title's, the heading's, the longest
+	column's, and the footer telling where the scroll is) */
+	shown_rows = MIN(rows, total);
+	if (total > page)
+		shown_rows++;
+	shown_rows += extra_rows;
+	{
+		real height = (2 + shown_rows) * line_height * SCOREBOARD_SCALE;
+
+		top = (short)(bounds.y0 + ((bounds.y1 - bounds.y0) - height) / 2);
+		top = MAX(top, (short)(SCOREBOARD_MINIMUM_TOP_ROWS * line_height));
+		/* (the panel behind it, half a row beyond its text, fading with it) */
+		{
+			pixel32 background = scoreboard_background_color();
+			real padding = 0.5f * line_height * SCOREBOARD_SCALE;
+			real block_width = (columns * SCOREBOARD_COLUMN_WIDTH + (columns - 1) * SCOREBOARD_COLUMN_GAP) * SCOREBOARD_SCALE;
+			real block_left = bounds.x0 + (left - bounds.x0) * SCOREBOARD_SCALE;
+
+			if (background >> 24)
+			{
+				rectangle2d panel;
+				long panel_alpha = (long)((background >> 24) * PIN(alpha, 0.0f, 1.0f) + 0.5f);
+
+				panel.x0 = (short)(block_left - padding);
+				/* (the ping, nearly as wide as its column, given room) */
+				panel.x1 = (short)(block_left + block_width + padding + 8.0f * SCOREBOARD_SCALE);
+				panel.y0 = (short)(top - padding);
+				panel.y1 = (short)(top + height + padding);
+				draw_quad(&panel, ((pixel32)panel_alpha << 24) | (background & 0x00FFFFFF));
+			}
+		}
+	}
+	rasterizer_text_set_scale(SCOREBOARD_SCALE, (real)bounds.x0, (real)top);
+
+	/* port: the pointer's click, on the menu's items (where they are
+	drawn), else on a player's row (below); one elsewhere closes the menu */
+	pointer_x = (short)(pointer.x - render.camera.viewport_bounds.x0);
+	pointer_y = (short)(pointer.y - render.camera.viewport_bounds.y0);
+	click_x = (short)(pointer.click_x - render.camera.viewport_bounds.x0);
+	click_y = (short)(pointer.click_y - render.camera.viewport_bounds.y0);
+	clicked = pointer_state > 0 && pointer.left_clicks > 0;
+	/* (the menu opens below its row, beyond the scoreboard if need be, but
+	above the motion sensor's rows) */
+	last_row = (long)((bounds.y1 - top) / (line_height * SCOREBOARD_SCALE)) - SCOREBOARD_BOTTOM_ROWS;
+	if (pointer_state <= 0 || (scoreboard_menu.player_index != NONE && !player_try_and_get(scoreboard_menu.player_index)))
+		scoreboard_menu.player_index = NONE;
+	if (scoreboard_menu.player_index != NONE)
+	{
+		short item;
+
+		scoreboard_menu_items(menu_labels, menu_offered);
+		for (item = 0; item < NUMBER_OF_SCOREBOARD_ITEMS; item++)
+			menu_item_count += menu_offered[item] ? 1 : 0;
+		menu_first_row = scoreboard_menu_first_row(menu_item_count, last_row);
+		if (clicked)
+		{
+			rectangle2d rectangle;
+			short shown = 0;
+
+			for (item = 0; item < NUMBER_OF_SCOREBOARD_ITEMS && clicked; item++)
+			{
+				if (!menu_offered[item])
+					continue;
+				scoreboard_rectangle(&rectangle, bounds.x0, top, line_height, scoreboard_menu.left,
+					SCOREBOARD_MENU_WIDTH, menu_first_row + shown++, 1);
+				if (scoreboard_point_in(&rectangle, click_x, click_y))
+				{
+					scoreboard_menu_pick(item);
+					clicked = FALSE;
+				}
+			}
+			if (clicked)
+				scoreboard_menu.player_index = NONE;
+			else if (scoreboard_menu.player_index != NONE)
+				scoreboard_menu_items(menu_labels, menu_offered);
+		}
+	}
+
+	team_colors[0].alpha = alpha;
+	team_colors[0].red = 0.6f;
+	team_colors[0].green = 0.3f;
+	team_colors[0].blue = 0.3f;
+	team_colors[1].alpha = alpha;
+	team_colors[1].red = 0.3f;
+	team_colors[1].green = 0.3f;
+	team_colors[1].blue = 0.6f;
+
+	if (campaign)
+		usprintf(title_string, L"Co-op");
+	else
+		game_engine_generate_title_string(title_string, player_index);
+	color.alpha = alpha;
+	color.red = color.green = color.blue = 0.7f;
+	scoreboard_draw_row(title_string, FALSE, &color, 0, top, left, FALSE);
+
+	string_list_index = tag_loaded('ustr', "ui\\multiplayer_game_text");
+	column_name = string_list_index != NONE && !campaign ? unicode_string_list_get_string(string_list_index, 0x43) : L"";
+	score_name = string_list_index != NONE ? unicode_string_list_get_string(string_list_index, 0x44) : L"";
+	score_string[0] = 0;
+	if (!campaign)
+		game_engine->format_score_name(score_string);
+	/* port: bounded (the map's column names) */
+	usnprintf(row_string, NUMBEROF(row_string), L"\t%s\t%s\t%s\t%s", column_name, score_name, score_string,
+		network ? L"Ping" : L"");
+	row_string[NUMBEROF(row_string) - 1] = 0;
+	{
+		long column;
+
+		for (column = 0; column < columns; column++)
+		{
+			/* (a team column's heading in its team's colour, brightened) */
+			if (team_columns)
+			{
+				color = team_colors[column];
+				color.red = MIN(color.red + 0.25f, 1.0f);
+				color.green = MIN(color.green + 0.25f, 1.0f);
+				color.blue = MIN(color.blue + 0.25f, 1.0f);
+			}
+			else
+			{
+				color.alpha = alpha;
+				color.red = color.green = color.blue = 0.5f;
+			}
+			scoreboard_draw_row(row_string, FALSE, &color, 1, top,
+				(short)(left + column * (SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP)), TRUE);
+		}
+	}
+
+	/* each slot of the page: a team column's row, or a place in the list */
+	for (index = 0; index < rows * columns; index++)
+	{
+		long column = team_columns ? index % 2 : index / rows;
+		long row = team_columns ? index / 2 : index % rows;
+		long list = team_columns ? column : 0;
+		long position = scoreboard_scroll + (team_columns ? row : index);
+		struct statistic_buffer *entry;
+		struct player_datum *player;
+		wchar_t *status_string;
+		real_argb_color *row_color;
+		long ping = NONE;
+		boolean ping_colored;
+
+		if (row >= rows || position >= list_counts[list])
+			continue;
+		entry = &ranked[lists[list][position]];
+		player = player_try_and_get(entry->player_index);
+		if (!player)
+			continue;
+		color = *hud_get_text_color(&text_color);
+		color.alpha = alpha;
+		score_string[0] = 0;
+		status_string = score_string;
+		if (!campaign)
+		{
+			game_engine->format_player_score(entry->player_index, score_string);
+			if (game_engine_player_is_out_of_lives(entry->player_index))
+				status_string = string_list_index != NONE ? unicode_string_list_get_string(string_list_index, 0x8A) : L"";
+			else if (player->quit_out_of_game)
+				status_string = string_list_index != NONE ? unicode_string_list_get_string(string_list_index, 0x8B) : L"";
+		}
+		ping_string[0] = 0;
+		if (network)
+		{
+			/* port: as this machine times it, with the latency meter on
+			(latency_meter.c); else the host's measure, as before */
+			ping = latency_meter_player_ping((short)DATUM_INDEX_TO_ABSOLUTE_INDEX(entry->player_index));
+
+			/* (three digits at most: its column's width) */
+			if (ping == NONE)
+				usprintf(ping_string, L"-");
+			else if (ping > 999)
+				usprintf(ping_string, L"999+");
+			else
+				usprintf(ping_string, L"%ld", ping);
+		}
+		/* port: with the latency meter on, a known ping is drawn on its own,
+		in the meter's colour for it (display.latency_meter) */
+		ping_colored = ping != NONE && latency_meter_shown();
+		usnprintf(
+			row_string,
+			NUMBEROF(row_string),
+			L"\t%s\t%s\t%s\t%s",
+			campaign ? L"" : get_place_string(entry),
+			player->name,
+			status_string,
+			ping_colored ? L"" : ping_string);
+		row_string[NUMBEROF(row_string) - 1] = 0;
+		row_color = has_teams ? &team_colors[PIN(player->team_index, 0, 1)] : &color;
+		/* port: a player talking (or muted) in voice chat, its speaker just
+		right of the name */
+		if (network && (network_voice_machine_speaking(player->network_player_data.machine_index) ||
+			network_voice_machine_muted(player->network_player_data.machine_index)))
+		{
+			rectangle2d icon;
+			rectangle2d text;
+			short row_left = (short)(left + column * (SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP));
+			short size;
+			short middle;
+
+			rectangle2d ink;
+			rectangle2d cursor;
+			short name_end;
+
+			/* (after the name's last letter, centred on its capitals: both
+			measured as the row is laid out, the name at its column's tab
+			stop, then scaled as it is drawn, as scoreboard_rectangle has it;
+			within the name's column) */
+			text.x0 = (short)(row_left + SCOREBOARD_PLACE_WIDTH);
+			text.x1 = (short)(text.x0 + SCOREBOARD_NAME_WIDTH);
+			text.y0 = (short)(top + (2 + row) * line_height);
+			text.y1 = (short)(text.y0 + line_height);
+			draw_string_set_draw_mode(font_index, NONE, 0, 0, row_color);
+			draw_unicode_string_compute_bounds(&text, player->name, &ink, &cursor);
+			middle = (short)(top + (draw_unicode_string_capital_middle(&text, player->name) - top) * SCOREBOARD_SCALE);
+			scoreboard_rectangle(&icon, bounds.x0, top, line_height, text.x0, SCOREBOARD_NAME_WIDTH, 2 + row, 1);
+			size = (short)((icon.y1 - icon.y0) * 2 / 3);
+			name_end = (short)(bounds.x0 + (MAX(ink.x1, text.x0) - bounds.x0) * SCOREBOARD_SCALE);
+			icon.x0 = (short)MIN(name_end + 4, icon.x1 - size);
+			icon.x1 = (short)(icon.x0 + size);
+			icon.y0 = (short)(middle - size / 2);
+			icon.y1 = (short)(icon.y0 + size);
+			network_voice_draw_icon(&icon, network_voice_machine_muted(player->network_player_data.machine_index),
+				alpha);
+		}
+		/* port: another machine's player, picked with the pointer: lit
+		under it (not under the menu), and its menu opened when clicked */
+		if (pointer_state > 0 && player->local_player_index == NONE)
+		{
+			rectangle2d rectangle;
+			rectangle2d menu_rectangle;
+			short row_left = (short)(left + column * (SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP));
+
+			scoreboard_rectangle(&rectangle, bounds.x0, top, line_height, row_left, SCOREBOARD_COLUMN_WIDTH,
+				2 + row, 1);
+			scoreboard_rectangle(&menu_rectangle, bounds.x0, top, line_height, scoreboard_menu.left,
+				SCOREBOARD_MENU_WIDTH, menu_first_row, menu_item_count);
+			if (scoreboard_point_in(&rectangle, pointer_x, pointer_y) &&
+				(scoreboard_menu.player_index == NONE || !scoreboard_point_in(&menu_rectangle, pointer_x, pointer_y)))
+			{
+				draw_quad(&rectangle, ((pixel32)(long)(80 * PIN(alpha, 0.0f, 1.0f)) << 24) | 0x00FFFFFF);
+			}
+			if (clicked && scoreboard_point_in(&rectangle, click_x, click_y))
+			{
+				scoreboard_menu.player_index = entry->player_index;
+				scoreboard_menu.row_index = 2 + row;
+				scoreboard_menu.left = (short)(row_left + SCOREBOARD_PLACE_WIDTH);
+				scoreboard_menu.ban_picked = FALSE;
+				clicked = FALSE;
+			}
+		}
+		scoreboard_draw_row(
+			row_string,
+			player_index == entry->player_index,
+			row_color,
+			2 + row,
+			top,
+			(short)(left + column * (SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP)),
+			TRUE);
+		if (ping_colored)
+		{
+			real_argb_color ping_color;
+
+			latency_meter_color(ping, &ping_color);
+			ping_color.alpha = alpha;
+			usnprintf(row_string, NUMBEROF(row_string), L"\t\t\t\t%s", ping_string);
+			row_string[NUMBEROF(row_string) - 1] = 0;
+			scoreboard_draw_row(
+				row_string,
+				FALSE,
+				&ping_color,
+				2 + row,
+				top,
+				(short)(left + column * (SCOREBOARD_COLUMN_WIDTH + SCOREBOARD_COLUMN_GAP)),
+				TRUE);
+		}
+	}
+	/* (where the scroll is, and how to move it) */
+	if (total > page)
+	{
+		long first = scoreboard_scroll + 1;
+		long last = MIN(scoreboard_scroll + page, total);
+
+		color.alpha = alpha;
+		color.red = color.green = color.blue = 0.6f;
+		usprintf(row_string, L"%ld-%ld of %ld   (Page Up / Page Down, mouse wheel)", first, last, total);
+		scoreboard_draw_row(row_string, FALSE, &color, 2 + rows, top, left, FALSE);
+	}
+	/* port: the vote running, and how to pick a player */
+	next_row = 2 + MIN(rows, total) + (total > page ? 1 : 0);
+	if (voting)
+	{
+		struct data_iterator iterator;
+		struct player_datum *target;
+		wchar_t const *name = L"?";
+		wchar_t const *note = vote.voted ? L" (you voted)" : vote.may_vote ? L"" : L" (too new to vote)";
+
+		data_iterator_new(&iterator, player_data);
+		while ((target = (struct player_datum *)data_iterator_next(&iterator)) != NULL)
+		{
+			if (DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index) == vote.player_index)
+			{
+				name = target->name;
+				if (target->local_player_index != NONE)
+					note = L" (against you)";
+			}
+		}
+		color.alpha = alpha;
+		color.red = 1.0f;
+		color.green = 0.75f;
+		color.blue = 0.3f;
+		usprintf(row_string, L"Vote to kick %s: %d of %d, %d s left%s", name, vote.votes, vote.needed,
+			vote.seconds_left, note);
+		scoreboard_draw_row(row_string, FALSE, &color, next_row++, top, left, FALSE);
+	}
+	if (network && pointer_state >= 0)
+	{
+		color.alpha = alpha;
+		color.red = color.green = color.blue = 0.6f;
+		if (pointer_state == 0)
+			usprintf(row_string, L"Right-click to pick a player");
+		else
+			usprintf(row_string, L"Pick a player   (right-click to aim)");
+		scoreboard_draw_row(row_string, FALSE, &color, next_row++, top, left, FALSE);
+	}
+	/* port: the picked player's menu, over the rows, its item under the
+	pointer lit */
+	if (scoreboard_menu.player_index != NONE && menu_item_count > 0)
+	{
+		rectangle2d rectangle;
+		short item;
+		short shown = 0;
+		long panel_alpha = (long)(255 * PIN(alpha, 0.0f, 1.0f));
+
+		scoreboard_rectangle(&rectangle, bounds.x0, top, line_height, scoreboard_menu.left, SCOREBOARD_MENU_WIDTH,
+			menu_first_row, menu_item_count);
+		draw_quad(&rectangle, ((pixel32)panel_alpha << 24) | 0x00202830);
+		for (item = 0; item < NUMBER_OF_SCOREBOARD_ITEMS; item++)
+		{
+			if (!menu_offered[item])
+				continue;
+			scoreboard_rectangle(&rectangle, bounds.x0, top, line_height, scoreboard_menu.left,
+				SCOREBOARD_MENU_WIDTH, menu_first_row + shown, 1);
+			if (scoreboard_point_in(&rectangle, pointer_x, pointer_y))
+				draw_quad(&rectangle, ((pixel32)(long)(90 * PIN(alpha, 0.0f, 1.0f)) << 24) | 0x00FFFFFF);
+			color.alpha = alpha;
+			color.red = color.green = color.blue = 0.9f;
+			if (item == _scoreboard_item_ban)
+			{
+				color.green = color.blue = 0.45f;
+			}
+			scoreboard_draw_row(menu_labels[item], FALSE, &color, menu_first_row + shown, top,
+				(short)(scoreboard_menu.left + 6), FALSE);
+			shown++;
+		}
+	}
+	rasterizer_text_set_scale(1.0f, 0.0f, 0.0f);
+
+	return;
+}
+
 static void game_engine_rasterize_in_game_score(
 	long player_index,
 	real alpha)
@@ -1654,12 +2561,21 @@ static void game_engine_rasterize_in_game_score(
 	wchar_t *column_name;
 	wchar_t *score_name;
 
+	/* port: a full-screen view's its own, as is the campaign's
+	(game_engine_rasterize_scoreboard) */
+	if (local_player_count() <= 1 || !game_engine)
+	{
+		game_engine_rasterize_scoreboard(player_index, alpha);
+		return;
+	}
 	game_engine_generate_title_string(title_string, player_index);
+	statistic_buffer_in_game_only = TRUE;
 	entry_count = select_players_to_display(
 		_postgame_statistic_ranking,
 		player_index,
 		entries,
 		NUMBEROF(entries));
+	statistic_buffer_in_game_only = FALSE;
 
 	color.alpha = alpha;
 	color.red = 0.7f;
@@ -1685,7 +2601,8 @@ static void game_engine_rasterize_in_game_score(
 		score_name = L"";
 
 	game_engine->format_score_name(score_string);
-	usprintf(row_string, L"\t%s\t%s\t%s", column_name, score_name, score_string);
+	usnprintf(row_string, NUMBEROF(row_string), L"\t%s\t%s\t%s", column_name, score_name, score_string);
+	row_string[NUMBEROF(row_string) - 1] = 0;
 	rasterize_in_game_score_draw_line(row_string, FALSE, &color, 1);
 
 	for (entry_index = 0; entry_index < entry_count; entry_index++)
@@ -1742,12 +2659,14 @@ static void game_engine_rasterize_in_game_score(
 
 			place_string = get_place_string(&entries[entry_index]);
 
-			usprintf(
+			usnprintf(
 				row_string,
+				NUMBEROF(row_string),
 				L"\t%s\t%s\t%s",
 				place_string,
 				player->name,
 				status_string);
+			row_string[NUMBEROF(row_string) - 1] = 0;
 
 			if (has_teams)
 				row_color = &team_colors[PIN(player->team_index, 0, 1)];
@@ -1886,7 +2805,7 @@ void game_engine_post_rasterize_post_game(
 			usnprintf(
 				row_string,
 				NUMBEROF(row_string),
-				team_formats[team_index],
+				ustring_format_checked(team_formats[team_index], "s"),
 				score_string);
 			row_string[NUMBEROF(row_string) - 1] = 0;
 			drawline(row_string, team_row + 4, 0);
@@ -2201,12 +3120,11 @@ long game_engine_remap_equipment(
 			break;
 		}
 
-		if (!TEST_FLAG(game_engine_globals.flags, _game_engine_5_or_more_players_bit))
+		/* (port: whatever the number of players, as
+		game_engine_infinite_grenades_internal) */
+		if (game_engine_infinite_grenades_internal())
 		{
-			if (game_engine_infinite_grenades_internal())
-			{
-				weapon_list_index = NONE;
-			}
+			weapon_list_index = NONE;
 		}
 
 		if (TEST_FLAG(game_engine_globals.flags, _game_engine_9_or_more_players_bit))
@@ -2728,12 +3646,9 @@ boolean match_game_type(
 static boolean game_engine_infinite_grenades_internal(
 	void)
 {
-	boolean infinite_grenades = FALSE;
-
-	if (!TEST_FLAG(game_engine_globals.flags, _game_engine_5_or_more_players_bit))
-		infinite_grenades = TEST_FLAG(global_variant.universal_variant.flags, _game_variant_infinite_grenades_bit);
-
-	return infinite_grenades;
+	/* port: whatever the number of players (the Xbox game's had none with
+	five or more) */
+	return TEST_FLAG(global_variant.universal_variant.flags, _game_variant_infinite_grenades_bit);
 }
 
 static boolean find_closest_player_callback(
@@ -3011,6 +3926,95 @@ void game_engine_rasterize_message(
 	return;
 }
 
+/* port: who is talking in voice chat (network_voice.c), down the view's
+left from below its middle: each machine's first player's name after its
+speaker (this machine's own too, as it talks), VOICE_SPEAKERS_SCALE times
+the HUD's text, in the colours of the names above players' heads (an ally's
+or an enemy's: hud_player_name_color; in co-op every player an ally), this
+machine's own white; while the scores are hidden */
+#define VOICE_SPEAKERS_SCALE 0.8f
+
+static void game_engine_rasterize_voice_speakers(
+	void)
+{
+	enum
+	{
+		MAXIMUM_SPEAKER_ROWS = 8,
+	};
+	rectangle2d bounds = render.camera.window_bounds;
+	long font_index = hud_get_font_index();
+	long machines_listed[MULTIPLAYER_MAXIMUM_PLAYERS];
+	short listed_count = 0;
+	struct data_iterator iterator;
+	struct player_datum *player;
+	struct font_header *font;
+	short line_height;
+	short row = 0;
+	short left;
+	short top;
+	struct player_datum *viewer;
+
+	if (font_index == NONE || !network_voice_available())
+		return;
+	offset_rectangle2d(&bounds, -render.camera.viewport_bounds.x0, -render.camera.viewport_bounds.y0);
+	font = font_definition_get(font_index);
+	line_height = (short)(font->leading_height + font->descending_height + font->ascending_height);
+	if (line_height <= 0)
+		return;
+	/* (laid out at full size, from the list's top left, and drawn scaled
+	about it) */
+	left = (short)(bounds.x0 + 16);
+	top = (short)(bounds.y0 + (bounds.y1 - bounds.y0) * 55 / 100);
+	rasterizer_text_set_scale(VOICE_SPEAKERS_SCALE, (real)left, (real)top);
+	viewer = local_player_get_next(NONE) != NONE ?
+		player_try_and_get(local_player_get_player_index(local_player_get_next(NONE))) : NULL;
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL && row < MAXIMUM_SPEAKER_ROWS)
+	{
+		long machine_index = player->network_player_data.machine_index;
+		real_argb_color color;
+		rectangle2d icon;
+		rectangle2d text;
+		short index;
+
+		if (player->quit_out_of_game)
+			continue;
+		for (index = 0; index < listed_count && machines_listed[index] != machine_index; index++)
+			;
+		if (index < listed_count || listed_count >= (short)NUMBEROF(machines_listed))
+			continue;
+		machines_listed[listed_count++] = machine_index;
+		if (!network_voice_machine_speaking(machine_index))
+			continue;
+		/* (the name after the speaker, which is centred on its capitals:
+		where they are drawn, scaled) */
+		text.x0 = (short)(left + line_height + 4);
+		text.x1 = (short)(left + (bounds.x1 - left) / VOICE_SPEAKERS_SCALE);
+		text.y0 = (short)(top + row * line_height);
+		text.y1 = (short)(text.y0 + line_height);
+		/* (allies as the names above heads have them: the same team) */
+		if (player->local_player_index != NONE)
+		{
+			color.alpha = 1.0f;
+			color.red = color.green = color.blue = 1.0f;
+		}
+		else
+		{
+			hud_player_name_color(!game_engine || (viewer && player->team_index == viewer->team_index), &color);
+		}
+		draw_string_set_draw_mode(font_index, NONE, 0, 0, &color);
+		icon.x0 = left;
+		icon.x1 = (short)(left + line_height * VOICE_SPEAKERS_SCALE);
+		icon.y0 = (short)(top + (draw_unicode_string_capital_middle(&text, player->name) - top) * VOICE_SPEAKERS_SCALE -
+			line_height * VOICE_SPEAKERS_SCALE / 2);
+		icon.y1 = (short)(icon.y0 + line_height * VOICE_SPEAKERS_SCALE);
+		network_voice_draw_icon(&icon, FALSE, 1.0f);
+		rasterizer_draw_unicode_string(&text, NULL, NULL, 0, player->name);
+		row++;
+	}
+	rasterizer_text_set_scale(1.0f, 0.0f, 0.0f);
+}
+
 static void game_engine_post_rasterize_in_game(
 	void)
 {
@@ -3031,7 +4035,7 @@ static void game_engine_post_rasterize_in_game(
 	match_assert(
 		"c:\\halo\\SOURCE\\game\\game_engine.c",
 		0x771,
-		NULL != game_engine);
+		NULL != game_engine || network_coop_active());
 
 	if (game_engine && player)
 		internal_rasterize_target_name(player_index);
@@ -3040,7 +4044,7 @@ static void game_engine_post_rasterize_in_game(
 	fade = game_engine_globals.hud_message_timers[local_player_index];
 	if ((!gamepad ||
 		!gamepad->buttons[_gamepad_binary_button_back]) &&
-		game_engine_globals.postgame_state != game_engine_mode_postgame_delay)
+		(!game_engine || game_engine_globals.postgame_state != game_engine_mode_postgame_delay))
 	{
 		/* a frame is no longer a tick (render_interpolation.c): fade in half
 		a second, not in 15 frames */
@@ -3058,6 +4062,15 @@ static void game_engine_post_rasterize_in_game(
 
 		game_engine_rasterize_in_game_score(player_index, alpha);
 	}
+	else if (local_player_count() <= 1)
+	{
+		/* (port: the full-screen scoreboard's scroll forgotten) */
+		game_engine_scoreboard_closed();
+	}
+	/* (port: who is talking, in the first view, while the scores are not
+	shown) */
+	if (fade <= 0.0f && local_player_index == local_player_get_next(NONE))
+		game_engine_rasterize_voice_speakers();
 
 	game_engine_globals.hud_message_timers[local_player_index] = fade;
 
@@ -3169,6 +4182,32 @@ boolean game_engine_showing_postgame(
 	return game_engine != NULL && game_engine_globals.postgame_state == game_engine_mode_postgame_rasterize;
 }
 
+/* port: whether a game is being played: one of no game engine's (the
+campaign, co-op), or its game not over (port/linux/game/latency_meter.c) */
+boolean game_engine_in_play(
+	void)
+{
+	return game_engine == NULL || game_engine_globals.postgame_state == game_engine_mode_active;
+}
+
+void game_variant_options_default(
+	struct game_variant const *variant,
+	struct game_variant_options *options)
+{
+	csmemset(options, 0, sizeof(*options));
+	options->friendly_fire = _friendly_fire_on;
+	options->loadout = _loadout_category;
+	options->primary_weapon = _loadout_weapon_assault_rifle;
+	options->secondary_weapon = _loadout_weapon_pistol;
+	options->radar_players = variant &&
+		!TEST_FLAG(variant->universal_variant.flags, _game_variant_draw_object_in_motion_sensor_bit) ?
+		_radar_players_none : _radar_players_all;
+	options->vehicle_set[0] = options->vehicle_set[1] =
+		variant ? (byte)variant->universal_variant.vehicle_set : 0;
+
+	return;
+}
+
 boolean game_engine_force_single_screen(
 	void)
 {
@@ -3222,7 +4261,6 @@ static void game_engine_build_lighting(
 	void)
 {
 	long player_count = 0;
-	long object_count = 0;
 
 	{
 		struct data_iterator iterator;
@@ -3232,54 +4270,10 @@ static void game_engine_build_lighting(
 			player_count++;
 	}
 
-	if (global_variant.universal_variant.vehicle_set != _game_engine_vehicles_none)
-	{
-		if (global_variant.game_engine_index == game_engine_race)
-		{
-			struct scenario *scenario = global_scenario_get();
-			short flag_index;
-
-			for (flag_index = 0;
-				flag_index < scenario->netgame_flags.count;
-				flag_index++)
-			{
-				struct scenario_netgame_flag *flag = TAG_BLOCK_GET_ELEMENT(
-					&scenario->netgame_flags,
-					flag_index,
-					struct scenario_netgame_flag);
-
-				if (flag->type == _netgame_flag_race_vehicle)
-					object_count++;
-			}
-
-			if (object_count > player_count)
-				object_count = player_count;
-		}
-		else
-		{
-			struct object_iterator object_iterator;
-
-			object_iterator_new(
-				&object_iterator,
-				_object_mask_vehicle,
-				0);
-			while (object_iterator_next(&object_iterator))
-				object_count++;
-		}
-	}
-
-	if ((player_count > 8 && object_count >= 2) ||
-		player_count >= 13)
-	{
-		SET_FLAG(game_engine_globals.flags, _game_engine_disable_dynamic_light_bit, TRUE);
-	}
-
-	if (player_count > 4 ||
-		object_count >= 4 ||
-		TEST_FLAG(game_engine_globals.flags, _game_engine_disable_dynamic_light_bit))
-	{
-		SET_FLAG(game_engine_globals.flags, _game_engine_disable_integrated_lights_bit, TRUE);
-	}
+	/* port: the Xbox turned dynamic lights off past 13 players, or past 8
+	with two vehicles, and the flashlight off past 4 players or 4 vehicles.
+	A match on a map with a few vehicles then had a flashlight, and the next
+	one did not. The beam is a dynamic light, so both stay on. */
 
 	if (player_count >= 5)
 		SET_FLAG(game_engine_globals.flags, _game_engine_5_or_more_players_bit, TRUE);
@@ -3380,6 +4374,12 @@ void game_engine_post_rasterize(
 				!"unreachable");
 			break;
 		}
+	}
+	/* port: network co-op's campaign has the scoreboard too, of names and
+	pings (game_engine_rasterize_scoreboard) */
+	else if (network_coop_active())
+	{
+		game_engine_post_rasterize_in_game();
 	}
 
 	return;
@@ -3642,6 +4642,220 @@ static void game_engine_update_teleporter(
 	return;
 }
 
+/* port: the gametype's vehicle respawn time (game_variant_options): the
+host puts a vehicle destroyed, or left empty away from where the map put
+it, back there after the time (the clients get the host's: the distributed
+netcode). Vehicles otherwise stay where they are left (the Xbox game's). */
+enum
+{
+	/* (a map places up to 80 vehicles, a Custom Edition map more: those
+	past this never came back) */
+	MAXIMUM_VEHICLE_HOMES = 1024
+};
+
+static struct
+{
+	long object_index;
+	long definition_index;
+	real_point3d position;
+	real_vector3d forward;
+	real_vector3d up;
+	long idle_since;
+	/* (the scenario name the map's scripts teleport; NONE when it had none) */
+	short name_index;
+} game_engine_vehicle_homes[MAXIMUM_VEHICLE_HOMES];
+static short game_engine_vehicle_home_count = NONE;
+
+/* still on the pad the map put it on: further than this, and empty, it can
+come back */
+#define VEHICLE_HOME_AWAY_SQUARED 4.0f
+
+/* whether nobody rides the vehicle: no driver or gunner, and no rider among
+its children (which hold its own weapons too) */
+static boolean game_engine_vehicle_empty(
+	struct unit_datum *vehicle)
+{
+	long child_index;
+
+	if (vehicle->unit.driver_object_index != NONE || vehicle->unit.gunner_object_index != NONE)
+		return FALSE;
+	for (child_index = vehicle->object.first_child_object_index; child_index != NONE;
+		child_index = object_get(child_index)->object.next_object_index)
+	{
+		if (object_get(child_index)->object.type == _object_type_biped)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* a living vehicle of the home's kind on its pad, but except, that no other
+home follows (one a map's script put there in place of the home's: another
+home's vehicle parked there is still that home's), else NONE */
+static long game_engine_vehicle_home_on_pad(
+	short home,
+	long except)
+{
+	struct object_iterator iterator;
+
+	object_iterator_new(&iterator, _object_mask_vehicle, 0);
+	while (object_iterator_next(&iterator))
+	{
+		struct object_datum *object = object_get(iterator.index);
+		real dx = object->object.position.x - game_engine_vehicle_homes[home].position.x;
+		real dy = object->object.position.y - game_engine_vehicle_homes[home].position.y;
+		real dz = object->object.position.z - game_engine_vehicle_homes[home].position.z;
+		short other;
+
+		if (iterator.index == except || TEST_FLAG(object->object.damage_flags, _object_dead_bit) ||
+			object->definition_index != game_engine_vehicle_homes[home].definition_index ||
+			dx * dx + dy * dy + dz * dz > VEHICLE_HOME_AWAY_SQUARED)
+		{
+			continue;
+		}
+		for (other = 0; other < game_engine_vehicle_home_count; other++)
+		{
+			if (other != home && game_engine_vehicle_homes[other].object_index == iterator.index)
+				break;
+		}
+		if (other == game_engine_vehicle_home_count)
+			return iterator.index;
+	}
+	return NONE;
+}
+
+/* the home follows this vehicle, which keeps (or takes) the home's name */
+static void game_engine_vehicle_home_follow(
+	short home,
+	long object_index)
+{
+	game_engine_vehicle_homes[home].object_index = object_index;
+	if (game_engine_vehicle_homes[home].name_index == NONE)
+		game_engine_vehicle_homes[home].name_index = object_get(object_index)->object.name_index;
+	else
+		object_claim_scenario_name(object_index, game_engine_vehicle_homes[home].name_index);
+}
+
+/* the vehicle this home should follow. The recorded one, if it is still
+alive. A map script often destroys that one and creates it again under the
+same name, or in its place: that one is this home's vehicle, and a second is
+not put on the pad with it. */
+static long game_engine_vehicle_home_current(
+	short home)
+{
+	long object_index = game_engine_vehicle_homes[home].object_index;
+	struct unit_datum *vehicle = unit_try_and_get(object_index);
+	long named_index;
+
+	if (vehicle && !TEST_FLAG(vehicle->object.damage_flags, _object_dead_bit))
+		return object_index;
+
+	named_index = game_engine_vehicle_homes[home].name_index == NONE ? NONE :
+		object_index_from_name_index(game_engine_vehicle_homes[home].name_index);
+	vehicle = unit_try_and_get(named_index);
+	if (vehicle && !TEST_FLAG(vehicle->object.damage_flags, _object_dead_bit))
+	{
+		game_engine_vehicle_homes[home].object_index = named_index;
+		return named_index;
+	}
+
+	object_index = game_engine_vehicle_home_on_pad(home, NONE);
+	if (object_index != NONE)
+		game_engine_vehicle_home_follow(home, object_index);
+	return object_index;
+}
+
+static void game_engine_update_vehicle_respawn(
+	void)
+{
+	long respawn_ticks = game_variant_options_get()->vehicle_respawn_time * TICKS_PER_SECOND;
+	long now = game_time_get();
+	short index;
+
+	if (respawn_ticks <= 0 || network_game_distributed_client() || now % TICKS_PER_SECOND)
+		return;
+	/* (where the map put them: the vehicles there at the first look) */
+	if (game_engine_vehicle_home_count == NONE)
+	{
+		struct object_iterator iterator;
+
+		game_engine_vehicle_home_count = 0;
+		object_iterator_new(&iterator, _object_mask_vehicle, 0);
+		while (object_iterator_next(&iterator) && game_engine_vehicle_home_count < MAXIMUM_VEHICLE_HOMES)
+		{
+			struct object_datum *object = object_get(iterator.index);
+			short home = game_engine_vehicle_home_count++;
+
+			game_engine_vehicle_homes[home].object_index = iterator.index;
+			game_engine_vehicle_homes[home].definition_index = object->definition_index;
+			game_engine_vehicle_homes[home].position = object->object.position;
+			object_get_orientation(iterator.index, &game_engine_vehicle_homes[home].forward,
+				&game_engine_vehicle_homes[home].up);
+			game_engine_vehicle_homes[home].idle_since = NONE;
+			game_engine_vehicle_homes[home].name_index = object->object.name_index;
+		}
+	}
+	for (index = 0; index < game_engine_vehicle_home_count; index++)
+	{
+		long object_index = game_engine_vehicle_home_current(index);
+		struct unit_datum *vehicle = unit_try_and_get(object_index);
+		boolean waiting = TRUE;
+
+		if (vehicle && !TEST_FLAG(vehicle->object.damage_flags, _object_dead_bit))
+		{
+			real dx = vehicle->object.position.x - game_engine_vehicle_homes[index].position.x;
+			real dy = vehicle->object.position.y - game_engine_vehicle_homes[index].position.y;
+			real dz = vehicle->object.position.z - game_engine_vehicle_homes[index].position.z;
+
+			waiting = dx * dx + dy * dy + dz * dz > VEHICLE_HOME_AWAY_SQUARED && game_engine_vehicle_empty(vehicle);
+		}
+		if (!waiting)
+			game_engine_vehicle_homes[index].idle_since = NONE;
+		else if (game_engine_vehicle_homes[index].idle_since == NONE)
+			game_engine_vehicle_homes[index].idle_since = now;
+		else if (now - game_engine_vehicle_homes[index].idle_since >= respawn_ticks)
+		{
+			struct object_placement_data placement_data;
+			long stale_index = game_engine_vehicle_homes[index].object_index;
+			long named_index = game_engine_vehicle_homes[index].name_index == NONE ? NONE :
+				object_index_from_name_index(game_engine_vehicle_homes[index].name_index);
+			struct unit_datum *named = unit_try_and_get(named_index);
+			long on_pad = game_engine_vehicle_home_on_pad(index, object_index);
+
+			/* (a vehicle under the home's name that someone rides is theirs:
+			the home follows it, and waits for it) */
+			if (named && named_index != stale_index && !TEST_FLAG(named->object.damage_flags, _object_dead_bit) &&
+				!game_engine_vehicle_empty(named))
+			{
+				game_engine_vehicle_homes[index].object_index = named_index;
+				game_engine_vehicle_homes[index].idle_since = NONE;
+				continue;
+			}
+			/* (the home's vehicle, empty or wrecked, goes; and the one under
+			its name, but for one on the pad, which it follows instead of a
+			new one: as many vehicles as before) */
+			if (unit_try_and_get(stale_index))
+				object_delete(stale_index);
+			if (named && named_index != stale_index && named_index != on_pad)
+				object_delete(named_index);
+			if (on_pad != NONE)
+			{
+				game_engine_vehicle_home_follow(index, on_pad);
+				game_engine_vehicle_homes[index].idle_since = NONE;
+				continue;
+			}
+			object_placement_data_new(&placement_data, game_engine_vehicle_homes[index].definition_index, NONE);
+			placement_data.position = game_engine_vehicle_homes[index].position;
+			placement_data.forward = game_engine_vehicle_homes[index].forward;
+			placement_data.up = game_engine_vehicle_homes[index].up;
+			game_engine_vehicle_homes[index].object_index = object_new(&placement_data);
+			object_claim_scenario_name(
+				game_engine_vehicle_homes[index].object_index,
+				game_engine_vehicle_homes[index].name_index);
+			game_engine_vehicle_homes[index].idle_since = NONE;
+		}
+	}
+}
+
 void game_engine_update(
 	void)
 {
@@ -3651,6 +4865,7 @@ void game_engine_update(
 		game_engine_update_purge();
 		game_engine_update_weapons();
 		game_engine_update_item_spawn();
+		game_engine_update_vehicle_respawn();
 
 		{
 			struct data_iterator player_iterator;
@@ -3801,6 +5016,10 @@ enum
 	_equipment_created_at_rest_bit = 0,
 };
 
+/* port: each player's friendly fire penalty (game_variant_options), added to
+his next respawn: by the player's absolute index */
+static short game_engine_betrayal_penalty[HALO_PORT_MAXIMUM_NETWORK_PLAYERS];
+
 void game_engine_player_killed(
 	long killing_player_index,
 	long killing_object_index,
@@ -3825,6 +5044,16 @@ void game_engine_player_killed(
 	killer (port/linux/game/network_distributed.c) */
 	network_distributed_player_killed(&killing_player_index, &killing_object_index, dead_player_index,
 		&friendly_fire);
+	/* port: a killer who has left the game since is no one's kill */
+	if (killing_player_index != NONE && !player_try_and_get(killing_player_index))
+		killing_player_index = NONE;
+	/* the host's kill of a player who quit, ahead of this client's clock
+	(game_update_quit_players has not come to its time yet) */
+	if (network_game_distributed_client() && dead_player->quit_out_of_game_time != NONE &&
+		killing_player_index == dead_player_index)
+	{
+		dead_player->quit_out_of_game = TRUE;
+	}
 	dead_player->death_time = game_time_get();
 	if (game_engine->player_killed_player)
 	{
@@ -3863,6 +5092,56 @@ void game_engine_player_killed(
 
 	if (!player_kill)
 		dead_player->respawn_timer += global_variant.universal_variant.suicide_penalty;
+
+	/* port: the gametype's auto team balance (game_variant_options): the host
+	moves the dead to the other team when his is two or more bigger (his
+	next unit is the other team's, which the clients take it from:
+	network_player_attach_unit) */
+	if (global_variant.universal_variant.teams && game_variant_options_get()->auto_team_balance &&
+		!network_game_distributed_client() && VALID_INDEX(dead_player->team_index, 2) && !dead_player->quit_out_of_game)
+	{
+		struct data_iterator iterator;
+		struct player_datum *player;
+		short count[2] = { 0, 0 };
+
+		data_iterator_new(&iterator, player_data);
+		while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL)
+		{
+			if (!player->quit_out_of_game && VALID_INDEX(player->team_index, 2))
+				count[player->team_index]++;
+		}
+		if (count[dead_player->team_index] >= count[1 - dead_player->team_index] + 2)
+		{
+			struct network_game_server *server = global_network_game_server_get();
+			struct network_game *game = server ? network_game_server_get_game(server) : NULL;
+			long list_index = dead_player->network_player_data.player_list_index;
+
+			dead_player->team_index = 1 - dead_player->team_index;
+			dead_player->network_player_data.team_index = (char)dead_player->team_index;
+			/* (and the host's game record, which late joins count and the
+			lobby shows) */
+			if (game && VALID_INDEX(list_index, HALO_PORT_MAXIMUM_NETWORK_PLAYERS))
+				game->players[list_index].team_index = (char)dead_player->team_index;
+		}
+	}
+
+	/* port: the gametype's friendly fire penalty: the team killer's next
+	respawn later (the dead's own, if he has one waiting) */
+	{
+		long dead_absolute = DATUM_INDEX_TO_ABSOLUTE_INDEX(dead_player_index);
+
+		if (dead_absolute < HALO_PORT_MAXIMUM_NETWORK_PLAYERS)
+		{
+			dead_player->respawn_timer += game_engine_betrayal_penalty[dead_absolute];
+			game_engine_betrayal_penalty[dead_absolute] = 0;
+		}
+		if (friendly_fire && valid_players && !same_player && global_variant.universal_variant.teams &&
+			DATUM_INDEX_TO_ABSOLUTE_INDEX(killing_player_index) < HALO_PORT_MAXIMUM_NETWORK_PLAYERS)
+		{
+			game_engine_betrayal_penalty[DATUM_INDEX_TO_ABSOLUTE_INDEX(killing_player_index)] =
+				(short)(game_variant_options_get()->friendly_fire_penalty * TICKS_PER_SECOND);
+		}
+	}
 
 	dead_player->respawn_timer = MAX(dead_player->respawn_timer, 90);
 	dead_player = player_get(dead_player_index);
@@ -3955,6 +5234,12 @@ void game_engine_player_killed(
 			message = _game_engine_message_double_kill;
 		else if (killing_player->statistics.kills_in_a_row == 5)
 			message = _game_engine_message_five_kills_in_row;
+		/* port: none in a row is no spree. A network client's copy of the
+		killer's statistics can have this kill credited to no one, or to
+		someone else, before the host's statistics come (the Xbox's credited
+		the killer here, so never had none): Running Riot was announced */
+		else if (killing_player->statistics.kills_in_a_row <= 0)
+			message = _game_engine_message_killed_enemy;
 		else
 		{
 			message = (killing_player->statistics.kills_in_a_row % 5)
@@ -4052,6 +5337,16 @@ boolean game_engine_has_shield(
 	return has_shield;
 }
 
+/* port: the local player whose motion sensor is drawn (motion_sensor.c),
+for the gametype's FRIENDS radar (game_variant_options) */
+static short game_engine_motion_sensor_local_player = NONE;
+
+void game_engine_motion_sensor_viewer(
+	short local_player_index)
+{
+	game_engine_motion_sensor_local_player = local_player_index;
+}
+
 boolean game_engine_draw_object_in_motion_sensor(
 	long unit_index)
 {
@@ -4059,6 +5354,16 @@ boolean game_engine_draw_object_in_motion_sensor(
 
 	if (game_engine)
 		draw_object = TEST_FLAG(global_variant.universal_variant.flags, _game_variant_draw_object_in_motion_sensor_bit);
+	/* port: friends only: the viewer's team's */
+	if (draw_object && game_engine && global_variant.universal_variant.teams &&
+		game_variant_options_get()->radar_players == _radar_players_friends &&
+		game_engine_motion_sensor_local_player != NONE)
+	{
+		long player_index = local_player_get_player_index(game_engine_motion_sensor_local_player);
+		struct player_datum *viewer = player_index != NONE ? player_try_and_get(player_index) : NULL;
+
+		draw_object = viewer && object_get(unit_index)->object.owner_team_index == viewer->team_index;
+	}
 
 	return draw_object;
 }
@@ -4223,7 +5528,8 @@ long find_netgame_flags(
 {
 	real radius_squared = radius * radius;
 	long found_count = 0;
-	short flag_index;
+	/* port: a long counter, for a map's long count */
+	long flag_index;
 	struct scenario *scenario;
 
 	scenario = global_scenario_get();
@@ -4319,6 +5625,12 @@ boolean game_engine_should_end_game(
 
 	if (game_engine && !multiple_teams_alive())
 		should_end_game = TRUE;
+	/* port: the gametype's time limit (game_variant_options) */
+	if (game_engine && game_variant_options_get()->time_limit > 0 &&
+		game_time_get() >= game_variant_options_get()->time_limit * 60L * TICKS_PER_SECOND)
+	{
+		should_end_game = TRUE;
+	}
 
 	return should_end_game;
 }
@@ -4330,6 +5642,30 @@ void game_engine_clear_goal_position(
 	if (!VALID_INDEX(goal_index, NUMBEROF(global_goal)))
 		return;
 	csmemset(&global_goal[goal_index], 0, sizeof(struct netgame_goal));
+
+	return;
+}
+
+/* port: a flag or ball deleted on a client of the distributed netcode, on
+the host's word (port/linux/game/network_objects.c): the goals its game
+type's objective_weapon_update set at it each tick, which nothing else
+clears (ctf: its team's, and its carrier's goal; oddball: its team's) */
+void game_engine_objective_weapon_deleted(
+	long weapon_index)
+{
+	short team_index = weapon_get(weapon_index)->object.owner_team_index;
+
+	if (!game_engine || team_index == NONE)
+		return;
+	if (global_variant.game_engine_index == game_engine_ctf)
+	{
+		game_engine_clear_goal_position(team_index);
+		game_engine_clear_goal_position(team_index + 2);
+	}
+	else if (global_variant.game_engine_index == game_engine_oddball)
+	{
+		game_engine_clear_goal_position(team_index);
+	}
 
 	return;
 }
@@ -5053,7 +6389,9 @@ struct game_variant *build_game_variant_oddball(
 struct game_variant *build_game_variant_team_oddball(
 	struct game_variant *variant)
 {
-	struct game_variant result;
+	/* port: cleared, as every other builder's is: only some of its fields
+	are set below, and the rest were the stack's */
+	struct game_variant result = { 0 };
 
 	SET_FLAG(result.universal_variant.flags, _game_variant_draw_object_in_motion_sensor_bit, TRUE);
 	SET_FLAG(result.universal_variant.flags, _game_variant_allow_friendly_navpoints_bit, TRUE);
@@ -5966,6 +7304,9 @@ void game_engine_variant_cleanup(
 	variant->universal_variant.respawn_time = MAX(variant->universal_variant.respawn_time, 0);
 	variant->universal_variant.suicide_penalty = MAX(variant->universal_variant.suicide_penalty, 0);
 	variant->universal_variant.lives = MAX(variant->universal_variant.lives, 0);
+	/* port: a NaN passes no comparison, so PIN keeps it */
+	if (!(variant->universal_variant.health == variant->universal_variant.health))
+		variant->universal_variant.health = 1.0f;
 	variant->universal_variant.health = PIN(variant->universal_variant.health, 0.25f, 4.0f);
 	variant->universal_variant.weapon_set = PIN(variant->universal_variant.weapon_set, 0, NUMBER_OF_GAME_ENGINE_WEAPON_SETS - 1);
 	variant->universal_variant.vehicle_set = PIN(variant->universal_variant.vehicle_set, 0, NUMBER_OF_GAME_ENGINE_VEHICLE_SETS - 1);
@@ -6008,68 +7349,60 @@ void game_engine_variant_cleanup(
 	return;
 }
 
-static void game_engine_predict_resources(
-	void)
+/* port: one of the globals' three multiplayer vehicles (0 warthog, 1 ghost,
+2 scorpion), or NONE for one the map's globals lack: a Custom Edition map's
+may have fewer, which the original read past the end of */
+static long game_engine_multiplayer_vehicle(
+	long index)
 {
-	struct game_globals *game_globals;
-	struct game_globals_multiplayer_information *multiplayer_information;
-	struct game_globals_vehicle *vehicle;
-	long weapon_indices[10];
-	long weapon_index;
+	struct game_globals *game_globals = scenario_get_game_globals();
+	struct game_globals_multiplayer_information *information;
 
-	game_globals = scenario_get_game_globals();
-	multiplayer_information = TAG_BLOCK_GET_ELEMENT(
+	if (game_globals->multiplayer_information.count <= 0)
+		return NONE;
+	information = TAG_BLOCK_GET_ELEMENT(
 		&game_globals->multiplayer_information,
 		0,
 		struct game_globals_multiplayer_information);
+	if (index >= information->vehicles.count)
+		return NONE;
+	return TAG_BLOCK_GET_ELEMENT(&information->vehicles, index, struct game_globals_vehicle)->vehicle.index;
+}
+
+static void game_engine_predict_multiplayer_vehicle(
+	long index)
+{
+	long definition_index = game_engine_multiplayer_vehicle(index);
+
+	if (definition_index != NONE)
+		object_definition_predict(definition_index);
+}
+
+static void game_engine_predict_resources(
+	void)
+{
+	long weapon_indices[10];
+	long weapon_index;
 
 	switch (global_variant.universal_variant.vehicle_set)
 	{
 	case _game_engine_vehicles_warthog:
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			&multiplayer_information->vehicles,
-			0,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
+		game_engine_predict_multiplayer_vehicle(0);
 		break;
 
 	case _game_engine_vehicles_ghost:
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			&multiplayer_information->vehicles,
-			1,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
+		game_engine_predict_multiplayer_vehicle(1);
 		break;
 
 	case _game_engine_vehicles_tank:
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			&multiplayer_information->vehicles,
-			2,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
+		game_engine_predict_multiplayer_vehicle(2);
 		break;
 
 	default:
-	{
-		struct tag_block *vehicles = &multiplayer_information->vehicles;
-
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			vehicles,
-			0,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			vehicles,
-			1,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
-		vehicle = TAG_BLOCK_GET_ELEMENT(
-			vehicles,
-			2,
-			struct game_globals_vehicle);
-		object_definition_predict(vehicle->vehicle.index);
+		game_engine_predict_multiplayer_vehicle(0);
+		game_engine_predict_multiplayer_vehicle(1);
+		game_engine_predict_multiplayer_vehicle(2);
 		break;
-	}
 	}
 
 	object_definition_predict(list_index_to_weapon_definition_index(_weapon_list_frag_grenade));
@@ -6127,6 +7460,8 @@ void game_engine_initialize_for_new_map(
 		game_engine_intialize_queued_sounds();
 		csmemset(global_goal, 0, sizeof(global_goal));
 		game_engine_globals.next_team_index = 0;
+		csmemset(game_engine_betrayal_penalty, 0, sizeof(game_engine_betrayal_penalty));
+		game_engine_vehicle_home_count = NONE;
 		timeout_for_endgame_sound = 0;
 		game_engine_network_state_read = FALSE;
 
@@ -6156,6 +7491,9 @@ void game_engine_player_added(
 	long player_index)
 {
 	initialize_player_multiplayer_data(player_index);
+	/* port: not the friendly fire penalty of the slot's last player */
+	if (DATUM_INDEX_TO_ABSOLUTE_INDEX(player_index) < HALO_PORT_MAXIMUM_NETWORK_PLAYERS)
+		game_engine_betrayal_penalty[DATUM_INDEX_TO_ABSOLUTE_INDEX(player_index)] = 0;
 
 	if (game_engine)
 	{
@@ -6273,6 +7611,166 @@ real game_engine_get_starting_location_rating(
 	return default_starting_location_rate_function(player_index, starting_location);
 }
 
+/* port: the gametype's vehicles of each team (game_variant_options) */
+static byte game_engine_vehicles_placed[2][NUMBER_OF_VARIANT_VEHICLES];
+
+void game_engine_vehicle_placement_begin(
+	void)
+{
+	csmemset(game_engine_vehicles_placed, 0, sizeof(game_engine_vehicles_placed));
+}
+
+/* a vehicle definition's type: the globals' multiplayer vehicles (warthog,
+ghost, scorpion), else by its tag's name; NONE for none of them */
+static short game_engine_variant_vehicle_type(
+	long definition_index)
+{
+	struct game_globals *game_globals = scenario_get_game_globals();
+	struct game_globals_multiplayer_information *information;
+	char const *name;
+	short index;
+
+	if (definition_index == NONE)
+		return NONE;
+	if (game_globals->multiplayer_information.count > 0)
+	{
+		information = TAG_BLOCK_GET_ELEMENT(&game_globals->multiplayer_information, 0,
+			struct game_globals_multiplayer_information);
+		for (index = 0; index < 3 && index < information->vehicles.count; index++)
+		{
+			if (TAG_BLOCK_GET_ELEMENT(&information->vehicles, index, struct game_globals_vehicle)->vehicle.index ==
+				definition_index)
+			{
+				return index == 0 ? _variant_vehicle_warthog : index == 1 ? _variant_vehicle_ghost :
+					_variant_vehicle_scorpion;
+			}
+		}
+	}
+	name = tag_get_name(definition_index);
+	if (!name)
+		return NONE;
+	if (strstr(name, "rwarthog") || strstr(name, "rocket"))
+		return _variant_vehicle_rocket_warthog;
+	if (strstr(name, "banshee"))
+		return _variant_vehicle_banshee;
+	if (strstr(name, "turret"))
+		return _variant_vehicle_gun_turret;
+	if (strstr(name, "warthog"))
+		return _variant_vehicle_warthog;
+	if (strstr(name, "ghost"))
+		return _variant_vehicle_ghost;
+	if (strstr(name, "scorpion"))
+		return _variant_vehicle_scorpion;
+	return NONE;
+}
+
+/* the team whose spawn points are nearest the point (red's if none) */
+static short game_engine_nearest_team(
+	real_point3d const *point)
+{
+	struct scenario *scenario = global_scenario_get();
+	real best = -1.0f;
+	short team = 0;
+	long index;
+
+	for (index = 0; index < scenario->players.count; index++)
+	{
+		struct player_starting_location *location =
+			TAG_BLOCK_GET_ELEMENT(&scenario->players, index, struct player_starting_location);
+		real dx = location->position.x - point->x;
+		real dy = location->position.y - point->y;
+		real dz = location->position.z - point->z;
+		real distance = dx * dx + dy * dy + dz * dz;
+
+		if (VALID_INDEX(location->team_index, 2) && (best < 0.0f || distance < best))
+		{
+			best = distance;
+			team = location->team_index;
+		}
+	}
+	return team;
+}
+
+boolean game_engine_vehicle_placement_allowed(
+	struct scenario_object_datum const *placement,
+	struct tag_block *palette)
+{
+	struct game_variant_options const *options = game_variant_options_get();
+	short side, type;
+	byte set;
+
+	if (!game_engine || placement->palette_entry_index == NONE)
+		return TRUE;
+	side = global_variant.universal_variant.teams ? game_engine_nearest_team(&placement->position) : 0;
+	set = options->vehicle_set[side];
+	if (set == VARIANT_VEHICLE_SET_PC)
+		return TRUE;
+	type = game_engine_variant_vehicle_type(TAG_BLOCK_GET_ELEMENT(palette, placement->palette_entry_index,
+		struct scenario_object_palette_entry)->reference.index);
+	/* (the map's own: the multiplayer ones of the globals, as the Xbox
+	game's remap allows) */
+	if (set == _game_engine_vehicles_default)
+		return type == NONE || type <= _variant_vehicle_scorpion;
+	if (type == NONE)
+		return set != _game_engine_vehicles_none;
+	if (set == VARIANT_VEHICLE_SET_CUSTOM)
+	{
+		if (game_engine_vehicles_placed[side][type] >= options->vehicle_counts[side][type])
+			return FALSE;
+		game_engine_vehicles_placed[side][type]++;
+		return TRUE;
+	}
+	/* (the sets: none, then each type alone, in the options' order) */
+	return set != _game_engine_vehicles_none && set - _game_engine_vehicles_warthog == type;
+}
+
+/* port: the gametype's friendly fire (game_variant_options) on a teammate's
+hit of the object (its damage marked friendly: object_cause_damage): all of
+it, none, its shields only, or explosives' only. A player's own hit of
+himself, or of what is not a player's teammate's, is the game's own. */
+short game_engine_friendly_damage(
+	long attacker_player_index,
+	long object_index,
+	boolean explosive)
+{
+	struct game_variant_options const *options = game_variant_options_get();
+	struct player_datum *attacker;
+	short friendly_fire;
+
+	/* port: network co-op's friendly fire is Server Setup's FRIENDLY FIRE,
+	in the host's game settings (only the host deals damage), between its
+	players: their AI allies they always hurt, as in the campaign. Each
+	player also has a choice of their own (network_coop_players_friendly_fire) */
+	if (network_coop_active())
+	{
+		struct network_game *game = network_game_get_game();
+		struct unit_datum *unit = (struct unit_datum *)object_try_and_get_and_verify_type(object_index,
+			_object_mask_unit);
+
+		if (!game || !unit || unit->unit.player_index == NONE)
+			return _friendly_damage_all;
+		if (!network_coop_players_friendly_fire(attacker_player_index, unit->unit.player_index))
+			return _friendly_damage_none;
+		friendly_fire = game->variant_options.friendly_fire;
+	}
+	else if (!game_engine || !global_variant.universal_variant.teams)
+		return _friendly_damage_all;
+	else
+		friendly_fire = options->friendly_fire;
+	if (attacker_player_index == NONE || friendly_fire == _friendly_fire_on)
+		return _friendly_damage_all;
+	attacker = (struct player_datum *)datum_try_and_get(player_data, attacker_player_index);
+	if (!attacker || attacker->unit_index == object_index)
+		return _friendly_damage_all;
+	switch (friendly_fire)
+	{
+	case _friendly_fire_off: return _friendly_damage_none;
+	case _friendly_fire_shields_only: return _friendly_damage_shields;
+	case _friendly_fire_explosives_only: return explosive ? _friendly_damage_all : _friendly_damage_none;
+	}
+	return _friendly_damage_all;
+}
+
 real game_engine_get_damage_multiplier(
 	long damaging_player_index,
 	long damaged_player_index)
@@ -6304,66 +7802,58 @@ long game_engine_remap_vehicle(
 {
 	long result = vehicle_definition_index;
 
+	/* port: a Halo Custom Edition map's vehicles are chosen by their
+	placements, and its scripts may create any
+	(port/linux/game/custom_edition_objects.c) */
+	if (custom_edition_vehicles_by_placement())
+		return result;
+	/* port: and the PC vehicle set's are every one the map places
+	(game_engine_vehicle_placement_allowed) */
+	if (game_engine && (game_variant_options_get()->vehicle_set[0] == VARIANT_VEHICLE_SET_PC ||
+		game_variant_options_get()->vehicle_set[1] == VARIANT_VEHICLE_SET_PC))
+	{
+		return result;
+	}
 	if (game_engine)
 	{
-		struct game_globals *game_globals;
-		struct game_globals_multiplayer_information *multiplayer_information;
-		struct tag_block *vehicles;
-		struct game_globals_vehicle *vehicle0;
-		struct game_globals_vehicle *vehicle1;
-		struct game_globals_vehicle *vehicle2;
-		struct game_globals_vehicle *vehicle;
+		/* (port: NONE for one the map's globals lack) */
+		long vehicle0 = game_engine_multiplayer_vehicle(0);
+		long vehicle1 = game_engine_multiplayer_vehicle(1);
+		long vehicle2 = game_engine_multiplayer_vehicle(2);
 
-		game_globals = scenario_get_game_globals();
-		multiplayer_information = TAG_BLOCK_GET_ELEMENT(
-			&game_globals->multiplayer_information,
-			0,
-			struct game_globals_multiplayer_information);
-		vehicle0 = TAG_BLOCK_GET_ELEMENT(
-			&multiplayer_information->vehicles,
-			0,
-			struct game_globals_vehicle);
-		vehicles = &multiplayer_information->vehicles;
-		vehicle1 = TAG_BLOCK_GET_ELEMENT(vehicles, 1, struct game_globals_vehicle);
-		vehicle2 = TAG_BLOCK_GET_ELEMENT(vehicles, 2, struct game_globals_vehicle);
-
-		if (result != vehicle0->vehicle.index &&
-			result != vehicle1->vehicle.index &&
-			result != vehicle2->vehicle.index)
+		/* (port: and the other types a gametype's sets name, which a map may
+		have: game_engine_variant_vehicle_type) */
+		if (result != vehicle0 &&
+			result != vehicle1 &&
+			result != vehicle2 &&
+			((game_variant_options_get()->vehicle_set[0] == _game_engine_vehicles_default &&
+				game_variant_options_get()->vehicle_set[1] == _game_engine_vehicles_default) ||
+				game_engine_variant_vehicle_type(result) == NONE))
 		{
 			result = NONE;
 		}
 
-		switch (global_variant.universal_variant.vehicle_set)
+		/* port: the per-team sets decide at placement
+		(game_engine_vehicle_placement_allowed) */
+		switch (game_variant_options_get()->vehicle_set[0] == game_variant_options_get()->vehicle_set[1] ?
+			global_variant.universal_variant.vehicle_set : _game_engine_vehicles_default)
 		{
 		case _game_engine_vehicles_none:
 			result = NONE;
 			break;
 
 		case _game_engine_vehicles_warthog:
-			vehicle = TAG_BLOCK_GET_ELEMENT(
-				vehicles,
-				0,
-				struct game_globals_vehicle);
-			if (vehicle->vehicle.index != result)
+			if (vehicle0 != result)
 				result = NONE;
 			break;
 
 		case _game_engine_vehicles_ghost:
-			vehicle = TAG_BLOCK_GET_ELEMENT(
-				vehicles,
-				1,
-				struct game_globals_vehicle);
-			if (vehicle->vehicle.index != result)
+			if (vehicle1 != result)
 				result = NONE;
 			break;
 
 		case _game_engine_vehicles_tank:
-			vehicle = TAG_BLOCK_GET_ELEMENT(
-				vehicles,
-				2,
-				struct game_globals_vehicle);
-			if (vehicle->vehicle.index != result)
+			if (vehicle2 != result)
 				result = NONE;
 			break;
 		}
@@ -6385,8 +7875,14 @@ long game_engine_remap_weapon(
 		return weapon_definition_index;
 	}
 
-	if (weapon_list_index == _weapon_list_flamethrower)
+	/* (port: and the gravity rifle, a cut weapon, as the flamethrower,
+	which the Xbox's maps have unfinished: neither is a multiplayer weapon) */
+	if (weapon_list_index == _weapon_list_flamethrower || weapon_list_index == _weapon_list_gravity_rifle)
 		weapon_list_index = _weapon_list_rocket_launcher;
+
+	/* port: a custom loadout (game_variant_options) has no weapon set */
+	if (game_variant_options_get()->loadout == _loadout_custom)
+		return list_index_to_weapon_definition_index(weapon_list_index);
 
 	switch (global_variant.universal_variant.weapon_set)
 	{
@@ -6482,6 +7978,40 @@ long game_engine_remap_weapon(
 			break;
 		}
 		break;
+
+	/* port: the PC version's sets. Covenant: the Covenant's weapons (the
+	needler for the rocket launcher: the Xbox's maps have no fuel rod) */
+	case _game_engine_weapons_covenant:
+		switch (weapon_list_index)
+		{
+		case _weapon_list_assault_rifle:
+			weapon_list_index = _weapon_list_plasma_rifle;
+			break;
+
+		case _weapon_list_pistol:
+			weapon_list_index = _weapon_list_plasma_pistol;
+			break;
+
+		case _weapon_list_shotgun:
+		case _weapon_list_sniper_rifle:
+			weapon_list_index = _weapon_list_needler;
+			break;
+
+		case _weapon_list_rocket_launcher:
+			weapon_list_index = _weapon_list_needler;
+			break;
+		}
+		break;
+
+	/* classic: the Xbox game's weapons (the flamethrower and the gravity
+	rifle are already rocket launchers) */
+	case _game_engine_weapons_classic:
+		break;
+
+	/* heavy weapons: rocket launchers */
+	case _game_engine_weapons_heavy:
+		weapon_list_index = _weapon_list_rocket_launcher;
+		break;
 	}
 
 	return list_index_to_weapon_definition_index(weapon_list_index);
@@ -6521,7 +8051,8 @@ static void netgame_flag_verify_no_team_duplicates(
 	char const *error_message)
 {
 	struct scenario *scenario = global_scenario_get();
-	short flag_index;
+	/* port: long counters, for a map's long count */
+	long flag_index;
 
 	for (flag_index = 0;
 		flag_index < scenario->netgame_flags.count;
@@ -6531,7 +8062,7 @@ static void netgame_flag_verify_no_team_duplicates(
 			&scenario->netgame_flags,
 			flag_index,
 			struct scenario_netgame_flag);
-		short duplicate_index;
+		long duplicate_index;
 
 		if (flag_type != flag->type)
 			continue;
@@ -6657,7 +8188,8 @@ static void netgame_flag_verify_team_range(
 	char const *error_message)
 {
 	struct scenario *scenario = global_scenario_get();
-	short flag_index;
+	/* port: a long counter, for a map's long count */
+	long flag_index;
 
 	for (flag_index = 0;
 		flag_index < scenario->netgame_flags.count;
@@ -6688,7 +8220,8 @@ static void netgame_verify_equipment(
 {
 	long matching_count = 0;
 	struct scenario *scenario = global_scenario_get();
-	short equipment_index;
+	/* port: a long counter, for a map's long count */
+	long equipment_index;
 
 	for (equipment_index = 0;
 		equipment_index < scenario->netgame_equipment.count;
@@ -6786,12 +8319,7 @@ static void game_engine_verify_current_map(
 		_netgame_flag_race_track,
 		"NETGAME MAP FAILURE: duplicate race track flag [team %d]");
 
-	/* BUG (preserved for exact matching): January passes team index zero for
-	 * both CTF checks, and netgame_verify_spawn_points never reads that
-	 * formal parameter.
-	 * A corrected build should filter starting locations by an authoritatively
-	 * recovered team-index field before reporting per-team counts.
-	 */
+	/* (the team index is not read: both checks count every ctf spawn) */
 	netgame_verify_spawn_points(
 		game_engine_ctf,
 		0,
@@ -6952,7 +8480,11 @@ static boolean internal_rasterize_score(
 		if (message >= _game_engine_message_multi_kill_with_score &&
 			message <= _game_engine_message_killed_enemy_with_score)
 		{
-			score = game_engine->get_player_score(player_index, TRUE);
+			/* port: a client of the distributed netcode replaying the host's
+			killing blow: the score the host's game type gave its killer
+			(its own has it only once the game type's state comes) */
+			if (!network_damage_killer_score(player_index, &score))
+				score = game_engine->get_player_score(player_index, TRUE);
 		}
 	}
 
@@ -6967,7 +8499,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			player->name);
 		break;
 	case _game_engine_message_killed_by_unknown:
@@ -6979,7 +8511,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			player->name);
 		break;
 	case _game_engine_message_killed_by_biped:
@@ -6991,7 +8523,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			player->name);
 		break;
 	case _game_engine_message_killed_by_vehicle:
@@ -7003,7 +8535,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			player->name);
 		break;
 	case _game_engine_message_killed_by_player:
@@ -7016,7 +8548,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "ss"),
 			player->name,
 			other_player->name);
 		break;
@@ -7030,7 +8562,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "ss"),
 			player->name,
 			other_player->name);
 		break;
@@ -7044,7 +8576,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			other_player->name);
 		break;
 	case _game_engine_message_killed_by_self:
@@ -7056,7 +8588,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			player->name);
 		break;
 	case _game_engine_message_killed_friendly:
@@ -7069,7 +8601,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			other_player->name);
 		break;
 	case _game_engine_message_multi_kill:
@@ -7142,7 +8674,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "s"),
 			other_player->name);
 		break;
 	case _game_engine_message_multi_kill_with_score:
@@ -7154,7 +8686,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			score);
 		game_engine_play_multiplayer_sound(_multiplayer_sound_killtacular_kill);
 		break;
@@ -7167,7 +8699,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			score);
 		game_engine_play_multiplayer_sound(_multiplayer_sound_triple_kill);
 		break;
@@ -7180,7 +8712,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			score);
 		game_engine_play_multiplayer_sound(_multiplayer_sound_double_kill);
 		break;
@@ -7193,7 +8725,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			score);
 		game_engine_play_multiplayer_sound(_multiplayer_sound_running_riot);
 		break;
@@ -7206,7 +8738,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			score);
 		game_engine_play_multiplayer_sound(_multiplayer_sound_killing_spree);
 		break;
@@ -7220,7 +8752,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "sd"),
 			other_player->name,
 			score);
 		break;
@@ -7255,7 +8787,7 @@ static boolean internal_rasterize_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			format,
+			ustring_format_checked(format, "d"),
 			message_data);
 		break;
 	case _game_engine_message_waiting_for_space_to_clear:
@@ -7381,7 +8913,8 @@ static void game_engine_update_item_spawn(
 	void)
 {
 	struct scenario *scenario = global_scenario_get();
-	short equipment_index;
+	/* port: a long counter, for a map's long count */
+	long equipment_index;
 
 	/* a client of the distributed netcode has the host's items
 	(port/linux/game/network_distributed.c) */
@@ -7430,11 +8963,21 @@ static void game_engine_update_item_spawn(
 				struct object_placement_data placement_data;
 				long object_index;
 
+				/* port: the gametype's no weapons on the map */
+				if (definition_index != NONE && game_variant_options_get()->no_map_weapons &&
+					object_definition_get(definition_index)->object.type == _object_type_weapon)
+				{
+					continue;
+				}
 				object_placement_data_new(
 					&placement_data,
 					definition_index,
 					NONE);
 				placement_data.position = equipment->position;
+				/* port: Halo PC faces a Custom Edition map's items the way
+				their placements do, where the Xbox copied only the position */
+				if (custom_edition_cache_tags_loaded())
+					vector3d_from_angle(&placement_data.forward, equipment->facing);
 				object_index = object_new(&placement_data);
 				if (object_index != NONE)
 				{
@@ -7543,6 +9086,70 @@ static void handle_custom_starting_equipment(
 	return;
 }
 
+/* port: a custom loadout's weapon's place in the globals' weapon list
+(game_engine_h's _loadout_weapon_*, from the assault rifle); random: one
+of those the map has */
+static long game_engine_loadout_weapon_definition(
+	byte weapon)
+{
+	static short const list_indices[] =
+	{
+		_weapon_list_assault_rifle, _weapon_list_pistol, _weapon_list_shotgun, _weapon_list_sniper_rifle,
+		_weapon_list_rocket_launcher, _weapon_list_plasma_pistol, _weapon_list_plasma_rifle, _weapon_list_needler
+	};
+	short index;
+
+	if (weapon == _loadout_weapon_random)
+	{
+		long available[NUMBEROF(list_indices)];
+		short count = 0;
+
+		for (index = 0; index < NUMBEROF(list_indices); index++)
+		{
+			long definition_index = list_index_to_weapon_definition_index(list_indices[index]);
+
+			if (definition_index != NONE)
+				available[count++] = definition_index;
+		}
+		return count ? available[local_random_range(0, count)] : NONE;
+	}
+	index = (short)(weapon - _loadout_weapon_assault_rifle);
+	return index >= 0 && index < NUMBEROF(list_indices) ? list_index_to_weapon_definition_index(list_indices[index]) :
+		NONE;
+}
+
+/* port: the unit's weapons the loadout's (its others gone): the primary,
+then the secondary */
+static void game_engine_give_loadout(
+	long unit_index)
+{
+	struct game_variant_options const *options = game_variant_options_get();
+	byte const weapons[2] = { options->primary_weapon, options->secondary_weapon };
+	boolean first = TRUE;
+	short index;
+
+	unit_delete_all_weapons(unit_index);
+	for (index = 0; index < 2; index++)
+	{
+		long definition_index = game_engine_loadout_weapon_definition(weapons[index]);
+		struct object_placement_data placement_data;
+		long weapon_index;
+
+		if (definition_index == NONE)
+			continue;
+		object_placement_data_new(&placement_data, definition_index, NONE);
+		weapon_index = object_new(&placement_data);
+		if (weapon_index == NONE)
+			continue;
+		if (!first && unit_has_weapon_definition_index(unit_index, definition_index))
+			object_delete(weapon_index);
+		else if (unit_add_weapon_to_inventory(unit_index, weapon_index, first ? 2 : 0))
+			first = FALSE;
+		else
+			object_delete(weapon_index);
+	}
+}
+
 void game_engine_postspawn_player_update(
 	long player_index)
 {
@@ -7591,7 +9198,12 @@ void game_engine_postspawn_player_update(
 			fragmentation_grenade_count;
 		long starting_plasma_grenade_count = 0;
 
-		if (!TEST_FLAG(global_variant.universal_variant.flags, _game_variant_generic_starting_equipment_bit))
+		/* port: a custom loadout's weapons (game_variant_options) */
+		if (game_variant_options_get()->loadout == _loadout_custom)
+		{
+			game_engine_give_loadout(unit_index);
+		}
+		else if (!TEST_FLAG(global_variant.universal_variant.flags, _game_variant_generic_starting_equipment_bit))
 		{
 			handle_custom_starting_equipment(
 				unit_index,
@@ -7982,15 +9594,26 @@ static void netgame_verify_spawn_points(
 }
 
 long game_engine_slayer_write_network_state(byte *buffer, long size);
-void game_engine_slayer_read_network_state(byte const *buffer, long size, boolean first);
+boolean game_engine_slayer_read_network_state(byte const *buffer, long size, boolean first);
 long game_engine_ctf_write_network_state(byte *buffer, long size);
-void game_engine_ctf_read_network_state(byte const *buffer, long size, boolean first);
+boolean game_engine_ctf_read_network_state(byte const *buffer, long size, boolean first);
 long game_engine_oddball_write_network_state(byte *buffer, long size);
-void game_engine_oddball_read_network_state(byte const *buffer, long size, boolean first);
+boolean game_engine_oddball_read_network_state(byte const *buffer, long size, boolean first);
 long game_engine_king_write_network_state(byte *buffer, long size);
-void game_engine_king_read_network_state(byte const *buffer, long size, boolean first);
+boolean game_engine_king_read_network_state(byte const *buffer, long size, boolean first);
 long game_engine_race_write_network_state(byte *buffer, long size);
-void game_engine_race_read_network_state(byte const *buffer, long size, boolean first);
+boolean game_engine_race_read_network_state(byte const *buffer, long size, boolean first);
+
+/* the distributed netcode (port/linux/game/network_damage.c): a player's
+score as the game type has it (with its killing blows' messages), 0 for
+none */
+long game_engine_network_player_score(
+	long player_index)
+{
+	if (!game_engine || !game_engine->get_player_score)
+		return 0;
+	return game_engine->get_player_score(player_index, TRUE);
+}
 
 /* the distributed netcode (port/linux/game/network_distributed.c): the
 current game type's state (scores, and what else every machine must agree
@@ -8028,6 +9651,7 @@ void game_engine_read_network_state(
 {
 	long postgame_state;
 	boolean first;
+	boolean read;
 
 	if (!game_engine || size < (long)sizeof(postgame_state))
 		return;
@@ -8035,16 +9659,20 @@ void game_engine_read_network_state(
 	buffer += sizeof(postgame_state);
 	size -= sizeof(postgame_state);
 	first = !game_engine_network_state_read;
-	game_engine_network_state_read = TRUE;
 	switch (game_engine_get_type())
 	{
-	case game_engine_ctf: game_engine_ctf_read_network_state(buffer, size, first); break;
-	case game_engine_slayer: game_engine_slayer_read_network_state(buffer, size, first); break;
-	case game_engine_oddball: game_engine_oddball_read_network_state(buffer, size, first); break;
-	case game_engine_king: game_engine_king_read_network_state(buffer, size, first); break;
-	case game_engine_race: game_engine_race_read_network_state(buffer, size, first); break;
-	default: break;
+	case game_engine_ctf: read = game_engine_ctf_read_network_state(buffer, size, first); break;
+	case game_engine_slayer: read = game_engine_slayer_read_network_state(buffer, size, first); break;
+	case game_engine_oddball: read = game_engine_oddball_read_network_state(buffer, size, first); break;
+	case game_engine_king: read = game_engine_king_read_network_state(buffer, size, first); break;
+	case game_engine_race: read = game_engine_race_read_network_state(buffer, size, first); break;
+	default: read = TRUE; break;
 	}
+	/* (a state the game type refused is not had: the first it takes is,
+	whose events it only takes) */
+	if (!read)
+		return;
+	game_engine_network_state_read = TRUE;
 	/* the game ended on the host (after what ended it is shown, as the host
 	shows it) */
 	if (postgame_state != 0 && game_engine_globals.postgame_state == 0)

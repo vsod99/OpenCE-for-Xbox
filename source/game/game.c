@@ -161,7 +161,9 @@ struct game_options;
 #include "memory/data.h"
 #include "networking/network_messages.h"
 #include "networking/telnet_console.h"
+#include "objects/object_lights.h"
 #include "objects/objects.h"
+#include "objects/widgets/antenna.h"
 #include "objects/widgets/widgets.h"
 #include "physics/breakable_surfaces.h"
 #include "physics/collision_usage.h"
@@ -179,9 +181,16 @@ struct game_options;
 #include "structures/structures.h"
 #include "units/units.h"
 #include "units/vehicles.h"
+#include "network_coop.h" /* port: port/linux/game/network_coop.c */
+#ifdef HALO_PROFILE
+#include "profile_console.h" /* port: port/linux/game/profile_console.c */
+#endif
+#include "profile_sections.h" /* port: port/linux/include/profile_sections.h */
 
 /* network_game_globals.c's */
 boolean network_game_distributed_client(void);
+/* port: a client drives the host's actors' units as the host sent them (port/linux/game/network_actors.c) */
+void network_actors_drive(void);
 
 /* ---------- constants */
 
@@ -231,6 +240,8 @@ typedef char verify_game_runtime_globals_difficulty_offset[
 static struct game_runtime_globals_prefix *game_globals = NULL;
 extern struct game_variant game_variant_global;
 extern struct data_array *player_data;
+/* port: the PC options the game plays by (game_set_game_variant_options) */
+static struct game_variant_options game_variant_options_global;
 
 char const *global_game_difficulty_level_names[NUMBER_OF_GAME_DIFFICULTY_LEVELS] =
 {
@@ -241,6 +252,25 @@ char const *global_game_difficulty_level_names[NUMBER_OF_GAME_DIFFICULTY_LEVELS]
 };
 
 static struct profile_section game_update_section = {"game_update", NONE, TRUE};
+/* port: game_tick's steps, timed in the profiling build */
+PROFILE_SECTION(game_tick_cheats_enforce_section, "game_tick.cheats_enforce")
+PROFILE_SECTION(game_tick_remove_quitting_players_section, "game_tick.remove_quitting_players")
+PROFILE_SECTION(game_tick_allegiance_section, "game_tick.allegiance")
+PROFILE_SECTION(game_tick_units_section, "game_tick.units")
+PROFILE_SECTION(game_tick_ai_section, "game_tick.ai")
+PROFILE_SECTION(game_tick_actors_drive_section, "game_tick.actors_drive")
+PROFILE_SECTION(game_tick_players_before_section, "game_tick.players_before")
+PROFILE_SECTION(game_tick_effects_section, "game_tick.effects")
+PROFILE_SECTION(game_tick_antennas_section, "game_tick.antennas")
+PROFILE_SECTION(game_tick_first_person_section, "game_tick.first_person")
+PROFILE_SECTION(game_tick_game_engine_section, "game_tick.game_engine")
+PROFILE_SECTION(game_tick_editor_section, "game_tick.editor")
+PROFILE_SECTION(game_tick_hs_section, "game_tick.hs")
+PROFILE_SECTION(game_tick_recorded_animations_section, "game_tick.recorded_animations")
+PROFILE_SECTION(game_tick_objects_section, "game_tick.objects")
+PROFILE_SECTION(game_tick_players_after_section, "game_tick.players_after")
+PROFILE_SECTION(game_tick_hud_section, "game_tick.hud")
+PROFILE_SECTION(game_tick_player_effect_section, "game_tick.player_effect")
 
 /* ---------- public code */
 
@@ -312,32 +342,58 @@ void game_tick(
 		0x28D,
 		game_globals->active);
 
-	remove_quitting_players_from_game();
-	game_allegiance_update();
-	units_update();
+	/* port: a data array gone out of order reported, and the lights made
+	again if it was theirs (game_state.c, object_lights.c), before anything
+	of the tick: a loaded game state's first tick, its scripts placing
+	actors, made the first light from it (Sentry NATIVE-7) */
+	game_state_check_data_arrays();
+	lights_port_recover();
+
+	/* port: a client of another's game, the host's rules (its own cheats and
+	game speed, set before it joined too, put back) */
+	profile_scope(game_tick_cheats_enforce_section, cheats_network_client_enforce();)
+	profile_scope(game_tick_remove_quitting_players_section, remove_quitting_players_from_game();)
+	profile_scope(game_tick_allegiance_section, game_allegiance_update();)
+	profile_scope(game_tick_units_section, units_update();)
 	/* (the host's actors drive the host's units, which a client of the
 	distributed netcode has from the host: its own would fight the host's
 	positions, and could place objects of their own) */
 	if (!network_game_distributed_client())
-		ai_update();
-	players_update_before_game();
+		profile_scope(game_tick_ai_section, ai_update();)
+	else
+		profile_scope(game_tick_actors_drive_section, network_actors_drive();)
+	profile_scope(game_tick_players_before_section, players_update_before_game();)
 
 	seconds_per_tick = game_globals->players_are_double_speed
 		? 1.0f / (2 * TICKS_PER_SECOND)
 		: 1.0f / TICKS_PER_SECOND;
-	effects_update(seconds_per_tick);
-	lock_global_random_seed();
-	rumble_update();
-	first_person_weapons_update();
-	unlock_global_random_seed();
-	game_engine_update();
-	editor_update();
-	hs_update();
-	recorded_animations_update();
-	objects_update();
-	players_update_after_game();
-	hud_update();
-	player_effect_update();
+	profile_scope(game_tick_effects_section, effects_update(seconds_per_tick);)
+	/* An antenna's chain is a simulation of the Xbox's own step, an update a
+	tick: stepped a frame at a time, its springs, its carry and its points'
+	physics act against the frames' own movement of it, and a vehicle at
+	speed swings it far wider than a tick's step does. The frames between the
+	ticks are drawn from what each tick leaves (antenna.c). */
+	profile_scope(game_tick_antennas_section, antennas_update(seconds_per_tick);)
+	profile_scope(game_tick_first_person_section,
+		lock_global_random_seed();
+		rumble_update();
+		first_person_weapons_update();
+		unlock_global_random_seed();)
+	profile_scope(game_tick_game_engine_section, game_engine_update();)
+	profile_scope(game_tick_editor_section, editor_update();)
+	/* port: in network co-op only the host runs the scripts. A client running
+	them would place the map's actors and objects a second time and make
+	decisions that belong to the host. */
+	if (!(network_game_distributed_client() && network_coop_active()))
+		profile_scope(game_tick_hs_section, hs_update();)
+	profile_scope(game_tick_recorded_animations_section, recorded_animations_update();)
+	profile_scope(game_tick_objects_section, objects_update();)
+	profile_scope(game_tick_players_after_section, players_update_after_game();)
+	profile_scope(game_tick_hud_section, hud_update();)
+	profile_scope(game_tick_player_effect_section, player_effect_update();)
+	/* port: and at its end, before the frame draws the lights */
+	game_state_check_data_arrays();
+	lights_port_recover();
 
 	profile_exit(game_update_section);
 	collision_log_end_period();
@@ -425,8 +481,27 @@ void game_set_game_variant(
 	{
 		game_variant_global = *variant;
 	}
+	/* port: its PC options, until the network game's are given */
+	game_variant_options_default(&game_variant_global, &game_variant_options_global);
 
 	return;
+}
+
+void game_set_game_variant_options(
+	struct game_variant_options const *options)
+{
+	if (options)
+		game_variant_options_global = *options;
+	else
+		game_variant_options_default(&game_variant_global, &game_variant_options_global);
+
+	return;
+}
+
+struct game_variant_options const *game_variant_options_get(
+	void)
+{
+	return &game_variant_options_global;
 }
 
 void game_set_game_engine_index(
@@ -533,6 +608,12 @@ boolean game_is_cooperative(
 boolean game_load(
 	struct game_options *options)
 {
+#ifdef HALO_PROFILE
+	/* port: the profiling build's recording learns of the map (every map
+	load passes here: main_new_map's and a network game's,
+	network_game_manager.c) */
+	profile_console_map_loaded(options->map_name);
+#endif
 	match_assert(
 		"c:\\halo\\SOURCE\\game\\game.c",
 		0x192,
@@ -629,6 +710,14 @@ void game_initialize_for_new_map(
 	ui_widgets_safe_to_load(TRUE);
 
 	return;
+}
+
+/* port: whether a map is loaded, the main menu's too: game_in_progress()
+is not, once game_time_end() stops its clock */
+boolean game_map_loaded(
+	void)
+{
+	return game_globals->map_loaded;
 }
 
 boolean game_map_loading_in_progress(
@@ -893,7 +982,9 @@ void remove_quitting_players_from_game(
 	struct player_datum *player;
 	long current_time;
 
-	if (!game_engine_running())
+	/* port: also in network co-op, which has no game engine. Without this a
+	player who left kept their unit, and it respawned. */
+	if (!game_engine_running() && !network_coop_active())
 		return;
 
 	current_time = game_time_get();
@@ -904,7 +995,9 @@ void remove_quitting_players_from_game(
 
 		if (quit_time != NONE && !player->quit_out_of_game)
 		{
-			if (current_time == quit_time)
+			/* port: at its time or past it (a client's clock may jump the
+			ticks it missed to the host's, game_time_set_distributed) */
+			if (current_time >= quit_time)
 			{
 				long unit_index = player->unit_index;
 
@@ -914,15 +1007,6 @@ void remove_quitting_players_from_game(
 					unit_get(unit_index);
 					unit_kill_no_statistics(player->unit_index);
 				}
-			}
-			else if (current_time > quit_time)
-			{
-				error(
-					_error_silent,
-					"player %x failed to quit, wanted %d is %d",
-					iterator.datum_index,
-					quit_time,
-					current_time);
 			}
 		}
 	}

@@ -313,6 +313,11 @@ void tgaLoadImageData(
 
 /* ---------- globals */
 
+/* port: rasterizer_xbox.c's (rasterizer_xbox_internal.h, which this file
+does not include) */
+void rasterizer_forget_hardware_state(
+	void);
+
 extern struct pixel_shader_definition blur_shader;
 extern struct pixel_shader_definition regular_shader;
 extern unsigned long current_time;
@@ -2029,7 +2034,15 @@ static void progress_bar_render(
 	IDirect3DDevice8_GetTransform(global_d3d_device, D3DTS_PROJECTION, &progress_bar_globals.saved_projection);
 	IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_WORLD, &progress_bar_globals.world);
 	IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_VIEW, &progress_bar_globals.view);
-	IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_PROJECTION, &progress_bar_globals.projection);
+	/* port: on a wide screen, the 640 columns in its middle, as the menus are
+	drawn (the frame before, which the trails are, is those columns:
+	d3d8_gl.c's front buffer) */
+	{
+		D3DXMATRIX projection= progress_bar_globals.projection;
+
+		projection._11*= 640.f/(real)halo_screen_width();
+		IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_PROJECTION, &projection);
+	}
 	IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ALPHABLENDENABLE, TRUE);
 	IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
 	IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_DESTBLEND, D3DBLEND_ONE);
@@ -2066,6 +2079,9 @@ static void progress_bar_render(
 		IDirect3DDevice8_SetTextureStageState(global_d3d_device, stage, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
 		IDirect3DDevice8_SetTexture(global_d3d_device, stage, &back_buffer_texture);
 	}
+	/* (back_buffer_texture has what it needs of the surface; the
+	reference IDirect3DDevice8_GetBackBuffer gave is given back) */
+	IDirect3DSurface8_Release(back_buffer);
 
 	if (progress<0.9f)
 		draw_fade_layer(0.f, 0.f, 0.9f);
@@ -2084,6 +2100,9 @@ static void progress_bar_render(
 	IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_VIEW, &progress_bar_globals.saved_view);
 	IDirect3DDevice8_SetTransform(global_d3d_device, D3DTS_PROJECTION, &progress_bar_globals.saved_projection);
 	IDirect3DDevice8_BlockUntilVerticalBlank(global_d3d_device);
+	/* port: the rasterizer's caches of the device's states learn what was
+	set here */
+	rasterizer_forget_hardware_state();
 
 	return;
 }
@@ -2221,6 +2240,11 @@ static void progress_bar_make_stuff_ready(
 		IDirect3DDevice8_SetRenderTarget(global_d3d_device, back_buffer, depth_buffer);
 		IDirect3DDevice8_Clear(global_d3d_device, 0, NULL, 0xf0, 0, 0.f, 0);
 		IDirect3DDevice8_SetRenderTarget(global_d3d_device, front_buffer, depth_buffer);
+		IDirect3DSurface8_Release(back_buffer);
+		IDirect3DSurface8_Release(front_buffer);
+		/* port: (none, when no depth buffer is set) */
+		if (depth_buffer)
+			IDirect3DSurface8_Release(depth_buffer);
 	}
 
 	return;
@@ -2246,11 +2270,24 @@ static void progress_bar_load_loading_texture(
 	file= fopen(source_path, "rb");
 	if (file)
 	{
+		image.width= 0;
+		image.height= 0;
+		image.image_type= 0;
+		image.pixel_depth= 0;
 		tgaLoadHeader(file, &image);
-		image.pixels= pixels;
-		tgaLoadImageData(file, &image);
+		/* port: the file is a map pack's: only an uncompressed 24-bit
+		picture the texture's size is read into it */
+		if (image.image_type==2 && image.pixel_depth==24 && image.width==320 && image.height==240)
+		{
+			image.pixels= pixels;
+			tgaLoadImageData(file, &image);
+		}
 		fclose(file);
 	}
+	/* port: no disc has loading.tga as a file (the retail default.xbe holds
+	the picture, which importing a disc writes as loading.tga:
+	port/linux/src/xiso.c); without it the texture is left as created,
+	black */
 	IDirect3DTexture8_UnlockRect(*texture, 0);
 
 	return;

@@ -499,7 +499,9 @@ long read_endpoint(
 
 		ep->error = (word)result;
 	}
-	else if (result == 0)
+	/* (port: a stream's end; an empty datagram is only empty, which anyone
+	may send: skipped, network_connection_idle) */
+	else if (result == 0 && ep->type != _transport_type_udp)
 	{
 		result = _transport_error_connection_lost;
 	}
@@ -523,7 +525,17 @@ long write_endpoint(
 	result = send(ep->socket, buffer, length, 0);
 	if (result == INVALID_SOCKET)
 	{
-		switch (WSAGetLastError())
+		/* port: the Winsock error a send failed with, which the transport's
+		errors don't say (logged once for each different one) */
+		static int logged_error;
+		int code = WSAGetLastError();
+
+		if (code != 0x2733 && code != logged_error)
+		{
+			error(_error_silent, "write_endpoint: Winsock error %d", code);
+			logged_error = code;
+		}
+		switch (code)
 		{
 		case 0x2733:
 			ep->error = _transport_result_operation_would_block;
@@ -1222,33 +1234,47 @@ short connect_endpoint(
 				unsigned long timeout = system_milliseconds() + 10 * MILLISECONDS_PER_SECOND;
 				struct timeval timeval;
 
-				timeval.tv_sec = 1;
-				timeval.tv_usec = 0;
-
 				do
 				{
 					fd_set writeable;
+					fd_set failed;
+					long ready;
 
+					/* (set each time: select may leave what is left of it) */
+					timeval.tv_sec = 1;
+					timeval.tv_usec = 0;
 					writeable.fd_array[0] = ep->socket;
 					writeable.fd_count = 1;
+					failed.fd_array[0] = ep->socket;
+					failed.fd_count = 1;
 
-					if (select(1, NULL, &writeable, NULL, &timeval) == 1)
+					/* port: a failed connect is in the error set, and a select
+					that times out (0) means the connection is still being made */
+					ready = select(1, NULL, &writeable, &failed, &timeval);
+					if (ready > 0)
 					{
-						error = 0;
+						error = failed.fd_count ? WSAECONNREFUSED : 0;
+					}
+					else if (ready == 0)
+					{
+						error = WSAEWOULDBLOCK;
 					}
 					else
 					{
 						error = WSAGetLastError();
 					}
 
-					if (system_milliseconds() > timeout)
+					/* port: a select that ends with the connection still being
+					made leaves the connect's would-block: waited on, as in
+					progress is, until the timeout (a connection made after a
+					SYN sent again takes a second or three) */
+					if ((error == WSAEINPROGRESS || error == WSAEWOULDBLOCK) &&
+						(long)(system_milliseconds() - timeout) > 0)
 					{
-						error = WSAEINPROGRESS;
-						closesocket(ep->socket);
 						break;
 					}
 				}
-				while (error == WSAEINPROGRESS);
+				while (error == WSAEINPROGRESS || error == WSAEWOULDBLOCK);
 			}
 		}
 
@@ -1256,6 +1282,12 @@ short connect_endpoint(
 		{
 			winsock_error_to_string(error);
 			result = _transport_error_connect_failed;
+			/* port: none of the attempt kept (its socket half made and not
+			blocking, which the next would reuse): the next makes a new one,
+			and its number is not closed again when the endpoint is */
+			closesocket(ep->socket);
+			ep->socket = INVALID_SOCKET;
+			SET_FLAG(ep->flags, _transport_endpoint_nonblocking_bit, FALSE);
 		}
 		else
 		{
@@ -1473,7 +1505,10 @@ struct transport_endpoint *accept_endpoint(
 			ep->flags |= 1;
 		}
 		else
+		{
+			closesocket(socket);
 			listening_endpoint->error = _transport_error_out_of_memory;
+		}
 	}
 	else
 	{
@@ -1671,6 +1706,26 @@ short reject_endpoint(
 		delete_transport_endpoint(endpoint);
 
 	return 0;
+}
+
+boolean transport_udp_port_taken(
+	word port)
+{
+	/* no SO_REUSEADDR, so the bind fails if the port is taken */
+	SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+	struct sockaddr_in socket_address;
+	boolean taken;
+
+	if (probe == INVALID_SOCKET)
+		return FALSE;
+	csmemset(&socket_address, 0, sizeof(socket_address));
+	socket_address.sin_family = AF_INET;
+	socket_address.sin_port = (word)SWAP2(port);
+	taken = bind(probe, (struct sockaddr *)&socket_address, sizeof(socket_address)) != 0 &&
+		WSAGetLastError() == WSAEADDRINUSE;
+	closesocket(probe);
+
+	return taken;
 }
 
 /* ---------- private code */

@@ -141,6 +141,9 @@ symbols in this file:
 #include "sound/sound_definitions.h"
 #include "units/bipeds.h"
 #include "units/units.h"
+/* port: port/linux/game/overshield_effect.c */
+boolean overshield_effect_active(long object_index);
+boolean overshield_effect_hit_effect_allowed(long effect_index);
 
 /* ---------- constants */
 
@@ -501,10 +504,6 @@ void projectile_export_function_values(
 					value = 0.f;
 				break;
 
-			/* value is left unassigned only by this default arm. Not reached unassigned: the
-			 * arm's assertion failure calls system_exit, which does not return in January
-			 * (0x47c960 jumps to halt_and_catch_fire 0x4f21c0, which loops or calls exit).
-			 * Source-policy approval pending (2026-09-27 audit). */
 			default:
 				display_assert(
 					NULL,
@@ -567,8 +566,10 @@ boolean projectile_new(
 
 	attachments = &definition->object.attachments;
 	projectile->projectile.tracer_attachment_index = NONE;
+	/* port: only the attachments the object has (a map's count; the tracer
+	index is written through, and attachments_new reports the rest) */
 	for (attachment_index = 0;
-		attachment_index < attachments->count;
+		attachment_index < MIN(attachments->count, MAXIMUM_NUMBER_OF_ATTACHMENTS_PER_OBJECT);
 		attachment_index++)
 	{
 		struct object_attachment_definition const *attachment = TAG_BLOCK_GET_ELEMENT(
@@ -1196,9 +1197,7 @@ static void projectile_calculate_deceleration(
 			definition,
 			definition->projectile.air_damage_range_lower_bound,
 			definition->projectile.air_damage_range_upper_bound);
-		/* BUG (preserved for exact matching): January loads the water upper bound
-		 * in the air branch. A corrected build should use
-		 * definition->projectile.air_damage_range_upper_bound. */
+		/* (as the original game, kept: in the air the water damage range's upper bound is used) */
 		projectile->projectile.maximum_damage_distance =
 			definition->projectile.water_damage_range_upper_bound;
 
@@ -1615,6 +1614,23 @@ static void projectile_collision(
 	{
 		response = material_response->default_response;
 		effect_definition_index = material_response->default_effect.index;
+	}
+
+	/* port: a hit on an overshield plays what the projectile plays on an
+	Elite's shield, when the map has it and it only shows and sounds; how
+	the projectile responds stays the hit's own
+	(port/linux/game/overshield_effect.c) */
+	if (collision->type == _collision_result_object &&
+		VALID_INDEX(_material_elite_energy_shield, definition->projectile.material_responses.count) &&
+		overshield_effect_active(collision->object_index))
+	{
+		struct projectile_material_response_definition const *elite_response = TAG_BLOCK_GET_ELEMENT(
+			&definition->projectile.material_responses,
+			_material_elite_energy_shield,
+			struct projectile_material_response_definition);
+
+		if (overshield_effect_hit_effect_allowed(elite_response->default_effect.index))
+			effect_definition_index = elite_response->default_effect.index;
 	}
 
 	if (collision->type == _collision_result_structure &&

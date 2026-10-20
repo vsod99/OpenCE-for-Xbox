@@ -29,9 +29,9 @@ update.h's: posix_update.c on Linux, win32_update.c on Windows.
 #include "port_config.h"
 #include "update.h"
 
-#ifndef HALO_ANDROID
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
 
-#include "memory/zlib/zlib.h"
+#include "zlib_prefixed.h"
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -46,7 +46,7 @@ update.h's: posix_update.c on Linux, win32_update.c on Windows.
 #define HALO_BUILD_FLAVOR "release"
 #endif
 
-#define UPDATE_REPOSITORY "cybersecurity/halo-ce-universal"
+#define UPDATE_REPOSITORY "OpenCommunityEdition/OpenCE"
 #ifdef _WIN32
 #define UPDATE_PLATFORM "windows"
 #define PATH_SEPARATOR "\\"
@@ -57,6 +57,10 @@ update.h's: posix_update.c on Linux, win32_update.c on Windows.
 #define UPDATE_ASSET "halo-" UPDATE_PLATFORM "-" HALO_BUILD_FLAVOR ".zip"
 #define UPDATE_DIRECTORY "update.partial"
 #define MAXIMUM_UPDATE_FILES 32
+/* the most a download may be: GitHub's answer about the latest release, a
+release's zip (about 30 MB) */
+#define MAXIMUM_CHECK_SIZE (1024ULL * 1024)
+#define MAXIMUM_UPDATE_SIZE (256ULL * 1024 * 1024)
 
 enum
 {
@@ -95,29 +99,36 @@ static unsigned long zip_long(const unsigned char *bytes)
 	return zip_word(bytes) | zip_word(bytes + 2) << 16;
 }
 
-/* an entry's data, unpacked, to the file at path */
+/* an entry's data, unpacked, to the file at path; why it could not be is
+written to reason */
 static int zip_extract_entry(SDL_IOStream *zip, unsigned long local_offset, int method,
-	unsigned long packed_size, unsigned long size, unsigned long crc, const char *path)
+	unsigned long packed_size, unsigned long size, unsigned long crc, const char *path,
+	char *reason, size_t reason_size)
 {
 	unsigned char header[30];
 	unsigned char input[16384], output[16384];
 	SDL_IOStream *file;
 	z_stream stream;
 	unsigned long remaining = packed_size, written = 0, checksum = crc32(0L, Z_NULL, 0);
-	int succeeded = 0;
+	int succeeded = 0, ended = 0;
 
 	if (SDL_SeekIO(zip, (Sint64)local_offset, SDL_IO_SEEK_SET) < 0 ||
 		SDL_ReadIO(zip, header, sizeof(header)) != sizeof(header) || zip_long(header) != 0x04034b50 ||
 		SDL_SeekIO(zip, (Sint64)(zip_word(header + 26) + zip_word(header + 28)), SDL_IO_SEEK_CUR) < 0)
 	{
+		snprintf(reason, reason_size, "its header at %lu could not be read (%s)", local_offset, SDL_GetError());
 		return 0;
 	}
 	file = SDL_IOFromFile(path, "wb");
 	if (!file)
+	{
+		snprintf(reason, reason_size, "could not create %s (%s)", path, SDL_GetError());
 		return 0;
+	}
 	memset(&stream, 0, sizeof(stream));
 	if (method == 8 && inflateInit2(&stream, -MAX_WBITS) != Z_OK)
 	{
+		snprintf(reason, reason_size, "zlib would not start (%s)", stream.msg ? stream.msg : "no message");
 		SDL_CloseIO(file);
 		return 0;
 	}
@@ -126,12 +137,24 @@ static int zip_extract_entry(SDL_IOStream *zip, unsigned long local_offset, int 
 		size_t count = remaining < sizeof(input) ? remaining : sizeof(input);
 
 		if (count && SDL_ReadIO(zip, input, count) != count)
+		{
+			snprintf(reason, reason_size, "the download ended %lu bytes early (%s)", remaining, SDL_GetError());
 			break;
+		}
 		remaining -= (unsigned long)count;
 		if (method == 0)
 		{
-			if (SDL_WriteIO(file, input, count) != count)
+			/* (no more than the entry says it holds) */
+			if (count > size - written)
+			{
+				snprintf(reason, reason_size, "it unpacks to more than %lu bytes", size);
 				break;
+			}
+			if (SDL_WriteIO(file, input, count) != count)
+			{
+				snprintf(reason, reason_size, "could not write %s after %lu bytes (%s)", path, written, SDL_GetError());
+				break;
+			}
 			checksum = crc32(checksum, input, (uInt)count);
 			written += (unsigned long)count;
 		}
@@ -151,8 +174,16 @@ static int zip_extract_entry(SDL_IOStream *zip, unsigned long local_offset, int 
 				if (result != Z_OK && result != Z_STREAM_END)
 					break;
 				produced = sizeof(output) - stream.avail_out;
+				/* (no more than the entry says, before it is on the disk) */
+				if (written + (unsigned long)produced > size)
+				{
+					snprintf(reason, reason_size, "it unpacks to more than %lu bytes", size);
+					result = Z_ERRNO;
+					break;
+				}
 				if (SDL_WriteIO(file, output, produced) != produced)
 				{
+					snprintf(reason, reason_size, "could not write %s after %lu bytes (%s)", path, written, SDL_GetError());
 					result = Z_ERRNO;
 					break;
 				}
@@ -160,30 +191,64 @@ static int zip_extract_entry(SDL_IOStream *zip, unsigned long local_offset, int 
 				written += (unsigned long)produced;
 			} while (stream.avail_out == 0 && result != Z_STREAM_END);
 			if (result == Z_STREAM_END)
+				ended = 1;
+			else if (result != Z_OK && result != Z_BUF_ERROR)
 			{
-				succeeded = written == size && checksum == crc;
+				if (result != Z_ERRNO)
+				{
+					snprintf(reason, reason_size, "zlib stopped with %d after %lu of %lu bytes (%s)", result, written, size,
+						stream.msg ? stream.msg : "no message");
+				}
 				break;
 			}
-			if (result != Z_OK && result != Z_BUF_ERROR)
-				break;
 		}
-		if (!remaining)
+		/* (all of the input unpacked is enough, as the size and the CRC are
+		checked: the game's zlib 1.1, used here before, could want a byte past
+		the end of a raw stream before it said the stream had ended) */
+		if (ended || !remaining)
 		{
-			succeeded = method == 0 && written == size && checksum == crc;
+			if (written != size)
+				snprintf(reason, reason_size, "it unpacked to %lu bytes, not %lu", written, size);
+			else if (checksum != crc)
+				snprintf(reason, reason_size, "its CRC is %08lx, not %08lx", checksum, crc);
+			else
+				succeeded = 1;
 			break;
 		}
 	}
 	if (method == 8)
 		inflateEnd(&stream);
-	if (!SDL_CloseIO(file))
+	if (!SDL_CloseIO(file) && succeeded)
+	{
+		snprintf(reason, reason_size, "could not finish writing %s (%s)", path, SDL_GetError());
 		succeeded = 0;
+	}
 	return succeeded;
 }
 
-/* the zip's files (a flat folder) into update.partial/, their names in names */
-static int zip_extract(const char *zip_path, char names[][256], int *name_count, char *error, size_t error_size)
+/* whether an entry's name is one of a release's files, which are all at the
+zip's top, named with letters, digits and . _ + - (a folder, or a name that
+could leave update.partial/ or mean something else to the system, is not) */
+static int zip_name_allowed(const char *name)
 {
-	SDL_IOStream *zip = SDL_IOFromFile(zip_path, "rb");
+	const char *c;
+
+	if (!*name || *name == '.')
+		return 0;
+	for (c = name; *c; c++)
+	{
+		if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '.' ||
+			*c == '_' || *c == '+' || *c == '-'))
+		{
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* the zip's files (a flat folder) into update.partial/, their names in names */
+static int zip_extract(SDL_IOStream *zip, char names[][256], int *name_count, char *error, size_t error_size)
+{
 	unsigned char tail[65536 + 22];
 	Sint64 size;
 	size_t tail_size, index;
@@ -191,11 +256,6 @@ static int zip_extract(const char *zip_path, char names[][256], int *name_count,
 	int found = 0, succeeded = 0;
 
 	*name_count = 0;
-	if (!zip)
-	{
-		snprintf(error, error_size, "could not open the download");
-		return 0;
-	}
 	/* the end of the central directory, in the last 64 KB */
 	size = SDL_GetIOSize(zip);
 	tail_size = size < (Sint64)sizeof(tail) ? (size_t)size : sizeof(tail);
@@ -223,6 +283,7 @@ static int zip_extract(const char *zip_path, char names[][256], int *name_count,
 		unsigned long name_length, extra_length, comment_length;
 		Sint64 next;
 		char path[1200];
+		char reason[512] = "";
 
 		if (SDL_ReadIO(zip, header, sizeof(header)) != sizeof(header) || zip_long(header) != 0x02014b50)
 			goto done;
@@ -235,8 +296,14 @@ static int zip_extract(const char *zip_path, char names[][256], int *name_count,
 		next = SDL_TellIO(zip) + (Sint64)(extra_length + comment_length);
 		/* (a folder, or a name that would leave the game's folder, is left
 		out: the release's files are all at its top) */
-		if (name_length && name[name_length - 1] != '/' && !strchr(name, '/') && !strchr(name, '\\') &&
-			strcmp(name, "..") && strcmp(name, ".") && *name_count < MAXIMUM_UPDATE_FILES)
+		if (memchr(name, 0, name_length))
+			goto done;
+		if (!zip_name_allowed(name))
+		{
+			if (name_length && name[name_length - 1] != '/')
+				platform_log("update: left out %s (not one of a release's names)", name);
+		}
+		else if (*name_count < MAXIMUM_UPDATE_FILES)
 		{
 			int method = (int)zip_word(header + 10);
 
@@ -247,9 +314,9 @@ static int zip_extract(const char *zip_path, char names[][256], int *name_count,
 			}
 			updater_partial_path(path, sizeof(path), name);
 			if (!zip_extract_entry(zip, zip_long(header + 42), method, zip_long(header + 20), zip_long(header + 24),
-				zip_long(header + 16), path))
+				zip_long(header + 16), path, reason, sizeof(reason)))
 			{
-				snprintf(error, error_size, "could not unpack %s", name);
+				snprintf(error, error_size, "could not unpack %s: %s", name, reason);
 				goto done;
 			}
 			snprintf(names[*name_count], 256, "%s", name);
@@ -263,7 +330,6 @@ static int zip_extract(const char *zip_path, char names[][256], int *name_count,
 done:
 	if (!succeeded && !error[0])
 		snprintf(error, error_size, "the download is not a zip file this build can read");
-	SDL_CloseIO(zip);
 	return succeeded;
 }
 
@@ -280,8 +346,8 @@ static long updater_latest_release(void)
 	long build = 0;
 
 	updater_path(path, sizeof(path), "update-check.json");
-	if (!update_download("https://api.github.com/repos/" UPDATE_REPOSITORY "/releases/latest", path, NULL, NULL,
-		error, sizeof(error)))
+	if (!update_download("https://api.github.com/repos/" UPDATE_REPOSITORY "/releases/latest", path,
+		MAXIMUM_CHECK_SIZE, NULL, NULL, error, sizeof(error)))
 	{
 		platform_log("update: could not check for a new version: %s", error);
 		return 0;
@@ -348,8 +414,8 @@ static int SDLCALL updater_download_thread(void *context)
 {
 	struct updater_download *download = context;
 	char error[512] = "";
-	int succeeded = update_download(download->url, download->zip_path, updater_download_progress, download, error,
-		sizeof(error));
+	int succeeded = update_download(download->url, download->zip_path, MAXIMUM_UPDATE_SIZE, updater_download_progress,
+		download, error, sizeof(error));
 
 	SDL_LockMutex(download->lock);
 	download->succeeded = succeeded;
@@ -377,6 +443,7 @@ static int updater_download_zip(const char *zip_path, char *error, size_t error_
 	thread = SDL_CreateThread(updater_download_thread, "update download", &download);
 	if (!thread)
 	{
+		SDL_DestroyMutex(download.lock);
 		snprintf(error, error_size, "could not start the download");
 		return 0;
 	}
@@ -432,13 +499,101 @@ static int updater_download_zip(const char *zip_path, char *error, size_t error_
 	return download.succeeded;
 }
 
+/* the downloaded zip, read once and unpacked from that copy; the zip is
+deleted either way */
+static int updater_unpack(const char *zip_path, char names[][256], int *name_count, char *error, size_t error_size)
+{
+	size_t zip_size = 0;
+	unsigned char *zip = SDL_LoadFile(zip_path, &zip_size);
+	SDL_IOStream *stream;
+	int succeeded = 0;
+
+	update_delete_file(zip_path);
+	if (!zip || zip_size > MAXIMUM_UPDATE_SIZE)
+	{
+		snprintf(error, error_size, "could not read the download");
+		goto done;
+	}
+	stream = SDL_IOFromConstMem(zip, zip_size);
+	if (!stream)
+	{
+		snprintf(error, error_size, "could not read the download");
+		goto done;
+	}
+	succeeded = zip_extract(stream, names, name_count, error, error_size);
+	SDL_CloseIO(stream);
+
+done:
+	SDL_free(zip);
+	return succeeded;
+}
+
+/* the first count of the new files, already in place, taken back out (to
+the update folder) and the old ones (<name>.old) put back, the last first:
+the install as it was before the update. A new file that had no old one is
+deleted */
+static void updater_put_back(char names[][256], int count)
+{
+	int index, failures = 0;
+
+	for (index = count - 1; index >= 0; index--)
+	{
+		char path[1200], new_path[1200], old_path[1300];
+
+		updater_path(path, sizeof(path), names[index]);
+		updater_partial_path(new_path, sizeof(new_path), names[index]);
+		snprintf(old_path, sizeof(old_path), "%s.old", path);
+		if (SDL_GetPathInfo(old_path, NULL))
+		{
+			if (!update_replace_file(path, old_path, new_path))
+			{
+				platform_log("update: could not put back %s", names[index]);
+				failures++;
+			}
+		}
+		else
+		{
+			update_delete_file(path);
+		}
+	}
+	if (failures)
+		platform_log("update: %d of %d replaced files could not be put back", failures, count);
+	else
+		platform_log("update: the %d replaced files put back: the install is as it was", count);
+}
+
+/* the new files in place of the old ones, each old one kept as <name>.old;
+if one cannot be, the ones before it put back as they were, and 0 */
+static int updater_replace_files(char names[][256], int name_count, char *error, size_t error_size)
+{
+	int index;
+
+	for (index = 0; index < name_count; index++)
+	{
+		char path[1200], new_path[1200], old_path[1300];
+
+		updater_path(path, sizeof(path), names[index]);
+		updater_partial_path(new_path, sizeof(new_path), names[index]);
+		snprintf(old_path, sizeof(old_path), "%s.old", path);
+		if (!update_replace_file(path, new_path, old_path))
+		{
+			/* (that one is as it was: update_replace_file) */
+			snprintf(error, error_size, "could not replace %s", path);
+			if (index > 0)
+				updater_put_back(names, index);
+			return 0;
+		}
+	}
+	return 1;
+}
+
 /* downloads, unpacks and puts in place the new build, and starts it; returns
 only if something failed */
 static void updater_update(void)
 {
 	char names[MAXIMUM_UPDATE_FILES][256];
 	char zip_path[1200], partial[1200], error[512] = "";
-	int name_count = 0, index;
+	int name_count = 0;
 
 	updater_path(partial, sizeof(partial), UPDATE_DIRECTORY);
 	updater_partial_path(zip_path, sizeof(zip_path), UPDATE_ASSET);
@@ -448,24 +603,9 @@ static void updater_update(void)
 		snprintf(error, sizeof(error), "could not make %s (is the game's folder read-only?)", partial);
 	}
 	else if (updater_download_zip(zip_path, error, sizeof(error)) &&
-		zip_extract(zip_path, names, &name_count, error, sizeof(error)))
+		updater_unpack(zip_path, names, &name_count, error, sizeof(error)))
 	{
-		update_delete_file(zip_path);
-		/* the new files in place of the old ones */
-		for (index = 0; index < name_count; index++)
-		{
-			char path[1200], new_path[1200], old_path[1300];
-
-			updater_path(path, sizeof(path), names[index]);
-			updater_partial_path(new_path, sizeof(new_path), names[index]);
-			snprintf(old_path, sizeof(old_path), "%s.old", path);
-			if (!update_replace_file(path, new_path, old_path))
-			{
-				snprintf(error, sizeof(error), "could not replace %s", path);
-				break;
-			}
-		}
-		if (index == name_count)
+		if (updater_replace_files(names, name_count, error, sizeof(error)))
 		{
 			update_delete_file(partial);
 			platform_log("update: starting build %ld", updater_latest_build);
@@ -483,12 +623,15 @@ static void updater_update(void)
 	}
 }
 
-/* the files a previous update left behind */
+/* the files a previous update left behind, and the notice of extract-xiso,
+which releases carried until the disc image readers were written again */
 static void updater_clean_up(void)
 {
 	static const char *const names[] =
 	{
-		"halo.old", "halo.exe.old", "SDL3.dll.old", "extract-xiso-LICENSE.txt.old", "mbedtls-LICENSE.txt.old",
+		"halo.old", "halo.exe.old", "SDL3.dll.old", "libSDL3.so.0.old", "SDL3-LICENSE.txt.old",
+		"extract-xiso-LICENSE.txt.old", "mbedtls-LICENSE.txt.old", "LICENSE.txt.old",
+		"extract-xiso-LICENSE.txt",
 	};
 	char path[1200];
 	size_t index;
@@ -521,9 +664,19 @@ void updater_start(void)
 	updater_clean_up();
 	/* (not for builds without a number, the player's no, or runs nobody is
 	watching, but for a test with its answer) */
-	if (HALO_BUILD_NUMBER <= 0 || !config_boolean("update.auto") ||
-		(!config_string("debug.update_answer")[0] && (config_boolean("debug.hidden_window") ||
-			config_real("debug.exit_after") > 0.0 || config_string("debug.network_test")[0])))
+	if (HALO_BUILD_NUMBER <= 0)
+	{
+		platform_log("update: not looked for: only the builds CI numbers update themselves (this one has no "
+			"number)");
+		return;
+	}
+	if (!config_boolean("update.auto"))
+	{
+		platform_log("update: not looked for: update.auto is false");
+		return;
+	}
+	if (!config_string("debug.update_answer")[0] && (config_boolean("debug.hidden_window") ||
+		config_real("debug.exit_after") > 0.0 || config_string("debug.network_test")[0]))
 	{
 		return;
 	}
@@ -536,6 +689,22 @@ void updater_start(void)
 		else
 			SDL_SetAtomicInt(&updater_state, _updater_handled);
 	}
+}
+
+/* whether the game runs under gamescope (the Steam Deck's Game Mode), where
+a system dialog such as SDL's message box crashes the game. gamescope sets
+GAMESCOPE_WAYLAND_DISPLAY for the programs it runs and Game Mode's session
+XDG_CURRENT_DESKTOP; Steam sets SteamDeck and SteamGamepadUI there. Wine
+passes them on to the Windows build under Proton. */
+static int updater_gamescope(void)
+{
+	const char *wayland_display = getenv("GAMESCOPE_WAYLAND_DISPLAY");
+	const char *desktop = getenv("XDG_CURRENT_DESKTOP");
+	const char *steam_deck = getenv("SteamDeck");
+	const char *gamepad_ui = getenv("SteamGamepadUI");
+
+	return (wayland_display && wayland_display[0]) || (desktop && strstr(desktop, "gamescope")) ||
+		(steam_deck && !strcmp(steam_deck, "1") && gamepad_ui && !strcmp(gamepad_ui, "1"));
 }
 
 /* every frame, on the game's thread (sdl_platform.c): asks the player once a
@@ -569,6 +738,14 @@ void updater_poll(SDL_Window *window)
 			updater_update();
 		else if (!strcmp(test_answer, "never"))
 			config_write_boolean("update.auto", 0);
+		return;
+	}
+	/* (no question under gamescope: the player updates from the desktop, or
+	with debug.update_answer) */
+	if (updater_gamescope())
+	{
+		platform_log("update: build %ld is out (this is build %d); not asking under gamescope (Steam Deck Game Mode)",
+			updater_latest_build, HALO_BUILD_NUMBER);
 		return;
 	}
 	/* (a dialog cannot show above a fullscreen game) */
@@ -615,5 +792,15 @@ void updater_poll(SDL_Window *window)
 void updater_start(void)
 {
 }
+
+#ifdef HALO_WEB
+#include <SDL3/SDL.h>
+
+/* (the site updates itself: port/web/site/sw.js) */
+void updater_poll(SDL_Window *window)
+{
+	(void)window;
+}
+#endif
 
 #endif

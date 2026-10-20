@@ -53,6 +53,22 @@ void input_abstraction_update_local_player_preferences(
 	struct game_input_preferences const *preferences);
 struct game_input_state *input_abstraction_get_input_state(
 	short local_player_index);
+/* port: the keyboard and mouse's own controls (input_abstraction.c) */
+boolean input_abstraction_port_reload(
+	short controller_index);
+byte input_abstraction_port_accept(
+	short controller_index);
+boolean input_abstraction_port_action_only(
+	short controller_index);
+real input_abstraction_port_primary_trigger(
+	short controller_index);
+/* port: the game control on each of the controller's buttons, and the
+player's look inverted as its stick is (the touch controls) */
+void input_abstraction_port_button_controls(
+	short controller_index,
+	short *controls);
+boolean input_abstraction_port_look_inverted(
+	short controller_index);
 
 /* ---------- globals */
 

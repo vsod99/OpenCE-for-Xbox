@@ -8,13 +8,16 @@ RASTERIZER_MEMORY_POOL.C
 #include "errors.h"
 #include "real_math.h"
 #include "rasterizer.h"
-#include "rasterizer_memory_pool.h"
+/* Empty reconstructed header removed; no declarations to include. */
 
 /* ---------- globals */
 
 /* swapped? */
 static void *global_memory_pool;
 static long global_memory_index;
+/* port: whether the pool ran out, logged once (a frame that runs out
+usually means every frame does) */
+static boolean pool_exceeded_logged;
 
 /* ---------- public code */
 
@@ -57,9 +60,10 @@ void *rasterizer_memory_alloc(
 			memcpy(pointer, src, size);
 		}
 	}
-	else
+	else if (!pool_exceeded_logged)
 	{
-		error(_error_silent, "### ERROR rasterizer memory pool exceeded");
+		pool_exceeded_logged = TRUE;
+		error(_error_silent, "### ERROR rasterizer memory pool exceeded (not logged again)");
 	}
 
 	return pointer;

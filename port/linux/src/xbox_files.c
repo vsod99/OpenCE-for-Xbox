@@ -7,6 +7,9 @@ Xbox paths are translated below two roots. d:\ is the data root, the
 directory holding the game's maps/ folder: paths.data (port_config.c), else the current
 directory when it has maps/, else assets/ in the current directory or two
 levels above the executable (the repository root for build/linux/halo).
+h:\ is the Halo Custom Edition install paths.custom_edition names, if any
+(its maps folder holds the resource maps Custom Edition maps need, and more
+maps).
 Every other drive letter X:\ is the subdirectory X/ of the save root (z:\ holds the persistent cache and saves,
 u:\ user data, t:\ title data): paths.saves, else
 $XDG_DATA_HOME/halo-linux or ~/.local/share/halo-linux. Path components are
@@ -108,7 +111,7 @@ const char *platform_data_root(void)
 						snprintf(root, sizeof(root), "%s", executable);
 				}
 			}
-#ifndef HALO_ANDROID
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
 			if (!has_maps(root) && executable_directory[0] && platform_offer_game_data(executable_directory) &&
 				has_maps(executable_directory))
 			{
@@ -176,6 +179,31 @@ const char *platform_save_root(void)
 	return root;
 }
 
+const char *platform_custom_edition_root(void)
+{
+	static char root[MAX_PATH];
+	static int found;
+
+	if (!found)
+	{
+		char maps[MAX_PATH + 8];
+		struct posix_file_information information;
+
+		found = 1;
+		snprintf(root, sizeof(root), "%s", config_string("paths.custom_edition"));
+		trim_separators(root);
+		snprintf(maps, sizeof(maps), "%s/maps", root);
+		if (root[0] && posix_stat(maps, &information) != 0)
+		{
+			platform_log("Halo Custom Edition: %s has no maps folder; not using it", root);
+			root[0] = 0;
+		}
+		if (root[0])
+			platform_log("Halo Custom Edition: using the install at %s", root);
+	}
+	return root;
+}
+
 void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size)
 {
 	char resolved[1024];
@@ -187,7 +215,11 @@ void platform_translate_path(const char *xbox_path, char *host_path, unsigned lo
 	{
 		char drive = (char)(cursor[0] | 0x20);
 
-		if (drive != 'd')
+		if (drive == 'h' && platform_custom_edition_root()[0])
+		{
+			snprintf(resolved, sizeof(resolved), "%s", platform_custom_edition_root());
+		}
+		else if (drive != 'd')
 		{
 			struct posix_file_information information;
 
@@ -210,7 +242,10 @@ void platform_translate_path(const char *xbox_path, char *host_path, unsigned lo
 		while (*cursor && *cursor != '\\' && *cursor != '/' && component_length + 1 < sizeof(component))
 			component[component_length++] = *cursor++;
 		component[component_length] = '\0';
-		if (!component_length || !strcmp(component, "."))
+		/* . and .. (and Windows' spellings of them, with trailing dots and
+		spaces) are skipped: FATX names are never only dots, and .. would
+		leave the root */
+		if (!component_length || strspn(component, ". ") == component_length)
 			continue;
 
 		if (posix_find_entry_case_insensitive(resolved, component, on_disk, sizeof(on_disk)))
@@ -231,6 +266,118 @@ void platform_translate_path(const char *xbox_path, char *host_path, unsigned lo
 		snprintf(resolved + length, sizeof(resolved) - length, "/%s", on_disk);
 	}
 	snprintf(host_path, host_path_size, "%s", resolved);
+}
+
+/* ---------- the maps folder's maps */
+
+enum
+{
+	/* a cache file's header: 'head' and its version */
+	MAP_HEADER_SIGNATURE = 0x68656164,
+	/* (Halo PC's: retail's, and Custom Edition's) */
+	HALO_PC_MAP_VERSION = 7,
+	CUSTOM_EDITION_MAP_VERSION = 609,
+};
+
+/* a map file's cache version, by its header; 0 if it is not a cache file */
+static long map_file_version(const char *path)
+{
+	unsigned char header[8];
+	FILE *file = fopen(path, "rb");
+	long version = 0;
+
+	if (!file)
+		return 0;
+	if (fread(header, 1, sizeof(header), file) == sizeof(header) &&
+		(header[0] | header[1] << 8 | header[2] << 16 | (unsigned long)header[3] << 24) == MAP_HEADER_SIGNATURE)
+	{
+		version = (long)(header[4] | header[5] << 8 | header[6] << 16 | (unsigned long)header[7] << 24);
+	}
+	fclose(file);
+	return version;
+}
+
+static BOOL map_version_is_pc(long version)
+{
+	return version == HALO_PC_MAP_VERSION || version == CUSTOM_EDITION_MAP_VERSION;
+}
+
+static BOOL name_ends_with(const char *name, const char *ending)
+{
+	size_t length = strlen(name);
+	size_t ending_length = strlen(ending);
+	size_t index;
+
+	if (length < ending_length)
+		return FALSE;
+	for (index = 0; index < ending_length; index++)
+	{
+		if (tolower((unsigned char)name[length - ending_length + index]) != tolower((unsigned char)ending[index]))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/* the Halo PC maps in the maps folder, which play only from custom_maps:
+how many, and the first PLATFORM_MAPS_FOLDER_NAMED's names */
+static long pc_maps_in_maps(char *names, unsigned long names_size)
+{
+	char folder[1024];
+	char name[256];
+	long count = 0;
+	void *directory;
+
+	platform_translate_path("d:\\maps", folder, sizeof(folder));
+	directory = posix_directory_open(folder);
+	if (!directory)
+		return 0;
+	while (posix_directory_next(directory, name, sizeof(name)))
+	{
+		char path[1300];
+
+		if (!name_ends_with(name, ".map"))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", folder, name);
+		if (!map_version_is_pc(map_file_version(path)))
+			continue;
+		if (count < PLATFORM_MAPS_FOLDER_NAMED)
+		{
+			size_t length = strlen(names);
+
+			snprintf(names + length, names_size - length, "%s%s", length ? ", " : "", name);
+		}
+		count++;
+	}
+	posix_directory_close(directory);
+	return count;
+}
+
+void platform_maps_folder_check(struct platform_maps_folder *maps)
+{
+	const char *root = platform_data_root();
+	char path[1024];
+
+	memset(maps, 0, sizeof(*maps));
+	/* the data root as the player finds it (whole: Windows' is the
+	executable's folder's, or paths.data's) */
+#ifndef _WIN32
+	if (root[0] != '/' && getcwd(maps->root, sizeof(maps->root)))
+	{
+		size_t length = strlen(maps->root);
+
+		if (strcmp(root, "."))
+			snprintf(maps->root + length, sizeof(maps->root) - length, "/%s", root);
+	}
+	else
+#endif
+	{
+		snprintf(maps->root, sizeof(maps->root), "%s", root);
+	}
+	platform_translate_path("d:\\maps\\ui.map", path, sizeof(path));
+	maps->ui_version = map_file_version(path);
+	maps->state = map_version_is_pc(maps->ui_version) ? _maps_folder_halo_pc :
+		!maps->ui_version ? _maps_folder_no_ui : _maps_folder_xbox;
+	maps->stray_pc_maps = pc_maps_in_maps(maps->stray_names, sizeof(maps->stray_names));
 }
 
 /* ---------- file handles */
@@ -388,7 +535,12 @@ static BOOL read_at(struct platform_file *file, LPVOID buffer, DWORD count, LPDW
 		if (result == 0)
 			break;
 		if (bounce)
+		{
+			/* (where pages are watched by their hashes, port/web, so that a
+			page long unchanged is checked again in the next frame) */
+			memory_watch_prepare_write((char *)buffer + total, (unsigned long)result);
 			memcpy((char *)buffer + total, staging, (size_t)result);
+		}
 		total += (DWORD)result;
 	}
 	free(staging);

@@ -8,9 +8,10 @@ replaced and the game started again.
 The download is a plain HTTP/1.1 GET over TLS 1.2 or 1.3, following
 redirects (GitHub sends release downloads to its file host). The server's
 certificate must chain to one of the system's certificate authorities (the
-bundle the distribution keeps for OpenSSL, curl and the rest, or the file
-SSL_CERT_FILE names) and name the host; nothing is sent before that is
-checked.
+bundle the distribution keeps for OpenSSL, curl and the rest) and name the
+host; nothing is sent before that is checked. The file SSL_CERT_FILE names
+is used only on a system with no bundle, with a warning on stderr: whatever
+sets the environment would otherwise choose whom updates are trusted from.
 
 Built with the host's ABI, as the other posix_*.c.
 */
@@ -62,12 +63,6 @@ static void load_certificates(void)
 
 	crypto_ready = psa_crypto_init() == PSA_SUCCESS;
 	mbedtls_x509_crt_init(&certificates);
-	if (environment && *environment && mbedtls_x509_crt_parse_file(&certificates, environment) >= 0 &&
-		certificates.version)
-	{
-		certificates_loaded = 1;
-		return;
-	}
 	for (index = 0; index < sizeof(certificate_bundles) / sizeof(*certificate_bundles); index++)
 	{
 		/* (a bundle's certificates that do not parse are left out: the
@@ -76,8 +71,22 @@ static void load_certificates(void)
 			mbedtls_x509_crt_parse_file(&certificates, certificate_bundles[index]) >= 0 && certificates.version)
 		{
 			certificates_loaded = 1;
+			if (environment && *environment)
+			{
+				fprintf(stderr, "halo-linux: update: SSL_CERT_FILE is ignored; the update server is checked "
+					"against %s\n", certificate_bundles[index]);
+			}
 			return;
 		}
+	}
+	/* no bundle of the system's: the environment's, said loudly, since it
+	decides which servers updates are taken from */
+	if (environment && *environment && mbedtls_x509_crt_parse_file(&certificates, environment) >= 0 &&
+		certificates.version)
+	{
+		certificates_loaded = 1;
+		fprintf(stderr, "halo-linux: update: WARNING: no system certificate authorities were found; the update "
+			"server is checked against SSL_CERT_FILE (%s) instead\n", environment);
 	}
 }
 
@@ -302,11 +311,14 @@ struct download
 	FILE *file;
 	update_progress_proc progress;
 	void *context;
-	unsigned long long received, total;
+	unsigned long long received, total, maximum;
 };
 
 static int body_write(struct download *download, const unsigned char *data, size_t size)
 {
+	/* (no more than the caller expects: a body that goes on is refused) */
+	if (size > download->maximum - download->received)
+		return 0;
 	if (fwrite(data, 1, size, download->file) != size)
 		return 0;
 	download->received += size;
@@ -326,11 +338,19 @@ static int read_body(struct connection *connection, struct download *download, i
 		for (;;)
 		{
 			char line[128];
+			char *after;
 			unsigned long long remaining;
 
 			if (!connection_read_line(connection, line, sizeof(line)))
 				return 0;
-			remaining = strtoull(line, NULL, 16);
+			/* (a size in hexadecimal, perhaps with extensions after a ";": a
+			line without one is no chunk, and not the last) */
+			remaining = strtoull(line, &after, 16);
+			if (after == line || (*after && *after != ';' && *after != ' ' && *after != '\t' &&
+				*after != '\r' && *after != '\n'))
+			{
+				return 0;
+			}
 			if (!remaining)
 				return 1;
 			while (remaining)
@@ -438,6 +458,12 @@ static int https_get(const char *url, struct download *download, char *location,
 	}
 	if (status == 200)
 	{
+		if (have_length && !chunked && length > download->maximum)
+		{
+			snprintf(error, (size_t)error_size, "the download from %s is larger than expected", host);
+			connection_free(&connection);
+			return 0;
+		}
 		download->total = have_length && !chunked ? length : 0;
 		if (!read_body(&connection, download, chunked, length, have_length && !chunked))
 		{
@@ -449,8 +475,8 @@ static int https_get(const char *url, struct download *download, char *location,
 	return status;
 }
 
-int update_download(const char *url, const char *path, update_progress_proc progress, void *context, char *error,
-	int error_size)
+int update_download(const char *url, const char *path, unsigned long long maximum, update_progress_proc progress,
+	void *context, char *error, int error_size)
 {
 	char current[2048];
 	char location[2048];
@@ -472,6 +498,7 @@ int update_download(const char *url, const char *path, update_progress_proc prog
 	memset(&download, 0, sizeof(download));
 	download.progress = progress;
 	download.context = context;
+	download.maximum = maximum;
 	download.file = fopen(path, "wb");
 	if (!download.file)
 	{

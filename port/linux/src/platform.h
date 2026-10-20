@@ -98,10 +98,42 @@ host path below the data root. Components are matched case-insensitively
 against what exists on disk, as the Xbox file system is case-insensitive. */
 void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size);
 const char *platform_data_root(void);
+/* the Halo Custom Edition install the Xbox drive h:\ is (paths.custom_edition),
+or "" when none is set or it has no maps folder */
+const char *platform_custom_edition_root(void);
 /* on the desktop, when the data root has no maps folder: offers to copy it
 out of an Xbox disc image into destination (sdl_platform.c), and quits if
 the player declines; nonzero once destination has one */
 BOOL platform_offer_game_data(const char *destination);
+/* what the data root's maps folder holds, which should be the Xbox maps
+(sdl_platform.c tells the player when it is not, rather than the game
+failing on Halo PC's ui.map) */
+enum
+{
+	_maps_folder_xbox,
+	/* its ui.map is Halo PC's (retail's, version 7, or Custom Edition's, 609) */
+	_maps_folder_halo_pc,
+	/* it has no ui.map (or one that is not a map) */
+	_maps_folder_no_ui,
+};
+#define PLATFORM_MAPS_FOLDER_NAMED 4
+struct platform_maps_folder
+{
+	int state;
+	/* the data root, whole */
+	char root[1024];
+	long ui_version;
+	/* Halo PC maps in maps/ itself, which play only from custom_maps: how
+	many, and the first PLATFORM_MAPS_FOLDER_NAMED's names */
+	long stray_pc_maps;
+	char stray_names[256];
+};
+void platform_maps_folder_check(struct platform_maps_folder *maps);
+/* asks the player, in a box of its own that waits for the answer (before
+the window opens, or between frames), with `count` buttons (3 at most: Android's),
+`default_index` Enter's and Escape's: the index of the one chosen, or -1
+when it cannot ask */
+int platform_ask(const char *title, const char *text, const char *const *labels, int count, int default_index);
 const char *platform_save_root(void);
 
 /* ---------- contiguous ("physical") memory
@@ -111,7 +143,18 @@ that window at start-up and hands out page-granular blocks from it, so the
 physical/virtual arithmetic the game and Direct3D rely on keeps working. */
 
 #define PLATFORM_CONTIGUOUS_BASE 0x80000000UL
-#define PLATFORM_CONTIGUOUS_SIZE 0x08000000UL /* a 128 MB development kit */
+#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB)
+/* 128 MB, a development kit's: Android's guest image is linked just above
+the window (port/android/include/halo_android_abi.h), and the web build's
+WebAssembly memory ends with it (tools/web_build.py) */
+#define PLATFORM_CONTIGUOUS_SIZE 0x08000000UL
+#else
+/* 512 MB on the desktop builds, whose caches outgrow the Xbox's (Custom
+Edition maps' textures and geometry: halo_port_capacity.h). Its pages are
+backed as they are used. port/windows/src/win32_memory_watch.c has the
+same size. */
+#define PLATFORM_CONTIGUOUS_SIZE 0x20000000UL
+#endif
 #define PLATFORM_ANY_PHYSICAL_ADDRESS 0xffffffffUL
 
 /* returns NULL on failure; physical_address places the block exactly */
@@ -121,6 +164,15 @@ void platform_contiguous_free(void *address);
 BOOL platform_is_contiguous(const void *address);
 #define PLATFORM_PHYSICAL_TO_VIRTUAL(physical) ((void *)((unsigned long)(physical) | PLATFORM_CONTIGUOUS_BASE))
 #define PLATFORM_VIRTUAL_TO_PHYSICAL(address) ((unsigned long)(address) & ~PLATFORM_CONTIGUOUS_BASE)
+
+/* The window Halo Custom Edition tag data are linked to (0x40440000):
+reserved at start-up when the game.custom_edition setting is on, else NULL
+(also declared for the game in halo_linux_source_fixups.h). */
+void *halo_custom_edition_tag_cache(void);
+/* which textures hold their channels where Halo PC keeps them
+(xbox_textures.c; also declared for the game there) */
+void halo_custom_edition_texels_channels(const void *texels, unsigned char channel_order);
+void halo_custom_edition_texels_forget(void);
 
 /* ---------- guest memory write tracking (memory_watch.c)
 
@@ -140,6 +192,10 @@ unsigned long memory_watch_serial(void);
 void memory_watch_prepare_write(void *address, unsigned long size);
 /* the range was remapped or reprotected: treat it as written and unwatched */
 void memory_watch_forget(void *address, unsigned long size);
+/* a new frame starts (Present): tracking that compares page contents
+(Android under ARM translation, host_watch_hash.h) hashes a page at most
+once a frame, so it sees a write in the next frame, not at once */
+void memory_watch_begin_frame(void);
 
 /* ---------- time */
 

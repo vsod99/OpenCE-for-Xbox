@@ -43,7 +43,19 @@ long player_ui_get_active_player_profile_index(
 	short local_player_index);
 struct player_profile *player_ui_get_edit_player_profile(
 	void);
+/* port: the saved game file being edited (NONE for none) */
+long player_ui_get_edit_profile_index(
+	void);
 struct game_variant *player_ui_get_edit_playlist_profile(
+	void);
+/* port: the PC options (game_engine.h) of the gametype being edited, and of
+the multiplayer gametype (player_ui_set_game_variant's) */
+struct game_variant_options;
+struct game_variant_options *player_ui_get_edit_playlist_options(
+	void);
+void player_ui_set_game_variant_options(
+	struct game_variant_options const *options);
+struct game_variant_options const *player_ui_get_game_variant_options(
 	void);
 boolean player_ui_edit_profile_is_dirty(
 	void);
@@ -63,6 +75,9 @@ short player_ui_get_last_single_player_level_played(
 	short local_player_index);
 void player_ui_local_player_joined_multiplayer_game(
 	short local_player_index);
+/* port: the local player out of this game and the next */
+void player_ui_local_player_left_multiplayer_game(
+	short local_player_index);
 boolean player_ui_rumble_disabled(
 	short local_player_index);
 boolean player_ui_get_path_to_local_player_profile_directory(
@@ -73,6 +88,12 @@ void player_ui_get_active_player_profile(
 	void *profile);
 void player_ui_activate_all_solo_levels(
 	void);
+/* port: the first player's profile's campaign progress cleared (hs.c's
+profile_reset_campaign) */
+boolean player_ui_reset_campaign_progress(
+	boolean reset,
+	wchar_t *name,
+	long name_length);
 void player_ui_set_game_variant(
 	struct game_variant *variant);
 boolean player_ui_game_variant_specified(
@@ -102,6 +123,9 @@ boolean player_ui_prompt_user_to_rename_edit_profile(
 	void);
 void player0_look_invert_pitch(
 	boolean invert);
+/* port: a saved game file deleted (saved_game_files.c) */
+void player_ui_saved_game_file_removed(
+	long removed_index);
 
 /* ---------- globals */
 

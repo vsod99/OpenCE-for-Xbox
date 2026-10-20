@@ -36,6 +36,9 @@ word network_game_server_get_state(
 	short *substate);
 boolean network_game_server_game_is_open(
 	struct network_game_server *server);
+/* port: whether the machines are loading the game (its start sent) */
+boolean network_game_server_game_is_loading(
+	struct network_game_server *server);
 /* joining a distributed game in progress (network_server_manager.c) */
 boolean network_game_server_accepts_late_joins(
 	struct network_game_server *server);
@@ -97,6 +100,9 @@ void network_game_server_handle_client_update_packet(
 boolean network_game_server_switch_machine_from_postgame_to_pregame(
 	struct network_game_server *server,
 	struct network_game_server_client_machine *client_machine);
+void network_game_server_set_machine_hardware_id(
+	struct network_game_server_client_machine *machine,
+	char const *hardware_id);
 void network_game_server_queue_player_for_addition(
 	struct network_game_server *server,
 	struct network_player *player);
@@ -117,6 +123,11 @@ struct network_game_server_client_machine *network_game_server_get_client_machin
 struct network_game_server_client_machine *network_game_server_get_client_machine_at_address(
 	struct network_game_server *server,
 	unsigned long address);
+/* port: the machine at an address, preferring one that isn't the host's own
+(a second game on the host's computer shares its address) */
+struct network_game_server_client_machine *network_game_server_get_remote_client_machine_at_address(
+	struct network_game_server *server,
+	unsigned long address);
 struct network_game *network_game_server_get_game(
 	struct network_game_server *server);
 boolean network_game_server_remove_machine_from_game(
@@ -125,6 +136,13 @@ boolean network_game_server_remove_machine_from_game(
 void network_game_server_update_countdown(
 	struct network_game_server *server,
 	short countdown_event);
+/* the lobby takes changes (not once the game has started loading) */
+boolean network_game_server_lobby_is_open(
+	struct network_game_server *server);
+/* a client machine's slower may add to the countdown (once each countdown) */
+boolean network_game_server_client_machine_may_slow_countdown(
+	struct network_game_server *server,
+	struct network_game_server_client_machine *machine);
 /* ---------- globals */
 
 /* ---------- public code */

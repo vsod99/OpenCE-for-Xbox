@@ -266,16 +266,16 @@ boolean network_distributed_client_send(
 	void *message,
 	word size)
 {
-	struct transport_address remote_server_address;
 	byte buffer[0x1000];
 
 	if (!global_network_game_client || size > sizeof(buffer))
 		return FALSE;
 	/* (the write swaps the header in place) */
 	csmemcpy(buffer, message, size);
-	network_game_client_get_remote_server_address(global_network_game_client, &remote_server_address);
+	/* (no address: the client's datagram socket is connected to the host,
+	network_connection_connect, and sends there) */
 	return network_game_client_write(network_game_client_get_connection(global_network_game_client),
-		(message_header *)buffer, size, &remote_server_address, 0);
+		(message_header *)buffer, size, NULL, 0);
 }
 
 /* ... reliably (a client's players' hits, network_damage.c) */
@@ -518,6 +518,16 @@ boolean network_game_client_start_frame(
 		main_goto_main_menu();
 		result = TRUE;
 	}
+	else if (!global_network_game_client)
+	{
+		/* port: no client (the menus let it go, as a lobby's last player
+		leaving does, without changing the connection): no network game, as
+		network_game_client_end_frame has it, which only a frame in a game
+		reaches */
+		game_connection_set(0);
+		main_menu_ensure_player_queues_exist();
+		result = TRUE;
+	}
 	else
 	{
 		result = network_game_client_idle(global_network_game_client);
@@ -580,7 +590,6 @@ boolean network_game_client_end_frame(
 {
 	struct player_action_collection update;
 	struct client_game_update_message message;
-	struct transport_address remote_server_address;
 	unsigned long now;
 	message_header *encoded_message;
 	boolean result;
@@ -618,14 +627,13 @@ boolean network_game_client_end_frame(
 				sizeof(message));
 			if (encoded_message)
 			{
-				network_game_client_get_remote_server_address(
-					global_network_game_client,
-					&remote_server_address);
+				/* (to the host: the client's datagram socket is connected to
+				it, network_distributed_client_send) */
 				result = network_game_client_write(
 					network_game_client_get_connection(global_network_game_client),
 					encoded_message,
 					GET_MESSAGE_SIZE(*encoded_message),
-					&remote_server_address,
+					NULL,
 					0);
 				if (!result)
 					network_event("failed to send a game update to the server");

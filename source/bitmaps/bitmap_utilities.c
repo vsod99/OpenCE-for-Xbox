@@ -1178,11 +1178,7 @@ static void bitmap_cm_smooth(
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x354, bitmap->type==_bitmap_type_cube_map);
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x355, filter_coefficients);
 
-	/* BUG (preserved for exact matching): January passes a newline as an
-	 * unused vararg even though the format has no conversion. A corrected
-	 * build should append the newline to the format string instead.
-	 */
-	fprintf(stdout, "### WARNING tried to smooth a cube map", "\r\n");
+	fprintf(stdout, "### WARNING tried to smooth a cube map\r\n");
 	fflush(stdout);
 
 	return;
@@ -1365,8 +1361,7 @@ static void bitmap_3d_sharpen(
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x3E4, positive_table);
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x3E5, negative_table);
 
-	/* BUG (preserved for exact matching): see bitmap_cm_smooth. */
-	fprintf(stdout, "### WARNING tried to sharpen a 3d bitmap", "\r\n");
+	fprintf(stdout, "### WARNING tried to sharpen a 3d bitmap\r\n");
 	fflush(stdout);
 
 	return;
@@ -1383,8 +1378,7 @@ static void bitmap_cm_sharpen(
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x3F5, positive_table);
 	match_assert("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x3F6, negative_table);
 
-	/* BUG (preserved for exact matching): see bitmap_cm_smooth. */
-	fprintf(stdout, "### WARNING tried to sharpen a cube map", "\r\n");
+	fprintf(stdout, "### WARNING tried to sharpen a cube map\r\n");
 	fflush(stdout);
 
 	return;
@@ -2453,10 +2447,6 @@ union rgb_color *hsv_color_to_rgb_color(
 		}
 	}
 
-	/* The sector switch has no default. Not reached unassigned: for a word hue,
-	 * scaled_hue = hue * 6 / 65536 is at most 393210 / 65536 < 6 (exact in real), so
-	 * sector is 0..5 and each of those cases assigns red, green and blue. Source-policy
-	 * approval pending (2026-09-27 audit). */
 	rgb->red = (word)(long)(red * 65535.0f);
 	rgb->green = (word)(long)(green * 65535.0f);
 	rgb->blue = (word)(long)(blue * 65535.0f);
@@ -2746,6 +2736,14 @@ union real_rgb_color *rgb_colors_interpolate(
 			inverse_interpolation_factor * rgb_lower_bound->blue +
 			interpolation_factor * rgb_upper_bound->blue;
 	}
+
+	/* port: the native builds' rounding can put an interpolation of two
+	valid colours a hair past 1 (a structure decal's random tint did,
+	starting a system link game on Blood Gulch); the result kept a valid
+	colour */
+	rgb_result->red = PIN(rgb_result->red, 0.f, 1.f);
+	rgb_result->green = PIN(rgb_result->green, 0.f, 1.f);
+	rgb_result->blue = PIN(rgb_result->blue, 0.f, 1.f);
 
 	match_assert_valid_real_rgb_color("c:\\halo\\SOURCE\\bitmaps\\bitmap_utilities.c", 0x95D, rgb_result);
 

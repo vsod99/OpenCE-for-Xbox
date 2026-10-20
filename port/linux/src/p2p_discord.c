@@ -63,7 +63,40 @@ static struct
 	int player_count;
 	int maximum_player_count;
 	int changed;
+
+	/* the Discord user signed in to the client (its READY), as told: an id
+	of digits, a name of the letters, digits and marks Discord's allow (a
+	host logs them, for a player it drops for cheating) */
+	char user_id[P2P_DISCORD_ID_SIZE];
+	char user_name[P2P_DISCORD_NAME_SIZE];
 } discord = { .handle = -1 };
+
+/* the text kept of a Discord user's id or name: of the characters allowed
+(the rest left out), no longer than the size (and ended) */
+void p2p_discord_sanitize(char *destination, int size, const char *source, int name)
+{
+	int length = 0;
+
+	for (; source && *source && length < size - 1; source++)
+	{
+		char character = *source;
+
+		if ((character >= '0' && character <= '9') ||
+			(name && ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+				character == '_' || character == '.' || character == '-')))
+		{
+			destination[length++] = character;
+		}
+	}
+	destination[length] = 0;
+}
+
+/* the Discord user signed in, as told (empty if none); under p2p_lock */
+void p2p_discord_user(char *id, int id_size, char *name, int name_size)
+{
+	p2p_discord_sanitize(id, id_size, discord.user_id, 0);
+	p2p_discord_sanitize(name, name_size, discord.user_name, 1);
+}
 
 static void discord_close(void)
 {
@@ -140,7 +173,10 @@ static void send_activity(void)
 	else
 	{
 		size = snprintf(json, sizeof(json),
-			"{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%lu\",\"args\":{\"pid\":%lu}}",
+			"{\"cmd\":\"SET_ACTIVITY\",\"nonce\":\"%lu\",\"args\":{\"pid\":%lu,\"activity\":{"
+			"\"details\":\"In Menus\","
+			"\"assets\":{\"large_image\":\"logo\",\"large_text\":\"Halo: Combat Evolved\"},"
+			"\"instance\":false}}}",
 			++discord.nonce, (unsigned long)posix_process_id());
 	}
 	discord_send(_opcode_frame, json, size);
@@ -188,6 +224,18 @@ static void frame_received(int opcode, char *json)
 
 			discord.ready = 1;
 			platform_log("Internet play: connected to Discord");
+			/* (who is signed in: its user, after the configuration) */
+			{
+				const char *user = strstr(json, "\"user\"");
+				char value[128];
+
+				discord.user_id[0] = 0;
+				discord.user_name[0] = 0;
+				if (user && json_string(user, "id", value, sizeof(value)))
+					p2p_discord_sanitize(discord.user_id, sizeof(discord.user_id), value, 0);
+				if (user && json_string(user, "username", value, sizeof(value)))
+					p2p_discord_sanitize(discord.user_name, sizeof(discord.user_name), value, 1);
+			}
 			size = snprintf(command, sizeof(command),
 				"{\"cmd\":\"SUBSCRIBE\",\"evt\":\"ACTIVITY_JOIN\",\"nonce\":\"%lu\"}", ++discord.nonce);
 			discord_send(_opcode_frame, command, size);
@@ -270,7 +318,10 @@ void p2p_discord_update(void)
 		const char *application = config_string("discord.application_id");
 
 		discord.checked = 1;
-		if (*application && strlen(application) < sizeof(discord.application))
+		/* (an application's id is digits: it goes into a file's path and
+		the handshake's JSON) */
+		if (*application && strlen(application) < sizeof(discord.application) &&
+			strspn(application, "0123456789") == strlen(application))
 		{
 			char scheme[48];
 
@@ -290,7 +341,8 @@ void p2p_discord_update(void)
 		char handshake[128];
 		int size;
 
-		if (discord.attempted && (long)(p2p_now() - discord.attempt_time) < RETRY_INTERVAL)
+		/* (unsigned, as the clock wraps) */
+		if (discord.attempted && (unsigned int)(p2p_now() - discord.attempt_time) < (unsigned int)RETRY_INTERVAL)
 			return;
 		discord.attempted = 1;
 		discord.attempt_time = p2p_now();

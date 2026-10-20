@@ -39,9 +39,10 @@ Internet play (p2p.c) adds machines that shared an invite to this LAN: an
 XNADDR's abEnet carries its machine's identifier, which XNetXnAddrToInAddr
 maps to the peer's virtual address, and traffic to and from those addresses
 is rewritten to and from p2p.c's local stand-ins here (or fails, with
-WSAEHOSTUNREACH, while the peer is not reached). Broadcasts also go to every
-peer. p2p.c is told the ports of the game's sockets, which alone peers
-reach.
+WSAEHOSTUNREACH, while the peer is not reached); datagrams to a peer, and
+broadcasts, which also go to every peer, go onto the tunnel at once
+(p2p_send_datagram). p2p.c is told the ports of the game's sockets, which
+alone peers reach.
 */
 
 #include "platform.h"
@@ -239,8 +240,8 @@ static int peer_outgoing_address(int stream, int connecting, const struct sockad
 	return 1;
 }
 
-/* tells internet play the local port the game's socket has (bound, or
-listening) */
+/* tells internet play the local port the game's socket has (bound, given
+one by a connection or a send, or listening) */
 static void note_socket_port(SOCKET socket, int listening)
 {
 	struct sockaddr_in bound;
@@ -248,15 +249,18 @@ static void note_socket_port(SOCKET socket, int listening)
 	int type = SOCK_DGRAM;
 	int type_length = sizeof(type);
 
-	/* (not one bound to this machine alone: the telnet console's, which no
-	peer is to reach, and which is not hosting) */
 	if (posix_socket_getsockname((int)socket, &bound, &length) < 0 || bound.sin_family != AF_INET ||
-		bound.sin_addr.s_addr == loopback_address())
+		!bound.sin_port)
 	{
 		return;
 	}
 	posix_socket_getsockopt((int)socket, SOL_SOCKET, SO_TYPE, &type, &type_length);
-	p2p_socket_port((int)socket, type == SOCK_STREAM, listening, bound.sin_port);
+	/* (one bound to this machine alone, as the telnet console's, is not for
+	peers to reach, and is not hosting; its port is still no stand-in's) */
+	if (bound.sin_addr.s_addr == loopback_address())
+		p2p_port_taken(type == SOCK_STREAM, bound.sin_port);
+	else
+		p2p_socket_port((int)socket, type == SOCK_STREAM, listening, bound.sin_port);
 }
 
 /* traffic from an internet play peer's stand-in comes from the peer, and
@@ -278,6 +282,18 @@ static void peer_incoming_address(int stream, struct sockaddr *address, const in
 		}
 	}
 	incoming_address(address, address_length);
+}
+
+/* the local port the game's socket is bound to (network byte order), or 0
+if it is not yet */
+static unsigned short socket_port(SOCKET socket)
+{
+	struct sockaddr_in bound;
+	int length = sizeof(bound);
+
+	if (posix_socket_getsockname((int)socket, &bound, &length) < 0 || bound.sin_family != AF_INET)
+		return 0;
+	return bound.sin_port;
 }
 
 /* the addresses to send broadcasts to instead, if network.broadcast is
@@ -362,7 +378,11 @@ SOCKET WSAAPI halo_ws_socket(int family, int type, int protocol)
 
 int WSAAPI halo_ws_closesocket(SOCKET socket)
 {
-	p2p_socket_closed((int)socket);
+	int type = SOCK_STREAM;
+	int type_length = sizeof(type);
+
+	posix_socket_getsockopt((int)socket, SOL_SOCKET, SO_TYPE, &type, &type_length);
+	p2p_socket_closed((int)socket, type == SOCK_DGRAM ? socket_port(socket) : 0);
 	delayed_closed((int)socket);
 	return winsock_result(posix_socket_close((int)socket));
 }
@@ -393,6 +413,8 @@ int WSAAPI halo_ws_connect(SOCKET socket, const struct sockaddr *address, int ad
 	unsigned long override;
 	int type = SOCK_STREAM;
 	int type_length = sizeof(type);
+	int result;
+	int error;
 
 	/* an internet play peer's TCP or UDP port */
 	if (address && address->sa_family == AF_INET &&
@@ -424,7 +446,18 @@ int WSAAPI halo_ws_connect(SOCKET socket, const struct sockaddr *address, int ad
 			posix_socket_bind((int)socket, &bound, sizeof(bound));
 		}
 	}
-	return winsock_result(posix_socket_connect((int)socket, address, address_length));
+	result = posix_socket_connect((int)socket, address, address_length);
+	error = result < 0 ? posix_socket_last_error() : 0;
+	/* the port the system gave it (a connection under way has one too, and
+	a datagram socket's that failed keeps its: a stream socket's that failed
+	has none) */
+	note_socket_port(socket, 0);
+	if (result < 0)
+	{
+		WSASetLastError(error);
+		return SOCKET_ERROR;
+	}
+	return result;
 }
 
 int WSAAPI halo_ws_listen(SOCKET socket, int backlog)
@@ -461,6 +494,10 @@ int WSAAPI halo_ws_sendto(SOCKET socket, const char *buffer, int length, int fla
 {
 	/* the rewritten destination: it must outlive the send */
 	struct sockaddr_in target;
+	/* 0: not bound yet, which the first send binds it */
+	unsigned short source_port = socket_port(socket);
+	int result;
+	int send_error;
 
 	if (address && address->sa_family == AF_INET && address_length >= (int)sizeof(struct sockaddr_in) &&
 		((const struct sockaddr_in *)address)->sin_addr.s_addr == INADDR_BROADCAST)
@@ -470,7 +507,6 @@ int WSAAPI halo_ws_sendto(SOCKET socket, const char *buffer, int length, int fla
 		int target_count = broadcast_targets(targets, MAXIMUM_BROADCAST_TARGETS);
 		int peer_count;
 		int index;
-		int result;
 
 		/* one datagram per target; the broadcast counts as sent if any is */
 		memcpy(&target, address, sizeof(target));
@@ -491,8 +527,31 @@ int WSAAPI halo_ws_sendto(SOCKET socket, const char *buffer, int length, int fla
 		{
 			result = posix_socket_sendto((int)socket, buffer, length, flags, address, address_length);
 		}
+		/* (the broadcast's own error, which what follows would overwrite) */
+		send_error = result < 0 ? posix_socket_last_error() : 0;
 		/* and to every internet play peer (after the send above, which binds
-		the socket if it was not) */
+		the socket if it was not): onto the tunnel at once, else through the
+		stand-ins */
+		if (!source_port)
+		{
+			source_port = socket_port(socket);
+			if (source_port)
+				note_socket_port(socket, 0);
+		}
+		if (source_port)
+		{
+			if (p2p_broadcast_datagram(source_port, ((const struct sockaddr_in *)address)->sin_port, buffer,
+				length) > 0 && result < 0)
+			{
+				result = length;
+			}
+			if (result < 0)
+			{
+				WSASetLastError(send_error);
+				return SOCKET_ERROR;
+			}
+			return result;
+		}
 		peer_count = p2p_broadcast_targets(((const struct sockaddr_in *)address)->sin_port, targets, ports,
 			P2P_BROADCAST_PEERS);
 		for (index = 0; index < peer_count; index++)
@@ -505,7 +564,28 @@ int WSAAPI halo_ws_sendto(SOCKET socket, const char *buffer, int length, int fla
 			if (result < 0 && sent >= 0)
 				result = sent;
 		}
-		return winsock_result(result);
+		if (result < 0)
+		{
+			WSASetLastError(send_error);
+			return SOCKET_ERROR;
+		}
+		return result;
+	}
+	/* an internet play peer's: onto the tunnel at once, from the socket's
+	port (one not bound yet goes through a stand-in, which the system's send
+	binds it for) */
+	if (address && address->sa_family == AF_INET && address_length >= (int)sizeof(struct sockaddr_in) &&
+		(halo_ws_ntohl(((const struct sockaddr_in *)address)->sin_addr.s_addr) & 0xFFC00000) == 0x64400000)
+	{
+		switch (source_port ? p2p_send_datagram(source_port, ((const struct sockaddr_in *)address)->sin_addr.s_addr,
+			((const struct sockaddr_in *)address)->sin_port, buffer, length) : 0)
+		{
+		case 1:
+			return length;
+		case -1:
+			WSASetLastError(WSAEHOSTUNREACH);
+			return SOCKET_ERROR;
+		}
 	}
 	switch (peer_outgoing_address(0, -1, &address, address_length, &target))
 	{
@@ -515,13 +595,29 @@ int WSAAPI halo_ws_sendto(SOCKET socket, const char *buffer, int length, int fla
 		address = outgoing_address(address, address_length, &target);
 		break;
 	}
-	return winsock_result(posix_socket_sendto((int)socket, buffer, length, flags, address, address_length));
+	result = posix_socket_sendto((int)socket, buffer, length, flags, address, address_length);
+	send_error = result < 0 ? posix_socket_last_error() : 0;
+	/* the port the send gave it (one that failed binds it too) */
+	if (!source_port)
+		note_socket_port(socket, 0);
+	if (result < 0)
+	{
+		WSASetLastError(send_error);
+		return SOCKET_ERROR;
+	}
+	return result;
 }
 
 /* debug.network_latency and debug.network_loss: what this machine receives
 is held back that many milliseconds (both ways between two machines: a
 round trip of twice it) and that share of its datagrams lost, to test the
-netcode as over the internet */
+netcode as over the internet. debug.network_corrupt: that share of the
+datagrams it receives, and debug.network_corrupt_stream that share of its
+reads of streams, is damaged at random (bytes changed, cut short,
+stretched, or replaced) from debug.network_corrupt_after seconds after the
+start (so that the game can be set up and started: what a host sends its
+own client over the loopback is damaged too), to test that nothing another
+machine sends can crash the game */
 #define DELAYED_PACKET_SIZE 1500
 #define MAXIMUM_DELAYED_PACKETS 4096
 
@@ -542,6 +638,11 @@ static struct
 	int checked;
 	DWORD latency;
 	int loss_percent;
+	int corrupt_percent;
+	int corrupt_stream_percent;
+	DWORD corrupt_after;
+	DWORD started_time;
+	unsigned corrupt_seed;
 	struct delayed_packet *packets;
 	int first;
 	int count;
@@ -557,21 +658,107 @@ static int delayed_enabled(void)
 	{
 		double latency = config_real("debug.network_latency");
 		double loss = config_real("debug.network_loss");
+		double corrupt = config_real("debug.network_corrupt");
+		double corrupt_stream = config_real("debug.network_corrupt_stream");
+		double corrupt_after = config_real("debug.network_corrupt_after");
 
-		/* up to ten seconds, and a share */
+		/* up to ten seconds, and shares */
 		latency = !(latency > 0.0) ? 0.0 : latency > 10000.0 ? 10000.0 : latency;
 		loss = !(loss > 0.0) ? 0.0 : loss > 100.0 ? 100.0 : loss;
+		corrupt = !(corrupt > 0.0) ? 0.0 : corrupt > 100.0 ? 100.0 : corrupt;
+		corrupt_stream = !(corrupt_stream > 0.0) ? 0.0 : corrupt_stream > 100.0 ? 100.0 : corrupt_stream;
+		corrupt_after = !(corrupt_after > 0.0) ? 0.0 : corrupt_after > 86400.0 ? 86400.0 : corrupt_after;
 		delayed.latency = (DWORD)latency;
 		delayed.loss_percent = (int)loss;
+		delayed.corrupt_percent = (int)corrupt;
+		delayed.corrupt_stream_percent = (int)corrupt_stream;
+		delayed.corrupt_after = (DWORD)(corrupt_after * 1000.0);
+		delayed.started_time = GetTickCount();
+		delayed.corrupt_seed = (unsigned)GetTickCount() ^ (unsigned)(size_t)&delayed.checked;
 		delayed.checked = 1;
-		if (delayed.latency || delayed.loss_percent)
+		if (delayed.latency || delayed.loss_percent || delayed.corrupt_percent || delayed.corrupt_stream_percent)
 		{
 			delayed.packets = calloc(MAXIMUM_DELAYED_PACKETS, sizeof(*delayed.packets));
-			platform_log("network: receiving %lu ms late, losing %d%% of datagrams (testing)",
-				(unsigned long)delayed.latency, delayed.loss_percent);
+			platform_log("network: receiving %lu ms late, losing %d%% of datagrams, damaging %d%% of them and %d%% of stream reads after %lu s (testing)",
+				(unsigned long)delayed.latency, delayed.loss_percent, delayed.corrupt_percent,
+				delayed.corrupt_stream_percent, (unsigned long)(delayed.corrupt_after / 1000));
 		}
 	}
 	return delayed.packets != NULL;
+}
+
+/* (the test's own numbers, so that the game's rand() goes as without it) */
+static unsigned delayed_random(void)
+{
+	delayed.corrupt_seed = delayed.corrupt_seed * 1103515245u + 12345u;
+	return delayed.corrupt_seed >> 8;
+}
+
+/* damages a packet at random: a few bytes changed, cut short, stretched
+with random bytes (a datagram, up to the largest), or replaced throughout;
+the length it has after */
+static int delayed_corrupt(char *data, int length, int datagram)
+{
+	int count, index;
+
+	switch (delayed_random() % 8)
+	{
+	case 0:
+		/* (cut short, a datagram to nothing at times; a stream's read of
+		nothing would be the stream closing) */
+		if (length > 0)
+			length = datagram ? (int)(delayed_random() % (unsigned)(length + 1)) :
+				1 + (int)(delayed_random() % (unsigned)length);
+		break;
+	case 1:
+		if (datagram)
+		{
+			int stretched = (int)(delayed_random() % (unsigned)(DELAYED_PACKET_SIZE + 1));
+
+			for (index = length; index < stretched; index++)
+				data[index] = (char)delayed_random();
+			if (stretched > length)
+				length = stretched;
+		}
+		else if (length > 0)
+		{
+			data[delayed_random() % (unsigned)length] = (char)delayed_random();
+		}
+		break;
+	case 2:
+		for (index = 0; index < length; index++)
+			data[index] = (char)delayed_random();
+		break;
+	case 3:
+		/* (a run of bytes: a field, with its neighbours) */
+		if (length > 0)
+		{
+			int start = (int)(delayed_random() % (unsigned)length);
+			int run = 1 + (int)(delayed_random() % 16u);
+
+			for (index = start; index < length && index < start + run; index++)
+				data[index] = (char)delayed_random();
+		}
+		break;
+	case 4:
+		/* (the extremes a size or an index is checked against) */
+		if (length > 0)
+		{
+			static const unsigned char extremes[] = { 0x00, 0xFF, 0x7F, 0x80, 0x01, 0xFE };
+
+			count = 1 + (int)(delayed_random() % 4u);
+			for (index = 0; index < count; index++)
+				data[delayed_random() % (unsigned)length] = (char)extremes[delayed_random() % sizeof(extremes)];
+		}
+		break;
+	default:
+		/* (a few bits) */
+		count = 1 + (int)(delayed_random() % 8u);
+		for (index = 0; index < count && length > 0; index++)
+			data[delayed_random() % (unsigned)length] ^= (char)(1u << (delayed_random() % 8u));
+		break;
+	}
+	return length;
 }
 
 /* drops what is held back for socket, and what has been read (socket -1),
@@ -666,6 +853,14 @@ static int delayed_receive_locked(SOCKET socket, char *buffer, int length, int f
 			return 0;
 		if (datagram && rand() % 100 < delayed.loss_percent)
 			continue;
+		/* (a stream's reads by their own share: a damaged stream is dropped,
+		and the game must go on for its datagrams to be tested) */
+		if ((datagram ? delayed.corrupt_percent : delayed.corrupt_stream_percent) &&
+			GetTickCount() - delayed.started_time >= delayed.corrupt_after &&
+			(int)(delayed_random() % 100u) < (datagram ? delayed.corrupt_percent : delayed.corrupt_stream_percent))
+		{
+			result = delayed_corrupt(packet->data, result, datagram);
+		}
 		packet->socket = (int)socket;
 		packet->length = result;
 		packet->offset = 0;

@@ -111,6 +111,14 @@ symbols in this file:
 
 /* ---------- constants */
 
+/* port: the cache's pages (sound_cache_new), named for the size check */
+enum
+{
+	/* port: the native builds' cache (halo_port_capacity.h; 1024 pages) */
+	SOUND_CACHE_PAGE_COUNT = HALO_PORT_SOUND_CACHE_SIZE >> 12,
+	SOUND_CACHE_PAGE_SIZE_BITS = 12,
+};
+
 /* ---------- macros */
 
 #define cache_block_index unknown0
@@ -188,6 +196,8 @@ static long sound_cache_locked_block_proc(
 	long block_index);
 static void sound_cache_delete_block_proc(
 	long block_index);
+static struct xbox_cache_sound_datum *sound_cache_sound_get_cache_sound(
+	struct sound_permutation *sound);
 
 /* ---------- globals */
 
@@ -248,7 +258,8 @@ void sound_cache_sound_new(
 void sound_cache_sound_delete(
 	struct sound_permutation *sound)
 {
-	if (sound->cache_block_index != NONE)
+	/* port: and a block that is this sound's */
+	if (sound_cache_sound_get_cache_sound(sound))
 	{
 		match_vassert(
 			"c:\\halo\\SOURCE\\cache\\xbox_sound_cache.c",
@@ -296,9 +307,10 @@ void sound_cache_sound_finished(
 {
 	struct xbox_cache_sound_datum *cache_sound;
 
-	cache_sound = datum_get(
-		xbox_sound_cache_globals.cache_sounds,
-		sound->cache_block_index);
+	/* port: none if the sound has no block of its own */
+	cache_sound = sound_cache_sound_get_cache_sound(sound);
+	if (!cache_sound)
+		return;
 	if (debug_sound_reference_counts)
 	{
 		error(
@@ -321,9 +333,10 @@ void sound_cache_sound_hardware_lock(
 {
 	struct xbox_cache_sound_datum *cache_sound;
 
-	cache_sound = datum_get(
-		xbox_sound_cache_globals.cache_sounds,
-		sound->cache_block_index);
+	/* port: none if the sound has no block of its own */
+	cache_sound = sound_cache_sound_get_cache_sound(sound);
+	if (!cache_sound)
+		return;
 	if (cache_sound->hardware_reference_count < UNSIGNED_CHAR_MAX)
 	{
 		cache_sound->hardware_reference_count++;
@@ -339,10 +352,11 @@ void sound_cache_sound_hardware_lock(
 void sound_cache_sound_hardware_unlock(
 	struct sound_permutation *sound)
 {
-	struct xbox_cache_sound_datum *cache_sound = datum_get(
-		xbox_sound_cache_globals.cache_sounds,
-		sound->cache_block_index);
+	/* port: none if the sound has no block of its own */
+	struct xbox_cache_sound_datum *cache_sound = sound_cache_sound_get_cache_sound(sound);
 
+	if (!cache_sound)
+		return;
 	if (cache_sound->hardware_reference_count)
 	{
 		cache_sound->hardware_reference_count--;
@@ -369,8 +383,8 @@ void sound_cache_new(
 		"xbox_sound_cache_globals.cache_sounds");
 	xbox_sound_cache_globals.cache = lruv_new(
 		"xbox sound cache",
-		1024,
-		12,
+		SOUND_CACHE_PAGE_COUNT,
+		SOUND_CACHE_PAGE_SIZE_BITS,
 		512,
 		sound_cache_delete_block_proc,
 		(lruv_locked_block_proc)sound_cache_locked_block_proc);
@@ -418,6 +432,22 @@ void sound_cache_close(
 	data_iterator_new(&iterator, xbox_sound_cache_globals.cache_sounds);
 	while ((cache_sound = data_iterator_next(&iterator)) != NULL)
 	{
+		/* port: the map is going, every sound stopped and the platform's
+		channels flushed (sound_dispose_from_old_map): a sound still counted
+		as playing is a count never given back, not a sound playing (one, a
+		weapon's charging loop, halted a client as a game ended); let go,
+		not halted on */
+		if (cache_sound->software_reference_count != 0 || cache_sound->hardware_reference_count != 0)
+		{
+			error(
+				_error_silent,
+				"sound %s still counted as playing (%d, %d) as the map closed; let go",
+				cache_sound->sound ? tag_get_name(cache_sound->sound->runtime_tag_index) : "?",
+				cache_sound->software_reference_count,
+				cache_sound->hardware_reference_count);
+			cache_sound->software_reference_count = 0;
+			cache_sound->hardware_reference_count = 0;
+		}
 		sound_cache_sound_delete(cache_sound->sound);
 	}
 	data_make_invalid(xbox_sound_cache_globals.cache_sounds);
@@ -426,6 +456,43 @@ void sound_cache_close(
 }
 
 /* ---------- private code */
+
+/* port: a permutation's cache block and address are kept in the tag, and a
+map's tags come with them as it was built (retail: no block, no address;
+sound_cache_sound_new, which would set them, is never called). A block that
+is not this sound's own (a map's, or one of another sound) is none, and so is
+its address: the sound is loaded again. That is said once. */
+static struct xbox_cache_sound_datum *sound_cache_sound_get_cache_sound(
+	struct sound_permutation *sound)
+{
+	struct xbox_cache_sound_datum *cache_sound = NULL;
+
+	if (sound->cache_block_index != NONE)
+	{
+		cache_sound = datum_try_and_get(
+			xbox_sound_cache_globals.cache_sounds,
+			sound->cache_block_index);
+		if (!cache_sound || cache_sound->sound != sound)
+		{
+			static boolean bad_block_reported = FALSE;
+
+			if (!bad_block_reported)
+			{
+				bad_block_reported = TRUE;
+				error(
+					_error_silent,
+					"sound permutation %.32s names cache block %08x (not its own)",
+					sound->name,
+					sound->cache_block_index);
+			}
+			sound->cache_block_index = NONE;
+			sound->cache_base_address = 0;
+			cache_sound = NULL;
+		}
+	}
+
+	return cache_sound;
+}
 
 static long sound_cache_locked_block_proc(
 	long block_index)
@@ -476,8 +543,10 @@ static const char *cache_block_get_sound_permutation_name(
 	struct xbox_cache_sound_datum *cache_sound;
 
 	cache_sound = datum_get(xbox_sound_cache_globals.cache_sounds, block_index);
-	sprintf(
+	/* port: snprintf (a map's tag's name may be any length) */
+	snprintf(
 		xbox_sound_cache_globals.debug_block_name,
+		sizeof(xbox_sound_cache_globals.debug_block_name),
 		"%s (%s)",
 		tag_get_name(cache_sound->sound->runtime_tag_index),
 		cache_sound->sound);
@@ -489,6 +558,27 @@ static void sound_cache_start_loading_sound(
 	struct sound_permutation *sound)
 {
 	long cache_block_index;
+
+	/* port: the size is the map's (retail: 288 bytes to 377064): none, or
+	more than the cache holds (its pages of 4k), is not loaded, said once
+	(the cache halts on a block of no pages) */
+	if (sound->samples.size <= 0 ||
+		sound->samples.size > SOUND_CACHE_PAGE_COUNT << SOUND_CACHE_PAGE_SIZE_BITS)
+	{
+		static boolean bad_size_reported = FALSE;
+
+		if (!bad_size_reported)
+		{
+			bad_size_reported = TRUE;
+			error(
+				_error_silent,
+				"sound permutation %.32s of %d bytes not loaded",
+				sound->name,
+				sound->samples.size);
+		}
+
+		return;
+	}
 
 	cache_block_index = lruv_block_new(
 		xbox_sound_cache_globals.cache,
@@ -516,27 +606,48 @@ static void sound_cache_start_loading_sound(
 		sound->cache_block_index = cache_block_index;
 		sound->cache_base_address = (unsigned long)cache_address;
 		cache_sound->sound = sound;
-		cache_file_read(
-			sound->cache_tag_index,
-			sound->samples.file_offset,
-			sound->samples.size,
-			cache_address,
-			&cache_sound->loaded,
-			FALSE);
+		/* port: or, the sound of a mod played over the map's, from memory,
+		at once (port/linux/game/mod_sounds.c) */
+		{
+			extern boolean mod_sounds_read(struct sound_permutation const *permutation, void *buffer);
+
+			if (mod_sounds_read(sound, cache_address))
+			{
+				cache_sound->loaded = TRUE;
+			}
+			else
+			{
+				cache_file_read(
+					sound->cache_tag_index,
+					sound->samples.file_offset,
+					sound->samples.size,
+					cache_address,
+					&cache_sound->loaded,
+					FALSE);
+			}
+		}
 	}
 	else if (
 		system_milliseconds() -
 			xbox_sound_cache_globals.last_allocation_failure_time > 10000)
 	{
-		terminal_printf(
-			global_real_argb_purple,
-			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		/* (port: chatter, shown as config.toml's game.console_log says) */
+		if (terminal_shows(_terminal_message_chatter))
+		{
+			terminal_printf(
+				global_real_argb_purple,
+				"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		}
 		error(
 			_error_silent,
 			"SOUND CACHE BLOWN!!!! double-click \"GETSTABBED.BAT\" on your PC now!!!");
-		terminal_printf(
-			global_real_argb_purple,
-			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		/* (port: chatter, shown as config.toml's game.console_log says) */
+		if (terminal_shows(_terminal_message_chatter))
+		{
+			terminal_printf(
+				global_real_argb_purple,
+				"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		}
 		lruv_debug_to_file(
 			"d:\\stabbed.txt",
 			sound->name,
@@ -572,6 +683,8 @@ boolean _sound_cache_sound_request(
 		0xC6,
 		sound->cache_tag_index!=0);
 
+	/* port: and a block that is this sound's (else it has none) */
+	sound_cache_sound_get_cache_sound(sound);
 	if (sound->cache_block_index == NONE && load)
 	{
 		sound_cache_start_loading_sound(sound);
@@ -675,8 +788,9 @@ void sound_cache_debug_render(
 {
 	if (debug_sound_cache)
 	{
-		short rows = 1024 / 640;
-		byte page_usage[1024];
+		/* port: (of the native builds' pages: the cache fills page_usage) */
+		short rows = SOUND_CACHE_PAGE_COUNT / 640;
+		byte page_usage[SOUND_CACHE_PAGE_COUNT];
 		long x;
 		real_argb_color const *colors[4];
 

@@ -41,6 +41,8 @@ symbols in this file:
 /* ---------- headers */
 
 #include "following_camera.h"
+#include "passenger_camera.h" /* port: port/linux/game/passenger_camera.c */
+#include "cseries/errors.h" /* port: (error, for a short camera track) */
 #include "observer.h"
 
 #include "static_camera.h"
@@ -194,11 +196,13 @@ void following_camera_update(
 {
 	struct player_control_unit_camera_info camera_info;
 	struct camera_command *command;
+	boolean passenger; /* port: only this local display view borrows a seat's camera */
 
 	match_assert("c:\\halo\\SOURCE\\camera\\following_camera.c", 138, camera);
 	match_assert("c:\\halo\\SOURCE\\camera\\following_camera.c", 139, result);
 
 	player_control_get_unit_camera_info(controls->local_player_index, &camera_info);
+	passenger = passenger_camera_info(controls->local_player_index, &camera_info);
 	command = &result->command;
 
 	command->position = camera_info.position;
@@ -233,7 +237,7 @@ void following_camera_update(
 			camera->crouched = crouched;
 		}
 
-		if (controls->active)
+		if (controls->active && !passenger) /* port: no free orbit outside the passenger's firing arc */
 		{
 			camera->facing_offset.yaw += controls->facing_delta.yaw;
 			camera->facing_offset.pitch += controls->facing_delta.pitch;
@@ -252,6 +256,9 @@ void following_camera_update(
 			facing.pitch + camera->facing_offset.pitch,
 			-_pi / 2.f,
 			_pi / 2.f);
+		/* port: keep the reference camera inside this passenger's weapon arc */
+		if (passenger)
+			passenger_camera_clamp_facing(controls->local_player_index, &facing);
 		vector3d_from_euler_angles2d(&command->forward, &facing);
 
 		match_vassert(
@@ -405,6 +412,60 @@ static void camera_track_splut(
 		camera_track_index);
 	t = (pitch + _pi / 2.f) * (1.f / _pi);
 	control_point_count = camera_track->control_points.count;
+	/* port: the curve below reads four control points, and a custom map's
+	track can have fewer: the camera goes between the points it has (none:
+	no offset) rather than reading past them (NaN with one point) */
+	if (control_point_count < 4)
+	{
+		static boolean short_track_reported = FALSE;
+		struct camera_track_control_point *start_point;
+		struct camera_track_control_point *end_point;
+		real span;
+		real fraction;
+		long sample_index;
+
+		if (!short_track_reported)
+		{
+			error(_error_silent,
+				"following camera: a camera track has %ld control points, and the curve wants four, so the camera uses the points it has",
+				control_point_count);
+			short_track_reported = TRUE;
+		}
+		if (control_point_count < 1)
+		{
+			offset->i = 0.f;
+			offset->j = 0.f;
+			offset->k = 0.f;
+			return;
+		}
+
+		span = (control_point_count - 1) * PIN(t, 0.f, 1.f);
+		sample_index = (long)span;
+		fraction = span - sample_index;
+		if (sample_index >= control_point_count - 1)
+		{
+			sample_index = control_point_count - 1;
+			fraction = 0.f;
+		}
+		/* (a pitch not a number) */
+		else if (sample_index < 0)
+		{
+			sample_index = 0;
+			fraction = 0.f;
+		}
+		start_point = TAG_BLOCK_GET_ELEMENT(
+			&camera_track->control_points,
+			sample_index,
+			struct camera_track_control_point);
+		end_point = TAG_BLOCK_GET_ELEMENT(
+			&camera_track->control_points,
+			MIN(sample_index + 1, control_point_count - 1),
+			struct camera_track_control_point);
+		offset->i = start_point->position.i + (end_point->position.i - start_point->position.i) * fraction;
+		offset->j = start_point->position.j + (end_point->position.j - start_point->position.j) * fraction;
+		offset->k = start_point->position.k + (end_point->position.k - start_point->position.k) * fraction;
+		return;
+	}
 	frame_index = (long)((control_point_count - 1) * t);
 	control_point_index = (short)frame_index;
 	h = 1.f / (control_point_count - 1);

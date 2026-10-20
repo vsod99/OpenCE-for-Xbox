@@ -97,6 +97,8 @@ symbols in this file:
 #include "memory/data.h"
 #include "objects/object_definitions.h"
 #include "objects/objects.h"
+#include "physics/collision_usage.h"
+#include "physics/collisions.h"
 #include "rasterizer/rasterizer.h"
 #include "render/render.h"
 #include "render/render_camera_projection.h"
@@ -105,6 +107,10 @@ symbols in this file:
 #include "sound/game_sound.h"
 #include "tag_files/tag_files.h"
 #include "text/draw_string.h"
+#include "coop_spectate.h" /* port: port/linux/game/coop_spectate.c */
+#include "network_coop.h" /* port: port/linux/game/network_coop.c */
+#include "network_chat.h" /* port: port/linux/game/network_chat.c */
+#include "text/font_group.h"
 #include "text/text_group.h"
 #include "units/unit_definitions.h"
 #include "units/units.h"
@@ -867,6 +873,7 @@ void hud_autosave(
 		: hud_globals->checkpoint_end_index;
 	short local_player_index;
 
+	network_coop_note_hud(_coop_hud_checkpoint, active);
 	scripted_hud_messages_clear();
 	if (active && hud_globals->checkpoint_sound.index != NONE)
 	{
@@ -990,6 +997,270 @@ static void hud_draw_players(
 	return;
 }
 
+/* port: in multiplayer and network co-op, players' names above their heads
+(display.player_names: "all", "allies", "enemies" or "none"), a speaker
+beside the name of one talking in voice chat. An ally's goes
+above the triangle the game draws over teammates; an enemy's only within the
+motion sensor's reach, while the view sees them and they are not
+camouflaged, so that it never gives away where they hide. Whose names show
+follows the gametype's motion tracker: none if it shows no players, only
+allies' if it shows only friends (game_engine_draw_object_in_motion_sensor). */
+
+/* the platform layer's (port/linux/src/port_config.c) */
+const char *config_string(const char *name);
+double config_real(const char *name);
+int config_boolean(const char *name);
+unsigned long config_changes(void);
+/* port/linux/game/network_voice.c's: a player talking in voice chat (its
+machine), and its speaker drawn */
+boolean network_voice_machine_speaking(long machine_index);
+void network_voice_draw_icon(rectangle2d const *bounds, boolean muted, real alpha);
+
+enum
+{
+	_player_names_none,
+	_player_names_all,
+	_player_names_allies,
+	_player_names_enemies,
+};
+
+static short hud_player_names_setting(
+	void)
+{
+	static short setting = NONE;
+	static unsigned long read_at = (unsigned long)-1;
+
+	/* (read again when Settings changes it) */
+	if (read_at != config_changes())
+	{
+		const char *value = config_string("display.player_names");
+
+		read_at = config_changes();
+		setting = _player_names_all;
+		if (value)
+		{
+			if (!csstrcmp(value, "none"))
+				setting = _player_names_none;
+			else if (!csstrcmp(value, "allies") || !csstrcmp(value, "allys"))
+				setting = _player_names_allies;
+			else if (!csstrcmp(value, "enemies"))
+				setting = _player_names_enemies;
+		}
+	}
+
+	return setting;
+}
+
+/* display.player_name_scale: how large the names are drawn, 0.25 to 4 times
+three quarters of the HUD's text */
+static real hud_player_name_scale(
+	void)
+{
+	static real scale = 0.0f;
+	static unsigned long read_at = (unsigned long)-1;
+
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		scale = 0.75f * PIN((real)config_real("display.player_name_scale"), 0.25f, 4.0f);
+	}
+
+	return scale;
+}
+
+/* whether the view sees the unit's head: nothing between them but the unit,
+or what it rides in */
+static boolean hud_player_name_in_sight(
+	long unit_index,
+	real_point3d const *head_position)
+{
+	long player_index = local_player_get_player_index(render.local_player_index);
+	long ignore_index = player_index == NONE ? NONE : player_get(player_index)->unit_index;
+	struct collision_result result;
+	real_vector3d vector;
+	boolean in_sight = TRUE;
+
+	if (global_current_collision_user_depth >= MAXIMUM_COLLISION_USER_STACK_DEPTH)
+		return FALSE;
+	global_current_collision_users[global_current_collision_user_depth++] = _collision_user_ui;
+	vector.i = head_position->x - render.camera.position.x;
+	vector.j = head_position->y - render.camera.position.y;
+	vector.k = head_position->z - render.camera.position.z;
+	if (collision_test_vector(_collision_test_for_line_of_sight_flags, &render.camera.position, &vector,
+		ignore_index, &result))
+	{
+		long parent_index = unit_get(unit_index)->object.parent_object_index;
+
+		/* (an object: 3) */
+		in_sight = result.type == 3 &&
+			(result.object_index == unit_index || (parent_index != NONE && result.object_index == parent_index));
+	}
+	--global_current_collision_user_depth;
+
+	return in_sight;
+}
+
+/* how far away enemies' names are shown: the motion sensor's reach */
+static real hud_player_name_enemy_range(
+	void)
+{
+	return hud_globals ? hud_globals->defaults.motion_sensor_range : 0.0f;
+}
+
+/* port: a player's name's colour above their head, an ally's (the HUD's
+text) or an enemy's (red), whole (game_engine.c's list of who talks in
+voice chat colours its names the same) */
+void hud_player_name_color(
+	boolean ally,
+	real_argb_color *color)
+{
+	if (ally)
+	{
+		hud_get_text_color(color);
+		color->alpha = 1.0f;
+	}
+	else
+	{
+		color->alpha = 1.0f;
+		color->red = 1.0f;
+		color->green = 0.3f;
+		color->blue = 0.25f;
+	}
+}
+
+static void hud_draw_player_name(
+	long player_index,
+	boolean ally,
+	boolean indicator,
+	real enemy_range)
+{
+	struct player_datum const *player = player_get(player_index);
+	long font_index = hud_get_font_index();
+	real_point3d head_position;
+	real_point3d view_position;
+	real_point2d screen_position;
+	wchar_t name[NUMBEROF(player->name) + 1];
+	real_argb_color color;
+	rectangle2d bounds;
+	struct font_header *font;
+	short x, y, index;
+	real depth_factor;
+	real distance;
+
+	if (font_index == NONE)
+		return;
+	unit_get_head_position(player->unit_index, &head_position);
+	distance = distance3d(&render.camera.position, &head_position);
+	if (!ally && distance >= enemy_range)
+		return;
+	if (!ally &&
+		(unit_get(player->unit_index)->unit.active_camouflage > 0.5f ||
+		!hud_player_name_in_sight(player->unit_index, &head_position)))
+	{
+		return;
+	}
+	/* (where the game draws a teammate's triangle) */
+	head_position.z += 0.30000001f;
+	matrix4x3_transform_point(&render.frustum.world_to_view, &head_position, &view_position);
+	if (!render_camera_view_to_screen(&render.camera, &render.frustum, &view_position, &screen_position))
+		return;
+	x = (short)fast_ftol(screen_position.x) - render.camera.viewport_bounds.x0;
+	y = (short)fast_ftol(screen_position.y) - render.camera.viewport_bounds.y0;
+	if (indicator)
+	{
+		struct bitmap_data *bitmap = bitmap_group_get_bitmap_from_sequence(
+			interface_get_tag_index(_interface_bitmap_multiplayer_hud), 0, 0);
+
+		if (bitmap)
+			y -= bitmap->registration_point.y;
+	}
+	y -= 2;
+	font = font_definition_get(font_index);
+	bounds.x0 = x - 160;
+	bounds.x1 = x + 160;
+	bounds.y1 = y;
+	bounds.y0 = y - (font->ascending_height + font->descending_height);
+	for (index = 0; index < (short)NUMBEROF(player->name); index++)
+		name[index] = player->name[index];
+	name[NUMBEROF(player->name)] = 0;
+	hud_player_name_color(ally, &color);
+	if (ally)
+	{
+		/* (whole up to 15 world units away, then fading to 0.4 at 75) */
+		depth_factor = 1.0f - (-view_position.z - 15.0f) / 60.0f;
+		color.alpha = PIN(depth_factor, 0.4f, 1.0f);
+	}
+	else
+	{
+		/* (whole up to four fifths of the range, then fading out) */
+		color.alpha = PIN((enemy_range - distance) / (0.2f * enemy_range), 0.0f, 1.0f);
+	}
+	/* (centred: 2; scaled about its bottom's middle, over the head) */
+	draw_string_set_draw_mode(font_index, NONE, 2, 0, &color);
+	rasterizer_text_set_scale(hud_player_name_scale(), (real)x, (real)y);
+	rasterizer_draw_unicode_string(&bounds, NULL, NULL, 0, name);
+	rasterizer_text_set_scale(1.0f, 0.0f, 0.0f);
+	/* (talking in voice chat: the speaker just left of the name, centred on
+	its capitals, where they are drawn, scaled; fading with it) */
+	if (network_voice_machine_speaking(player->network_player_data.machine_index))
+	{
+		real scale = hud_player_name_scale();
+		rectangle2d text;
+		rectangle2d cursor;
+		rectangle2d icon;
+		short size = (short)((font->ascending_height + font->descending_height) * scale);
+		short middle;
+
+		draw_unicode_string_compute_bounds(&bounds, name, &text, &cursor);
+		middle = (short)(y + (draw_unicode_string_capital_middle(&bounds, name) - y) * scale);
+		icon.x1 = (short)(x + (text.x0 - x) * scale - 3.0f * scale);
+		icon.x0 = (short)(icon.x1 - size);
+		icon.y0 = (short)(middle - size / 2);
+		icon.y1 = (short)(icon.y0 + size);
+		network_voice_draw_icon(&icon, FALSE, color.alpha);
+	}
+
+	return;
+}
+
+static void hud_draw_player_names(
+	void)
+{
+	short setting = hud_player_names_setting();
+	long player_index = local_player_get_player_index(render.local_player_index);
+	struct data_iterator iterator;
+	struct player_datum *player;
+	boolean indicators;
+	long team_index;
+	real enemy_range;
+
+	if (setting == _player_names_none || player_index == NONE)
+		return;
+	team_index = player_get(player_index)->team_index;
+	/* the campaign always draws teammate triangles (hud_draw_players) */
+	indicators = game_engine_display_team_indicators() || !game_engine_running();
+	enemy_range = hud_player_name_enemy_range();
+	/* (the players the motion tracker would show this local player) */
+	game_engine_motion_sensor_viewer(render.local_player_index);
+	data_iterator_new(&iterator, player_data);
+	while ((player = data_iterator_next(&iterator)) != NULL)
+	{
+		/* (allies as the game's triangles tell them: the same team) */
+		boolean ally = player->team_index == team_index;
+
+		if (iterator.datum_index == player_index || player->unit_index == NONE)
+			continue;
+		if ((ally && setting == _player_names_enemies) || (!ally && setting == _player_names_allies) ||
+			!game_engine_draw_object_in_motion_sensor(player->unit_index))
+		{
+			continue;
+		}
+		hud_draw_player_name(iterator.datum_index, ally, ally && indicators, enemy_range);
+	}
+
+	return;
+}
+
 static void temporary_hud_draw(
 	void)
 {
@@ -1015,10 +1286,14 @@ static void temporary_hud_draw(
 	if (equipment_index != NONE)
 	{
 		struct object_datum *equipment = object_get(equipment_index);
-		sprintf(
+		/* port: snprintf, here and below, and the names' paths stripped as
+		the grenade's is (a map's tag's name may be any length, and need
+		not have a path) */
+		snprintf(
 			temporary,
+			sizeof(temporary),
 			"%s (press WHITE to use)|n",
-			strrchr(tag_get_name(equipment->definition_index), '\\') + 1);
+			tag_name_strip_path(tag_get_name(equipment->definition_index)));
 	}
 	else
 	{
@@ -1031,8 +1306,9 @@ static void temporary_hud_draw(
 			&scenario_get_game_globals()->grenades,
 			unit->unit.current_grenade_index,
 			struct game_globals_grenade);
-		sprintf(
+		snprintf(
 			temporary + csstrlen(temporary),
+			sizeof(temporary) - csstrlen(temporary),
 			"%d %s|n",
 			unit->unit.grenade_counts[unit->unit.current_grenade_index],
 			tag_name_strip_path(tag_get_name(grenade->projectile.index)));
@@ -1051,10 +1327,11 @@ static void temporary_hud_draw(
 					&weapon_definition->weapon.magazines,
 					0,
 					struct weapon_magazine_definition);
-			sprintf(
+			snprintf(
 				temporary + csstrlen(temporary),
+				sizeof(temporary) - csstrlen(temporary),
 				"%s|ntotal %d/%d|nloaded %d/%d|nheat %3.2f|nage %3.2f|n",
-				strrchr(tag_get_name(weapon->definition_index), '\\') + 1,
+				tag_name_strip_path(tag_get_name(weapon->definition_index)),
 				weapon->weapon.magazines[0].rounds_total,
 				magazine_definition->rounds_total_maximum,
 				weapon->weapon.magazines[0].rounds_loaded,
@@ -1064,14 +1341,16 @@ static void temporary_hud_draw(
 		}
 		else
 		{
-			sprintf(
+			snprintf(
 				temporary + csstrlen(temporary),
+				sizeof(temporary) - csstrlen(temporary),
 				"%s|n",
-				strrchr(tag_get_name(weapon->definition_index), '\\') + 1);
+				tag_name_strip_path(tag_get_name(weapon->definition_index)));
 		}
 
-		sprintf(
+		snprintf(
 			temporary + csstrlen(temporary),
+			sizeof(temporary) - csstrlen(temporary),
 			"%s%s",
 			(real)player->powerup_durations[_player_powerup_active_camouflage] > 0.0f
 				? "ACTIVE-CAMOUFLAGE "
@@ -1120,6 +1399,65 @@ static void temporary_hud_draw(
 	return;
 }
 
+/* port: the match clock (display.match_timer, off by default: Custom
+Edition's HUD has none), counting up from the game's
+first tick, which the items' respawn periods count from as well
+(game_engine_update_item_spawn's game_time_get() % respawn_period): an item
+is back on the map at every multiple of its period on the clock. */
+static boolean hud_match_timer_setting(
+	void)
+{
+	static boolean setting = FALSE;
+	static unsigned long read_at = (unsigned long)-1;
+
+	/* (read again when Settings changes it) */
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		setting = config_boolean("display.match_timer") != 0;
+	}
+
+	return setting;
+}
+
+static void hud_draw_match_timer(
+	void)
+{
+	long font_index = hud_get_font_index();
+	wchar_t time_string[32];
+	real_argb_color color;
+	rectangle2d bounds;
+	struct font_header *font;
+
+	if (!hud_match_timer_setting() || font_index == NONE)
+		return;
+	ticks_to_unicode_time_string(game_time_get(), NUMBEROF(time_string), time_string);
+	/* (a time under a minute is drawn with no minutes digit, which a clock
+	counting up from zero starts at: " :07") */
+	if (time_string[0] == L' ')
+		time_string[0] = L'0';
+	font = font_definition_get(font_index);
+	/* (the HUD's window, which a wide screen widens and a split screen
+	divides, in the view's coordinates; into the corner, where the first
+	person's weapon is not drawn) */
+	bounds.x1 = render.camera.window_bounds.x1 - render.camera.viewport_bounds.x0 - 5;
+	bounds.x0 = bounds.x1 - 320;
+	bounds.y1 = render.camera.window_bounds.y1 - render.camera.viewport_bounds.y0 - 14;
+	bounds.y0 = bounds.y1 - (font->ascending_height + font->descending_height);
+	hud_get_text_color(&color);
+	/* (lifted toward white, and whole: the HUD's own text colour is lost
+	against a map as bright as it) */
+	color.red += (1.0f - color.red) * 0.65f;
+	color.green += (1.0f - color.green) * 0.65f;
+	color.blue += (1.0f - color.blue) * 0.65f;
+	color.alpha = 1.0f;
+	/* (right justified: 1) */
+	draw_string_set_draw_mode(font_index, NONE, 1, 0, &color);
+	rasterizer_draw_unicode_string(&bounds, NULL, NULL, 0, time_string);
+
+	return;
+}
+
 void hud_draw_screen(
 	void)
 {
@@ -1135,6 +1473,23 @@ void hud_draw_screen(
 			!cinematic_in_progress())
 		{
 			hud_draw_players();
+		}
+
+		/* port: players' names above their heads, in multiplayer and network co-op */
+		if ((game_engine_running() || network_coop_active()) && !cinematic_in_progress())
+			hud_draw_player_names();
+		/* port: who a dead network co-op player is watching */
+		if (player->unit_index == NONE && coop_spectating() && !cinematic_in_progress())
+			coop_spectate_draw(render.local_player_index);
+		/* port: the network co-op vote to skip a cinematic */
+		if (cinematic_in_progress())
+			coop_skip_vote_draw(render.local_player_index);
+
+		/* port: the match clock, in multiplayer */
+		if (game_engine_running() && !cinematic_in_progress() &&
+			hud_scripted_globals->show_hud)
+		{
+			hud_draw_match_timer();
 		}
 
 		if (!game_time_get_paused() &&
@@ -1168,6 +1523,8 @@ void hud_draw_screen(
 		}
 
 		hud_messaging_update(render.local_player_index);
+		/* port: network games' text chat, the lines this view's player hears */
+		network_chat_draw(render.local_player_index);
 	}
 
 	rasterizer_hud_end();

@@ -16,7 +16,10 @@ also need the tick after the pair it spans: two ticks behind.)
 Rotations are blended as quaternions (normalised lerp, taking the shorter
 way round), positions and scales linearly. Anything that moves further than
 a tick of motion plausibly allows (teleports, respawns, camera cuts) snaps
-instead of sweeping across the world.
+instead of sweeping across the world, and so does a pose whose nodes moved
+too far for one tick: two snapshots of different poses (a model swapped,
+another weapon's skeleton, a pose left from seconds before) blended node by
+node stretch vertices across the screen.
 
 Particles, contrails and other effects already move every frame
 (game_frame), so they need nothing here.
@@ -24,12 +27,15 @@ Particles, contrails and other effects already move every frame
 An object the distributed netcode moves to where the host has it
 (port/linux/game/network_objects.c) is drawn gliding there over a few ticks
 rather than jumping: its snapshots move with it, and the difference is drawn
-on top of it, fading each tick.
+on top of it, whole until the next tick and fading from then on (no more than
+a few world units of it: further is a jump). A local player's view glides so
+with their unit, and with what it rides.
 */
 
 #include "cseries.h"
 #include "math/real_math.h"
 #include "objects/objects.h"
+#include "camera/camera_scripting.h"
 #include "camera/director.h"
 #include "camera/observer.h"
 #include "cutscene/cinematics.h"
@@ -39,6 +45,7 @@ on top of it, fading each tick.
 
 /* port/linux/src/port_config.c */
 int config_boolean(const char *name);
+unsigned long config_changes(void);
 
 #include <math.h>
 #include <stdlib.h>
@@ -53,10 +60,25 @@ int config_boolean(const char *name);
 /* world units (10 feet each) a node may move in one tick before it snaps:
 well beyond any vehicle, short of any teleport */
 #define OBJECT_SNAP_DISTANCE 10.0f
+/* ... a node may move in the object's root node's frame in one tick before
+the pose is taken for a new one, not blended to: further than any limb or
+part of a model moves in 33 ms (37 m/s), short of the game changing a pose
+at once (an actor waking from dormancy, a model swapped), which blended
+sweeps the vertices through poses it never had. (In the root's frame, so
+that the whole object turning moves nothing: measured in the world, a fast
+turn swung the head and weapon far enough to snap, and characters moved
+like robots.) */
+#define NODE_SNAP_DISTANCE 0.4f
+/* ... a first-person node may move relative to the camera */
+#define FIRST_PERSON_SNAP_DISTANCE 0.25f
 /* a correction's difference left drawn after each tick (of 1) */
 #define CORRECTION_DECAY 0.6f
 /* ... and small enough to be none */
 #define CORRECTION_NEGLIGIBLE 0.001f
+/* ... or so large that it is no glide but a jump (corrections come one on
+another: their sum is drawn): past the largest a client's own unit or
+vehicle is corrected by (3 and 4 world units), short of a snap */
+#define CORRECTION_MAXIMUM 8.0f
 /* a camera cut: a jump or turn no player or scripted camera makes in 33 ms */
 #define CAMERA_CUT_DISTANCE 3.0f
 #define CAMERA_CUT_COSINE 0.5f
@@ -68,6 +90,14 @@ struct interpolation_quaternion
 	real i, j, k, w;
 };
 
+/* a node's rotation: whether its basis is one a quaternion can hold, and
+that quaternion */
+struct interpolation_rotation
+{
+	struct interpolation_quaternion quaternion;
+	boolean is_rotation;
+};
+
 struct interpolated_object
 {
 	long object_index; /* NONE when unused */
@@ -77,10 +107,15 @@ struct interpolated_object
 	boolean has_previous;
 	byte latest; /* which snapshot is the latest */
 	long blended_frame;
-	/* where it is drawn from where it is: a correction fading */
+	/* where it is drawn from where it is: a correction fading, and those
+	since the last tick, drawn whole until the next begins to fade them */
 	real_vector3d correction;
+	real_vector3d correction_pending;
 	/* [0] and [1]: the two snapshots, [2]: the blend drawn this frame */
 	real_matrix4x3 *nodes;
+	/* ... the two snapshots' rotations, found when first blended */
+	struct interpolation_rotation *rotations;
+	boolean rotations_valid[2];
 };
 
 struct interpolated_camera
@@ -91,6 +126,9 @@ struct interpolated_camera
 	struct observer_result previous;
 	struct observer_result latest;
 	struct observer_result blended;
+	/* its player's unit (or what it rides) corrected: as an object's */
+	real_vector3d correction;
+	real_vector3d correction_pending;
 };
 
 struct interpolated_first_person
@@ -230,18 +268,29 @@ static void basis_from_quaternion(struct interpolation_quaternion const *q, real
 	matrix->up.k = 1.0f - 2.0f * (ii + jj);
 }
 
-/* a matrix a fraction t of the way from a to b */
-static void matrix_blend(real_matrix4x3 const *a, real_matrix4x3 const *b, real t, real_matrix4x3 *result)
+static void rotation_from_matrix(real_matrix4x3 const *matrix, struct interpolation_rotation *rotation)
+{
+	rotation->is_rotation = basis_is_rotation(matrix);
+	if (rotation->is_rotation)
+		quaternion_from_basis(matrix, &rotation->quaternion);
+}
+
+/* a matrix a fraction t of the way from a to b, their rotations found */
+static void matrix_blend_rotations(
+	real_matrix4x3 const *a,
+	real_matrix4x3 const *b,
+	struct interpolation_rotation const *rotation_a,
+	struct interpolation_rotation const *rotation_b,
+	real t,
+	real_matrix4x3 *result)
 {
 	result->scale = lerp(a->scale, b->scale, t);
 	point_lerp(&a->position, &b->position, t, &result->position);
-	if (basis_is_rotation(a) && basis_is_rotation(b))
+	if (rotation_a->is_rotation && rotation_b->is_rotation)
 	{
-		struct interpolation_quaternion qa, qb, q;
+		struct interpolation_quaternion qa = rotation_a->quaternion, qb = rotation_b->quaternion, q;
 		real length;
 
-		quaternion_from_basis(a, &qa);
-		quaternion_from_basis(b, &qb);
 		/* q and -q are the same rotation: take the shorter way round */
 		if (qa.i * qb.i + qa.j * qb.j + qa.k * qb.k + qa.w * qb.w < 0.0f)
 		{
@@ -277,6 +326,55 @@ static void matrix_blend(real_matrix4x3 const *a, real_matrix4x3 const *b, real 
 	result->up.k = lerp(a->up.k, b->up.k, t);
 }
 
+/* the vector's parts' sum, large enough to be a correction (so written that
+one not a number is none) */
+static boolean correction_significant(real_vector3d const *correction)
+{
+	return fabs(correction->i) + fabs(correction->j) + fabs(correction->k) >= CORRECTION_NEGLIGIBLE;
+}
+
+/* a correction a tick on: what was drawn fades, what came since is drawn
+whole from now on, fading from the next */
+static void correction_advance(real_vector3d *correction, real_vector3d *pending)
+{
+	correction->i = correction->i * CORRECTION_DECAY + pending->i;
+	correction->j = correction->j * CORRECTION_DECAY + pending->j;
+	correction->k = correction->k * CORRECTION_DECAY + pending->k;
+	*pending = *global_zero_vector3d;
+	if (!correction_significant(correction))
+		*correction = *global_zero_vector3d;
+}
+
+/* a correction as drawn this frame: fading through the tick as it does tick
+to tick, and those since the tick whole */
+static void correction_drawn(real_vector3d const *correction, real_vector3d const *pending, real_vector3d *drawn)
+{
+	real fade = lerp(1.0f, CORRECTION_DECAY, interpolation_fraction);
+
+	drawn->i = correction->i * fade + pending->i;
+	drawn->j = correction->j * fade + pending->j;
+	drawn->k = correction->k * fade + pending->k;
+}
+
+/* a correction added (offset): all of it dropped when the sum is too large
+to glide (or not a number) */
+static void correction_add(real_vector3d *correction, real_vector3d *pending, real_vector3d const *offset)
+{
+	real i, j, k;
+
+	pending->i += offset->i;
+	pending->j += offset->j;
+	pending->k += offset->k;
+	i = correction->i + pending->i;
+	j = correction->j + pending->j;
+	k = correction->k + pending->k;
+	if (!(i * i + j * j + k * k <= CORRECTION_MAXIMUM * CORRECTION_MAXIMUM))
+	{
+		*correction = *global_zero_vector3d;
+		*pending = *global_zero_vector3d;
+	}
+}
+
 static real distance_squared(real_point3d const *a, real_point3d const *b)
 {
 	real x = a->x - b->x, y = a->y - b->y, z = a->z - b->z;
@@ -294,6 +392,18 @@ void render_interpolation_tick(void)
 
 	if (!halo_interpolation_enabled())
 		return;
+	/* the cameras' corrections a tick on, as the objects' (below) */
+	{
+		short local_player_index;
+
+		for (local_player_index = 0; local_player_index < MAXIMUM_LOCAL_PLAYERS; local_player_index++)
+		{
+			struct interpolated_camera *camera = &interpolated_cameras[local_player_index];
+
+			if (camera->valid)
+				correction_advance(&camera->correction, &camera->correction_pending);
+		}
+	}
 	if (!interpolated_objects)
 	{
 		long index;
@@ -324,6 +434,7 @@ void render_interpolation_tick(void)
 		if (record->node_capacity < node_count)
 		{
 			real_matrix4x3 *nodes = realloc(record->nodes, 3 * node_count * sizeof(real_matrix4x3));
+			struct interpolation_rotation *rotations;
 
 			if (!nodes)
 			{
@@ -331,6 +442,13 @@ void render_interpolation_tick(void)
 				continue;
 			}
 			record->nodes = nodes;
+			rotations = realloc(record->rotations, 2 * node_count * sizeof(struct interpolation_rotation));
+			if (!rotations)
+			{
+				record->object_index = NONE;
+				continue;
+			}
+			record->rotations = rotations;
 			record->node_capacity = node_count;
 			record->object_index = NONE; /* the old snapshots moved */
 		}
@@ -340,21 +458,18 @@ void render_interpolation_tick(void)
 		if (continuing)
 		{
 			record->latest ^= 1;
-			record->correction.i *= CORRECTION_DECAY;
-			record->correction.j *= CORRECTION_DECAY;
-			record->correction.k *= CORRECTION_DECAY;
-			/* (so written that one not a number goes too) */
-			if (!(fabs(record->correction.i) + fabs(record->correction.j) + fabs(record->correction.k) >= CORRECTION_NEGLIGIBLE))
-				record->correction = *global_zero_vector3d;
+			correction_advance(&record->correction, &record->correction_pending);
 		}
 		else
 		{
 			record->correction = *global_zero_vector3d;
+			record->correction_pending = *global_zero_vector3d;
 		}
 		memcpy(
 			record->nodes + record->latest * record->node_capacity,
 			object_get_node_matrices(iterator.index),
 			node_count * sizeof(real_matrix4x3));
+		record->rotations_valid[record->latest] = FALSE;
 		record->object_index = iterator.index;
 		record->node_count = node_count;
 		record->tick = interpolation_tick;
@@ -420,27 +535,62 @@ real_matrix4x3 *render_interpolation_object_node_matrices(long object_index)
 		real_matrix4x3 const *latest = record->nodes + record->latest * record->node_capacity;
 		real_matrix4x3 *blended = record->nodes + 2 * record->node_capacity;
 		short node_index;
+		/* (so written that a position not a number snaps) */
+		boolean snap = !(distance_squared(&previous[0].position, &latest[0].position) <=
+			OBJECT_SNAP_DISTANCE * OBJECT_SNAP_DISTANCE);
 
-		if (distance_squared(&previous[0].position, &latest[0].position) >
-			OBJECT_SNAP_DISTANCE * OBJECT_SNAP_DISTANCE)
+		/* a node moved further in the root's frame than a tick allows: the
+		two snapshots are different poses, not one moving (so written that
+		a position not a number snaps) */
+		for (node_index = 1; !snap && node_index < record->node_count; node_index++)
 		{
-			memcpy(blended, latest, record->node_count * sizeof(real_matrix4x3));
-		}
-		else
-		{
-			for (node_index = 0; node_index < record->node_count; node_index++)
-				matrix_blend(&previous[node_index], &latest[node_index], interpolation_fraction, &blended[node_index]);
-		}
-		/* (a correction fading through the tick as it does tick to tick) */
-		if (record->correction.i != 0.0f || record->correction.j != 0.0f || record->correction.k != 0.0f)
-		{
-			real fade = lerp(1.0f, CORRECTION_DECAY, interpolation_fraction);
+			real_point3d previous_local, latest_local;
 
+			matrix4x3_inverse_transform_point(&previous[0], &previous[node_index].position, &previous_local);
+			matrix4x3_inverse_transform_point(&latest[0], &latest[node_index].position, &latest_local);
+			snap = !(distance_squared(&previous_local, &latest_local) <= NODE_SNAP_DISTANCE * NODE_SNAP_DISTANCE);
+		}
+		if (!snap)
+		{
+			struct interpolation_rotation *previous_rotations =
+				record->rotations + (record->latest ^ 1) * record->node_capacity;
+			struct interpolation_rotation *latest_rotations =
+				record->rotations + record->latest * record->node_capacity;
+			short snapshot;
+
+			/* (each snapshot's rotations found once, not every frame: its
+			nodes' positions may move with a correction, their rotations
+			never) */
+			for (snapshot = 0; snapshot < 2; snapshot++)
+			{
+				if (!record->rotations_valid[snapshot])
+				{
+					real_matrix4x3 const *nodes = record->nodes + snapshot * record->node_capacity;
+					struct interpolation_rotation *rotations = record->rotations + snapshot * record->node_capacity;
+
+					for (node_index = 0; node_index < record->node_count; node_index++)
+						rotation_from_matrix(&nodes[node_index], &rotations[node_index]);
+					record->rotations_valid[snapshot] = TRUE;
+				}
+			}
 			for (node_index = 0; node_index < record->node_count; node_index++)
 			{
-				blended[node_index].position.x += record->correction.i * fade;
-				blended[node_index].position.y += record->correction.j * fade;
-				blended[node_index].position.z += record->correction.k * fade;
+				matrix_blend_rotations(&previous[node_index], &latest[node_index], &previous_rotations[node_index],
+					&latest_rotations[node_index], interpolation_fraction, &blended[node_index]);
+			}
+		}
+		if (snap)
+			memcpy(blended, latest, record->node_count * sizeof(real_matrix4x3));
+		if (correction_significant(&record->correction) || correction_significant(&record->correction_pending))
+		{
+			real_vector3d drawn;
+
+			correction_drawn(&record->correction, &record->correction_pending, &drawn);
+			for (node_index = 0; node_index < record->node_count; node_index++)
+			{
+				blended[node_index].position.x += drawn.i;
+				blended[node_index].position.y += drawn.j;
+				blended[node_index].position.z += drawn.k;
 			}
 		}
 		record->blended_frame = interpolation_frame;
@@ -484,10 +634,28 @@ void render_interpolation_correct_object(long object_index, real_vector3d const 
 				nodes[node_index].position.z -= offset->k;
 			}
 		}
-		record->correction.i += offset->i;
-		record->correction.j += offset->j;
-		record->correction.k += offset->k;
+		correction_add(&record->correction, &record->correction_pending, offset);
 		record->blended_frame = NONE;
+	}
+	/* a local player's unit (by itself, or with what it rides): its
+	first-person view, which the observer poses from it, glides with it */
+	{
+		short local_player_index;
+
+		for (local_player_index = 0; local_player_index < MAXIMUM_LOCAL_PLAYERS; local_player_index++)
+		{
+			struct interpolated_camera *camera = &interpolated_cameras[local_player_index];
+
+			if (!camera->valid || player_control_get_unit_index(local_player_index) != object_index)
+				continue;
+			camera->previous.position.x -= offset->i;
+			camera->previous.position.y -= offset->j;
+			camera->previous.position.z -= offset->k;
+			camera->latest.position.x -= offset->i;
+			camera->latest.position.y -= offset->j;
+			camera->latest.position.z -= offset->k;
+			correction_add(&camera->correction, &camera->correction_pending, offset);
+		}
 	}
 	object = object_get(object_index);
 	for (child_index = object->object.first_child_object_index; child_index != NONE;
@@ -520,12 +688,16 @@ static struct observer_result const *render_interpolation_direct_camera(
 	(void)local_player_index;
 	return observer;
 #else
-	static int enabled = -1;
+	static int enabled;
+	static unsigned long read_at = (unsigned long)-1;
 	struct observer_result *direct;
 	long unit_index;
 
-	if (enabled < 0)
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
 		enabled = config_boolean("display.direct_camera");
+	}
 	if (!enabled || !observer ||
 		director_get_perspective(local_player_index) != _director_perspective_first_person ||
 		director_inhibited_facing(local_player_index) ||
@@ -555,6 +727,48 @@ struct observer_result const *render_interpolation_camera(
 		render_interpolation_blended_camera(local_player_index, observer));
 }
 
+/* between two of the observer's results: the position, the axes (up kept
+square to forward) and the field of view */
+static void observer_blend(
+	struct observer_result const *a,
+	struct observer_result const *b,
+	real t,
+	struct observer_result *result)
+{
+	real along, length;
+
+	*result = *b;
+	point_lerp(&a->position, &b->position, t, &result->position);
+	vector_nlerp(&a->forward, &b->forward, t, &result->forward);
+	vector_nlerp(&a->up, &b->up, t, &result->up);
+	along = result->up.i * result->forward.i + result->up.j * result->forward.j + result->up.k * result->forward.k;
+	result->up.i -= result->forward.i * along;
+	result->up.j -= result->forward.j * along;
+	result->up.k -= result->forward.k * along;
+	length = vector_length(&result->up);
+	if (length > 1e-6f)
+	{
+		result->up.i /= length;
+		result->up.j /= length;
+		result->up.k /= length;
+	}
+	else
+	{
+		result->up = b->up;
+	}
+	result->field_of_view = lerp(a->field_of_view, b->field_of_view, t);
+}
+
+/* a cut between two of the observer's results (so written that a position
+or direction not a number cuts) */
+static boolean observer_cut(
+	struct observer_result const *a,
+	struct observer_result const *b)
+{
+	return !(distance_squared(&a->position, &b->position) <= CAMERA_CUT_DISTANCE * CAMERA_CUT_DISTANCE) ||
+		!(a->forward.i * b->forward.i + a->forward.j * b->forward.j + a->forward.k * b->forward.k >= CAMERA_CUT_COSINE);
+}
+
 static struct observer_result const *render_interpolation_blended_camera(
 	short local_player_index,
 	struct observer_result const *observer)
@@ -567,53 +781,87 @@ static struct observer_result const *render_interpolation_blended_camera(
 		return observer;
 	}
 	camera = &interpolated_cameras[local_player_index];
+	/* A scripted camera that moves with an object (a cinematic's camera
+	point relative to a lifepod or dropship, or a unit's eyes in one) is
+	placed by the object as it stands after the last tick. Blended from its
+	own snapshots (taken at the first frame after each tick, a different
+	part of a tick each tick), it did not follow the object as drawn, which
+	is blended from the object's snapshots, or steps from tick to tick when
+	its pose snaps: it ran up to 2 m ahead of or behind the object, out
+	through the lifepod's hull in a30. It is drawn where the observer has
+	it, moved with the object from where the object is to where it is
+	drawn. (An animated camera has no such object; a scripted first-person
+	camera looks along its unit's aim, which turns once a tick, and is
+	blended from its snapshots as the player's camera is.) */
+	if (director_get_perspective(local_player_index) == _director_perspective_scripted)
+	{
+		long relative_object_index = scripted_camera_object_relative_to();
+		real_matrix4x3 const *drawn;
+
+		if (relative_object_index != NONE &&
+			!scripted_camera_object_is_first_person_camera(relative_object_index) &&
+			object_try_and_get_and_verify_type(relative_object_index, _object_mask_all) &&
+			(drawn = render_interpolation_object_node_matrices(relative_object_index)) != NULL)
+		{
+			/* (as of the last tick: object_get_node_matrices gives the drawn
+			pose while a frame is drawn) */
+			real_matrix4x3 const *nodes = (real_matrix4x3 const *)object_header_block_get(
+				relative_object_index, &object_get(relative_object_index)->object.node_matrices);
+
+			camera->blended = *observer;
+			camera->blended.position.x += drawn[0].position.x - nodes[0].position.x;
+			camera->blended.position.y += drawn[0].position.y - nodes[0].position.y;
+			camera->blended.position.z += drawn[0].position.z - nodes[0].position.z;
+			/* (the snapshots start again after) */
+			camera->valid = FALSE;
+			return &camera->blended;
+		}
+	}
 	/* the observer as it stood after each tick (the first frame drawn
 	after the tick) */
 	if (!camera->valid || camera->tick != interpolation_tick)
 	{
+		/* (its correction taken on each tick, render_interpolation_tick) */
+		if (!camera->valid)
+		{
+			camera->correction = *global_zero_vector3d;
+			camera->correction_pending = *global_zero_vector3d;
+		}
 		camera->has_previous = camera->valid;
 		camera->previous = camera->latest;
 		camera->latest = *observer;
+		/* Several ticks since the last snapshot (a long frame): the objects
+		are drawn between the last two ticks, so the camera's previous is
+		where it was a tick ago, as nearly as a steady move from the last
+		snapshot tells. (Blended across all the ticks since, the camera
+		moved further each frame than the world it is in, out through a
+		Pelican's hull for a frame.) A cut stays a cut. */
+		if (camera->has_previous && interpolation_tick - camera->tick > 1 &&
+			!observer_cut(&camera->previous, &camera->latest))
+		{
+			real ticks = (real)(interpolation_tick - camera->tick);
+			struct observer_result previous = camera->previous;
+
+			observer_blend(&previous, &camera->latest, (ticks - 1.0f) / ticks, &camera->previous);
+		}
 		camera->tick = interpolation_tick;
 		camera->valid = TRUE;
 	}
-	if (!camera->has_previous ||
-		distance_squared(&camera->previous.position, &camera->latest.position) >
-			CAMERA_CUT_DISTANCE * CAMERA_CUT_DISTANCE ||
-		camera->previous.forward.i * camera->latest.forward.i +
-			camera->previous.forward.j * camera->latest.forward.j +
-			camera->previous.forward.k * camera->latest.forward.k < CAMERA_CUT_COSINE)
+	if (!camera->has_previous || observer_cut(&camera->previous, &camera->latest))
 	{
 		return observer;
 	}
 
-	camera->blended = camera->latest;
-	point_lerp(&camera->previous.position, &camera->latest.position, t, &camera->blended.position);
-	vector_nlerp(&camera->previous.forward, &camera->latest.forward, t, &camera->blended.forward);
-	vector_nlerp(&camera->previous.up, &camera->latest.up, t, &camera->blended.up);
+	observer_blend(&camera->previous, &camera->latest, t, &camera->blended);
+	if (correction_significant(&camera->correction) || correction_significant(&camera->correction_pending))
 	{
-		/* keep up perpendicular to forward */
-		real_vector3d *forward = &camera->blended.forward;
-		real_vector3d *up = &camera->blended.up;
-		real along = up->i * forward->i + up->j * forward->j + up->k * forward->k;
-		real length;
+		real_vector3d drawn;
 
-		up->i -= forward->i * along;
-		up->j -= forward->j * along;
-		up->k -= forward->k * along;
-		length = vector_length(up);
-		if (length > 1e-6f)
-		{
-			up->i /= length;
-			up->j /= length;
-			up->k /= length;
-		}
-		else
-		{
-			*up = camera->latest.up;
-		}
+		correction_drawn(&camera->correction, &camera->correction_pending, &drawn);
+		camera->blended.position.x += drawn.i;
+		camera->blended.position.y += drawn.j;
+		camera->blended.position.z += drawn.k;
 	}
-	camera->blended.field_of_view = lerp(camera->previous.field_of_view, camera->latest.field_of_view, t);
 	return &camera->blended;
 }
 
@@ -631,6 +879,8 @@ void render_interpolation_first_person(
 	struct interpolated_first_person *first_person;
 	real_matrix4x3 camera_matrix;
 	real_matrix4x3 inverse_camera;
+	struct interpolation_rotation previous_rotations[MAXIMUM_INTERPOLATED_NODES];
+	struct interpolation_rotation latest_rotations[MAXIMUM_INTERPOLATED_NODES];
 	short node_index;
 
 	if (!interpolation_rendering ||
@@ -644,8 +894,11 @@ void render_interpolation_first_person(
 	matrix4x3_inverse(&camera_matrix, &inverse_camera);
 	if (first_person->tick != interpolation_tick)
 	{
-		/* the pose drawn last, at the end of the previous tick */
-		first_person->has_previous = first_person->node_count == node_count;
+		/* the pose drawn last, if that was at the end of the tick just
+		before: not one left from before the view was last away from first
+		person (zoomed, in a vehicle, dead, in a cinematic), seconds old */
+		first_person->has_previous = first_person->tick == interpolation_tick - 1 &&
+			first_person->node_count == node_count;
 		memcpy(first_person->previous, first_person->latest, sizeof(first_person->previous));
 		first_person->tick = interpolation_tick;
 	}
@@ -654,13 +907,31 @@ void render_interpolation_first_person(
 	first_person->node_count = node_count;
 	if (!first_person->has_previous)
 		return;
+	/* a node that jumped further in the camera's frame than a tick allows:
+	the last pose was another weapon's skeleton (of as many nodes), not this
+	one moving (so written that a position not a number snaps) */
+	for (node_index = 0; node_index < node_count; node_index++)
+	{
+		real_matrix4x3 const *previous = &first_person->previous[node_index];
+		real_matrix4x3 const *latest = &first_person->latest[node_index];
+
+		if (!(distance_squared(&previous->position, &latest->position) <=
+			FIRST_PERSON_SNAP_DISTANCE * FIRST_PERSON_SNAP_DISTANCE))
+		{
+			return;
+		}
+		rotation_from_matrix(previous, &previous_rotations[node_index]);
+		rotation_from_matrix(latest, &latest_rotations[node_index]);
+	}
 	for (node_index = 0; node_index < node_count; node_index++)
 	{
 		real_matrix4x3 blended;
 
-		matrix_blend(
+		matrix_blend_rotations(
 			&first_person->previous[node_index],
 			&first_person->latest[node_index],
+			&previous_rotations[node_index],
+			&latest_rotations[node_index],
 			interpolation_fraction,
 			&blended);
 		matrix4x3_multiply(&camera_matrix, &blended, &node_matrices[node_index]);

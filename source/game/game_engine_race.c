@@ -416,7 +416,8 @@ void race_flags_make_unique(
 {
 	struct scenario *scenario = global_scenario_get();
 	unsigned long used_flags = 0;
-	short itr;
+	/* port: a long counter, for a map's long count */
+	long itr;
 
 	for (itr = 0; itr < scenario->netgame_flags.count; itr++)
 	{
@@ -464,7 +465,20 @@ static void race_engine_dispose_from_old_map(
 static void race_engine_player_added(
 	long player_index)
 {
+	long slot = DATUM_INDEX_TO_ABSOLUTE_INDEX(player_index);
+
 	player_get(player_index)->multiplayer_special = 0;
+	/* port: not the laps of a player who quit from the slot (as slayer's):
+	a normal race starts everyone at the same flag, the others at the first
+	touched */
+	race_globals.lap_bit_vector[slot] = 0;
+	if (game_engine_get_variant()->game_engine_variant.race.race_type != _race_type_normal)
+		race_globals.first_flag[slot] = NONE;
+	if (!game_engine_has_teams())
+		race_globals.team_laps[slot] = 0;
+	race_events.touches[slot] = 0;
+	race_events.laps[slot] = 0;
+	race_events.best_laps[slot] = 0;
 
 	return;
 }
@@ -910,7 +924,7 @@ static boolean race_engine_display_score(
 			}
 			else
 				string = L"";
-			usnprintf(buffer, buffer_size, string, other_player->name);
+			usnprintf(buffer, buffer_size, ustring_format_checked(string, "s"), other_player->name);
 		}
 		break;
 
@@ -925,7 +939,7 @@ static boolean race_engine_display_score(
 			}
 			else
 				string = L"";
-			usnprintf(buffer, buffer_size, string, other_player->name);
+			usnprintf(buffer, buffer_size, ustring_format_checked(string, "s"), other_player->name);
 		}
 		break;
 
@@ -947,7 +961,7 @@ static boolean race_engine_display_score(
 			usnprintf(
 				buffer,
 				buffer_size,
-				string,
+				ustring_format_checked(string, "df"),
 				other_player->statistics.multiplayer_statistics.race_statistics.laps + 1,
 				lap_time);
 		}
@@ -966,7 +980,7 @@ static boolean race_engine_display_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			string,
+			ustring_format_checked(string, "sd"),
 			other_player->name,
 			other_player->statistics.multiplayer_statistics.race_statistics.laps + 1);
 		break;
@@ -984,7 +998,7 @@ static boolean race_engine_display_score(
 		usnprintf(
 			buffer,
 			buffer_size,
-			string,
+			ustring_format_checked(string, "sd"),
 			other_player->name,
 			other_player->statistics.multiplayer_statistics.race_statistics.laps);
 		break;
@@ -1004,7 +1018,7 @@ static boolean race_engine_display_score(
 			}
 			else
 				string = L"";
-			usnprintf(buffer, buffer_size, string, best_lap_time);
+			usnprintf(buffer, buffer_size, ustring_format_checked(string, "f"), best_lap_time);
 		}
 		break;
 
@@ -1025,7 +1039,7 @@ static boolean race_engine_display_score(
 				usnprintf(
 					buffer,
 					buffer_size,
-					string,
+					ustring_format_checked(string, "s"),
 					get_place_name(game_engine_get_place(player_index, _get_score_team)));
 			}
 			else
@@ -1042,7 +1056,7 @@ static boolean race_engine_display_score(
 				usnprintf(
 					buffer,
 					buffer_size,
-					string,
+					ustring_format_checked(string, "sd"),
 					get_place_name(game_engine_get_place(player_index, _get_score_team)),
 					other_player->statistics.multiplayer_statistics.race_statistics.laps);
 			}
@@ -1062,7 +1076,7 @@ static boolean race_engine_display_score(
 			usnprintf(
 				buffer,
 				buffer_size,
-				string,
+				ustring_format_checked(string, "s"),
 				get_place_name(game_engine_get_place(player_index, _get_score_team)));
 		}
 		else
@@ -1079,7 +1093,7 @@ static boolean race_engine_display_score(
 			usnprintf(
 				buffer,
 				buffer_size,
-				string,
+				ustring_format_checked(string, "sdd"),
 				get_place_name(game_engine_get_place(player_index, _get_score_team)),
 				other_player->statistics.multiplayer_statistics.race_statistics.laps + 1,
 				game_engine_get_variant()->universal_variant.score_to_win);
@@ -1191,7 +1205,8 @@ static wchar_t *race_get_score_header_string(
 	else
 		header_string = L"";
 
-	ustrcpy(string, header_string);
+	/* port: bounded (a map's text, into its callers' score_string[256]) */
+	ustrncpy_terminated(string, header_string, 256);
 
 	return string;
 }
@@ -1578,6 +1593,12 @@ struct race_network_state
 	byte touches[MULTIPLAYER_MAXIMUM_PLAYERS];
 	byte laps[MULTIPLAYER_MAXIMUM_PLAYERS];
 	byte best_laps[MULTIPLAYER_MAXIMUM_PLAYERS];
+	/* each player's race statistics (which their laps' messages show: the
+	players' statistics come less often and may be lost), by absolute
+	index */
+	short last_lap_times[MULTIPLAYER_MAXIMUM_PLAYERS];
+	short best_lap_times[MULTIPLAYER_MAXIMUM_PLAYERS];
+	short laps_completed[MULTIPLAYER_MAXIMUM_PLAYERS];
 };
 
 typedef char verify_race_network_state_size[
@@ -1588,6 +1609,8 @@ long game_engine_race_write_network_state(
 	long size)
 {
 	struct race_network_state state;
+	struct data_iterator iterator;
+	struct player_datum *player;
 
 	if (size < (long)sizeof(state))
 		return 0;
@@ -1596,11 +1619,23 @@ long game_engine_race_write_network_state(
 	csmemcpy(state.touches, race_events.touches, sizeof(state.touches));
 	csmemcpy(state.laps, race_events.laps, sizeof(state.laps));
 	csmemcpy(state.best_laps, race_events.best_laps, sizeof(state.best_laps));
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)))
+	{
+		long absolute_index = DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index);
+		struct race_statistics *statistics = &player->statistics.multiplayer_statistics.race_statistics;
+
+		if (absolute_index >= MULTIPLAYER_MAXIMUM_PLAYERS)
+			continue;
+		state.last_lap_times[absolute_index] = statistics->last_lap_time;
+		state.best_lap_times[absolute_index] = statistics->best_lap_time;
+		state.laps_completed[absolute_index] = statistics->laps;
+	}
 	csmemcpy(buffer, &state, sizeof(state));
 	return sizeof(state);
 }
 
-void game_engine_race_read_network_state(
+boolean game_engine_race_read_network_state(
 	byte const *buffer,
 	long size,
 	boolean first)
@@ -1608,26 +1643,34 @@ void game_engine_race_read_network_state(
 	struct race_network_state state;
 	boolean vehicles_have_been_added = race_globals.vehicles_have_been_added;
 	unsigned long lap_completed_value = race_globals.lap_completed_value;
+	struct data_iterator iterator;
+	struct player_datum *player;
 
 	if (size != (long)sizeof(state))
-		return;
+		return FALSE;
 	csmemcpy(&state, buffer, sizeof(state));
 	race_globals = state.globals;
 	race_globals.vehicles_have_been_added = vehicles_have_been_added;
 	race_globals.lap_completed_value = lap_completed_value;
-	/* the host's events since the last state, shown as the host showed them
-	(race_touch_flag, race_complete_lap) */
-	if (!first)
+	/* the players' race statistics, and the host's events since the last
+	state, shown as the host showed them (race_touch_flag,
+	race_complete_lap: a lap's messages with the lap's times and the laps
+	before it) */
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)))
 	{
-		struct data_iterator iterator;
+		long absolute_index = DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index);
+		struct race_statistics *statistics = &player->statistics.multiplayer_statistics.race_statistics;
+		short laps;
 
-		data_iterator_new(&iterator, player_data);
-		while (data_iterator_next(&iterator))
+		if (absolute_index >= MULTIPLAYER_MAXIMUM_PLAYERS)
+			continue;
+		laps = state.laps_completed[absolute_index];
+		statistics->last_lap_time = state.last_lap_times[absolute_index];
+		statistics->best_lap_time = state.best_lap_times[absolute_index];
+		statistics->laps = laps > 0 ? laps - 1 : 0;
+		if (!first)
 		{
-			long absolute_index = DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index);
-
-			if (absolute_index >= MULTIPLAYER_MAXIMUM_PLAYERS)
-				continue;
 			if (state.touches[absolute_index] != race_events.touches[absolute_index])
 				game_engine_play_multiplayer_sound(_multiplayer_sound_countdown_timer);
 			if (state.laps[absolute_index] != race_events.laps[absolute_index])
@@ -1635,8 +1678,10 @@ void game_engine_race_read_network_state(
 			if (state.best_laps[absolute_index] != race_events.best_laps[absolute_index])
 				game_show_score_extended(iterator.datum_index, _race_message_new_best_lap_time, iterator.datum_index);
 		}
+		statistics->laps = laps;
 	}
 	csmemcpy(race_events.touches, state.touches, sizeof(race_events.touches));
 	csmemcpy(race_events.laps, state.laps, sizeof(race_events.laps));
 	csmemcpy(race_events.best_laps, state.best_laps, sizeof(race_events.best_laps));
+	return TRUE;
 }

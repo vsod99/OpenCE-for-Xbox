@@ -241,11 +241,14 @@ boolean network_game_distributed_client(void);
 
 /* port: the host's ball resets a client of the distributed netcode shows
 (each machine counts them, a client as it last had them from the host):
-all, and those of balls that had been touched */
+all, and those of balls that had been touched; and the balls passed to
+a killer (juggernaut), the last to whom (absolute index) */
 static struct
 {
 	byte resets;
 	byte touched_resets;
+	byte transfers;
+	byte transfer_player;
 } oddball_events;
 
 /* ---------- public code */
@@ -321,7 +324,12 @@ static void oddball_engine_prespawn_player_update(
 static void oddball_engine_player_added(
 	long player_index)
 {
-	player_get(player_index);
+	long slot = DATUM_INDEX_TO_ABSOLUTE_INDEX(player_index);
+
+	/* port: not the score of a player who quit from the slot (as slayer's) */
+	oddball_globals.individual_score[slot] = 0;
+	if (!game_engine_has_teams())
+		oddball_globals.team_score[slot] = 0;
 
 	return;
 }
@@ -499,10 +507,13 @@ static real_point3d find_position_for_ball(
 {
 	struct scenario *scenario = global_scenario_get();
 	long flag_index = NONE;
-	/* BUG (original): after the fatal missing-spawn assertion, January returns
-	 * the untouched value. A corrected build should report failure explicitly.
-	 */
-	real_point3d position;
+	/* port: the first player starting location (else the origin) when the map
+	has no ball spawn, as a Custom Edition map may not: the original returned
+	whatever was on the stack after its missing-spawn assertion, which a
+	release build carries on past */
+	real_point3d position = scenario->players.count > 0 ?
+		TAG_BLOCK_GET_ELEMENT(&scenario->players, 0, struct player_starting_location)->position :
+		*global_origin3d;
 
 	if (!game_engine_get_variant()->game_engine_variant.oddball.random_start)
 	{
@@ -659,7 +670,10 @@ static void update_ball_ownership(
 				{
 					struct weapon_datum *weapon = weapon_get(weapon_index);
 
-					oddball_globals.current_ball_owner[weapon->object.owner_team_index] = player_index;
+					/* port: (a client's ball has the team the host's word
+					gives it, which may be none) */
+					if (VALID_INDEX(weapon->object.owner_team_index, MAXIMUM_ODDBALLS))
+						oddball_globals.current_ball_owner[weapon->object.owner_team_index] = player_index;
 				}
 			}
 		}
@@ -727,9 +741,15 @@ static void oddball_engine_player_update(
 
 	game_engine_state_message(player_index, NONE, NONE);
 	/* (a client of the distributed netcode has the host's carriers and
-	scores, game_engine_oddball_read_network_state, and shows the rest) */
-	if (!network_game_distributed_client())
+	scores, game_engine_oddball_read_network_state, and shows the rest;
+	its own players' carrying it takes from the weapon in their hands,
+	which the host sends more often than its state, so the speed the ball
+	gives them follows a pickup or drop at once) */
+	if (!network_game_distributed_client() ||
+		player->local_player_index != NONE)
+	{
 		update_ball_ownership(player_index);
+	}
 	ball_count = player_ball_count(player_index);
 
 	player->speed_multiplier = 1.0f;
@@ -993,11 +1013,13 @@ static wchar_t *oddball_get_score_header_string(
 		string_index = _multiplayer_game_text_time;
 
 	string_list_index = tag_loaded('ustr', "ui\\multiplayer_game_text");
-	ustrcpy(
+	/* port: bounded (a map's text, into its callers' score_string[256]) */
+	ustrncpy_terminated(
 		buffer,
 		string_list_index != NONE ?
 			unicode_string_list_get_string(string_list_index, string_index) :
-			L"");
+			L"",
+		256);
 
 	return buffer;
 }
@@ -1083,12 +1105,19 @@ static void oddball_engine_player_killed_player(
 					/* January and HCEA both retain this mode re-query inside
 					 * the already transfer-only arm.
 					 */
-					game_show_score_you_ally_enemy(
-						killing_player_index,
-						oddball_ball_transfer_by_killing() ? NONE : _oddball_message_you_are_it,
-						_oddball_message_ally_is_it,
-						_oddball_message_enemy_is_it,
-						killing_player_index);
+					/* (port: a client shows the host's, whose state may come
+					before this copy of the kill: game_engine_oddball_read_network_state) */
+					if (!network_game_distributed_client())
+					{
+						game_show_score_you_ally_enemy(
+							killing_player_index,
+							oddball_ball_transfer_by_killing() ? NONE : _oddball_message_you_are_it,
+							_oddball_message_ally_is_it,
+							_oddball_message_enemy_is_it,
+							killing_player_index);
+						oddball_events.transfers++;
+						oddball_events.transfer_player = (byte)DATUM_INDEX_TO_ABSOLUTE_INDEX(killing_player_index);
+					}
 					oddball_globals.current_ball_owner[capture_index] = killing_player_index;
 				}
 			}
@@ -1189,7 +1218,7 @@ static boolean oddball_engine_display_score(
 			}
 			else
 				string = L"";
-			usnprintf(buffer, buffer_size, string, other_player->name);
+			usnprintf(buffer, buffer_size, ustring_format_checked(string, "s"), other_player->name);
 		}
 		break;
 
@@ -1232,7 +1261,7 @@ static boolean oddball_engine_display_score(
 			}
 			else
 				string = L"";
-			usnprintf(buffer, buffer_size, string, other_player->name);
+			usnprintf(buffer, buffer_size, ustring_format_checked(string, "s"), other_player->name);
 		}
 		break;
 
@@ -1257,7 +1286,7 @@ static boolean oddball_engine_display_score(
 				}
 				else
 					string = L"";
-				usnprintf(buffer, buffer_size, string, place_name, score);
+				usnprintf(buffer, buffer_size, ustring_format_checked(string, "sd"), place_name, score);
 			}
 			else if (message == _oddball_message_ally_has_the_ball_tick)
 			{
@@ -1270,7 +1299,7 @@ static boolean oddball_engine_display_score(
 				}
 				else
 					string = L"";
-				usnprintf(buffer, buffer_size, string, other_player->name, score);
+				usnprintf(buffer, buffer_size, ustring_format_checked(string, "sd"), other_player->name, score);
 			}
 			else if (message == _oddball_message_enemy_has_the_ball_tick)
 			{
@@ -1283,7 +1312,7 @@ static boolean oddball_engine_display_score(
 				}
 				else
 					string = L"";
-				usnprintf(buffer, buffer_size, string, other_player->name, score);
+				usnprintf(buffer, buffer_size, ustring_format_checked(string, "sd"), other_player->name, score);
 			}
 		}
 		break;
@@ -1345,9 +1374,11 @@ struct oddball_network_state
 	/* the balls' carriers, by absolute index (their datum identifiers are
 	each machine's own) */
 	byte current_ball_owner[MAXIMUM_ODDBALLS];
-	/* the host's resets (oddball_events) */
+	/* the host's resets and passes (oddball_events) */
 	byte resets;
 	byte touched_resets;
+	byte transfers;
+	byte transfer_player;
 };
 
 typedef char verify_oddball_network_state_size[
@@ -1447,11 +1478,13 @@ long game_engine_oddball_write_network_state(
 	csmemcpy(state.ball_spawn_timer, oddball_globals.ball_spawn_timer, sizeof(state.ball_spawn_timer));
 	state.resets = oddball_events.resets;
 	state.touched_resets = oddball_events.touched_resets;
+	state.transfers = oddball_events.transfers;
+	state.transfer_player = oddball_events.transfer_player;
 	csmemcpy(buffer, &state, sizeof(state));
 	return sizeof(state);
 }
 
-void game_engine_oddball_read_network_state(
+boolean game_engine_oddball_read_network_state(
 	byte const *buffer,
 	long size,
 	boolean first)
@@ -1460,7 +1493,7 @@ void game_engine_oddball_read_network_state(
 	short ball_index;
 
 	if (size != (long)sizeof(state))
-		return;
+		return FALSE;
 	csmemcpy(&state, buffer, sizeof(state));
 	for (ball_index = 0; ball_index < MAXIMUM_ODDBALLS; ball_index++)
 		oddball_globals.current_ball_owner[ball_index] = distributed_player_from_byte(state.current_ball_owner[ball_index]);
@@ -1479,6 +1512,21 @@ void game_engine_oddball_read_network_state(
 			for (reset = 0; reset < resets && reset < MAXIMUM_ODDBALLS; reset++)
 				oddball_show_reset(reset < touched_resets);
 		}
+		/* the ball the host passed to a killer (the last of those since) */
+		if (state.transfers != oddball_events.transfers)
+		{
+			long player_index = distributed_player_from_byte(state.transfer_player);
+
+			if (player_index != NONE)
+			{
+				game_show_score_you_ally_enemy(
+					player_index,
+					NONE,
+					_oddball_message_ally_is_it,
+					_oddball_message_enemy_is_it,
+					player_index);
+			}
+		}
 		/* a ball the host has spawned (oddball_engine_update) */
 		for (ball_index = 0; ball_index < ball_spawn_count && ball_index < MAXIMUM_ODDBALLS; ball_index++)
 		{
@@ -1491,4 +1539,6 @@ void game_engine_oddball_read_network_state(
 	csmemcpy(oddball_globals.ball_spawn_timer, state.ball_spawn_timer, sizeof(state.ball_spawn_timer));
 	oddball_events.resets = state.resets;
 	oddball_events.touched_resets = state.touched_resets;
+	oddball_events.transfers = state.transfers;
+	return TRUE;
 }

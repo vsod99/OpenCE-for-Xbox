@@ -266,7 +266,7 @@ symbols in this file:
 #include "ai/ai_script.h"
 #include "hs/hs.h"
 #include "hs/hs_library_internal.h"
-#include "hs/hs_library_internal_runtime.h"
+/* Empty reconstructed header removed; no declarations to include. */
 #include "hs/object_lists.h"
 #include "hs/hs_scenario_definitions.h"
 #include "math/real_math.h"
@@ -281,6 +281,7 @@ symbols in this file:
 #include "saved games/game_state.h"
 #include "text/draw_string.h"
 #include "cseries/errors.h"
+#include "interface/terminal.h"
 #include "main/console.h"
 #include "game/game.h"
 
@@ -311,10 +312,19 @@ enum
 	HS_THREAD_STACK_SIZE = 0x200
 };
 
+/* port: the size of the text an inspector writes (hs_evaluate_inspect) */
+enum
+{
+	HS_INSPECT_BUFFER_SIZE = 1024
+};
+
 enum
 {
 	_hs_thread_in_function_call_bit = 0,
 	_hs_thread_sleeping_bit,
+	/* port: the thread's stack overflowed (hs_stack_overflow); hs_thread_main
+	ends it */
+	_hs_thread_stack_overflow_bit,
 	_hs_global_external_bit = 15,
 };
 
@@ -494,7 +504,11 @@ static void hs_thread_delete(
 static long hs_thread_new(
 	short type,
 	long script_index);
-static void hs_stack_push(
+static boolean hs_stack_push(
+	long thread_index);
+static void hs_stack_overflow(
+	long thread_index);
+static void hs_syntax_error(
 	long thread_index);
 static void *hs_stack_allocate(
 	long thread_index,
@@ -514,6 +528,9 @@ static boolean script_error(
 	long thread_index,
 	char const *reason,
 	char const *expression);
+/* port: a type's default value (hs_scenario_functions_check) */
+static long hs_type_default_value(
+	short type);
 static void hs_script_evaluate(
 	short script_index,
 	long thread_index,
@@ -531,6 +548,7 @@ struct data_array *hs_global_data;
 struct data_array *hs_thread_data;
 extern struct data_array *hs_syntax_data;
 extern short const hs_external_global_count;
+extern long const hs_function_table_count;
 extern short const hs_type_sizes[NUMBER_OF_HS_TYPES];
 boolean debug_scripting;
 unsigned long hs_debug_data[BIT_VECTOR_SIZE_IN_LONGS(MAXIMUM_TRIGGER_VOLUMES_PER_SCENARIO)];
@@ -795,10 +813,20 @@ void hs_runtime_initialize_for_new_map(
 			global_datum = datum_get(hs_global_data, global_datum_index);
 			internal_thread->script_index = NONE;
 			internal_thread->stack->size = 0;
-			hs_evaluate(
-				internal_thread_index,
-				global->initialization_expression_index,
-				&global_datum->value);
+			/* port: an initializer that calls a function a map's scripts
+			may not isn't evaluated: the global starts at its type's
+			default (hs_scenario_functions_check) */
+			if (hs_scenario_global_initializer_disabled(global_index))
+			{
+				global_datum->value = hs_type_default_value(global->type);
+			}
+			else
+			{
+				hs_evaluate(
+					internal_thread_index,
+					global->initialization_expression_index,
+					&global_datum->value);
+			}
 
 			if (TEST_FLAG(internal_thread->flags, _hs_thread_in_function_call_bit))
 			{
@@ -823,8 +851,11 @@ void hs_runtime_initialize_for_new_map(
 				script_index,
 				struct hs_script);
 
+			/* port: none for a script that calls a function a map's
+			scripts may not (hs_scenario_functions_check) */
 			if (script->script_type!=_hs_script_static &&
-				script->script_type!=_hs_script_stub)
+				script->script_type!=_hs_script_stub &&
+				!hs_scenario_script_disabled(script_index))
 			{
 				if (hs_thread_new(_hs_thread_type_script, script_index)==NONE)
 					error(_error_immediate, "ran out of script threads.");
@@ -880,6 +911,10 @@ static char const *expression_get_function_name(
 		if (syntax_node->index != 0 ||
 			expression_index != thread->stack->expression_index)
 		{
+			/* port: an index past the table (a damaged map's) names none */
+			if ((word)syntax_node->index>=hs_function_table_count)
+				return "(corrupt function)";
+
 			return hs_function_get((word)syntax_node->index)->name;
 		}
 
@@ -892,10 +927,33 @@ static char const *expression_get_function_name(
 		thread = hs_thread_get(thread_index);
 	}
 
+	/* port: as for a function's */
+	if (syntax_node->index<0 ||
+		syntax_node->index>=global_scenario_get()->hs_scripts.count)
+	{
+		return "(corrupt script)";
+	}
+
 	return TAG_BLOCK_GET_ELEMENT(
 		&global_scenario_get()->hs_scripts,
 		syntax_node->index,
 		struct hs_script)->name;
+}
+
+boolean hs_runtime_waiting_on_call(
+	void)
+{
+	struct hs_stack_frame *frame;
+	struct hs_syntax_node *caller;
+
+	if (hs_runtime_globals.executing_thread_index == NONE)
+		return FALSE;
+	frame = hs_thread_get(hs_runtime_globals.executing_thread_index)->stack;
+	if (!frame || !frame->previous)
+		return FALSE;
+	caller = hs_syntax_get(frame->previous->expression_index);
+
+	return !TEST_FLAG(caller->flags, _hs_syntax_node_script_bit) && caller->function_index == _hs_function_sleep_until;
 }
 
 char const *hs_runtime_get_executing_thread_name(
@@ -989,7 +1047,7 @@ void render_debug_trigger_volumes(
 {
 	if (debug_trigger_volumes)
 	{
-		real_matrix4x3 matrix;
+		real_matrix4x3 matrix = { 0 };
 		short volume_index;
 		struct scenario *scenario = global_scenario_get();
 
@@ -1034,10 +1092,6 @@ void render_debug_trigger_volumes(
 				matrix4x3_transform_vector(&matrix, &local_extent, &world_extent);
 				break;
 
-			/* matrix is left unassigned only by this default arm. Not reached unassigned: the
-			 * arm's assertion failure calls system_exit, which does not return in January
-			 * (0x47c960 jumps to halt_and_catch_fire 0x4f21c0, which loops or calls exit).
-			 * Source-policy approval pending (2026-09-27 audit). */
 			default:
 				match_assert(
 					"c:\\halo\\SOURCE\\hs\\hs_runtime.c",
@@ -1118,6 +1172,24 @@ void render_debug_trigger_volumes(
 	}
 
 	return;
+}
+
+/* port: moves every sleeping script thread's wake time on by `ticks`, after
+a network co-op host reverts but keeps its clock (network_coop.c) */
+void hs_runtime_port_shift_sleep_times(
+	long ticks)
+{
+	struct data_iterator iterator;
+	struct hs_thread_datum *thread;
+
+	data_iterator_new(&iterator, hs_thread_data);
+	while ((thread = data_iterator_next(&iterator)) != NULL)
+	{
+		if (thread->sleep_until > 0)
+			thread->sleep_until += ticks;
+		if (thread->previous_sleep_until > 0)
+			thread->previous_sleep_until += ticks;
+	}
 }
 
 void hs_runtime_update(
@@ -1286,7 +1358,7 @@ static void hs_thread_delete(
 	return;
 }
 
-static void hs_stack_push(
+static boolean hs_stack_push(
 	long thread_index)
 {
 	struct hs_thread_datum *thread = hs_thread_get(thread_index);
@@ -1297,9 +1369,55 @@ static void hs_stack_push(
 		(byte *) (new_frame+1)<thread->stack_data+HS_THREAD_STACK_SIZE,
 		"stack overflow.");
 
+	/* port: a frame past the thread's stack isn't pushed (it would be
+	written over the next thread's datum): the thread is ended instead */
+	if ((byte *)(new_frame+1)>=thread->stack_data+HS_THREAD_STACK_SIZE ||
+		TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
+	{
+		hs_stack_overflow(thread_index);
+
+		return FALSE;
+	}
+
 	new_frame->previous = thread->stack;
 	thread->stack = new_frame;
 	new_frame->size = 0;
+
+	return TRUE;
+}
+
+/* port: a script whose stack overflows is ended rather than let write past
+its thread's stack: the push or allocation is refused (its caller returns),
+and hs_thread_main lets the thread's frames go once the evaluation in hand
+returns */
+static void hs_stack_overflow(
+	long thread_index)
+{
+	struct hs_thread_datum *thread = hs_thread_get(thread_index);
+
+	if (!TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
+	{
+		error(_error_silent, "a problem occurred while executing the script %s: stack overflow. (it was stopped)",
+			hs_thread_format(thread_index));
+		SET_FLAG(thread->flags, _hs_thread_stack_overflow_bit, TRUE);
+	}
+
+	return;
+}
+
+/* port: a script that reaches a syntax node a damaged map has wrong
+(hs_evaluate, hs_thread_main) is ended as one whose stack overflows is */
+static void hs_syntax_error(
+	long thread_index)
+{
+	struct hs_thread_datum *thread = hs_thread_get(thread_index);
+
+	if (!TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
+	{
+		error(_error_silent, "a problem occurred while executing the script %s: corrupt syntax tree. (it was stopped)",
+			hs_thread_format(thread_index));
+		SET_FLAG(thread->flags, _hs_thread_stack_overflow_bit, TRUE);
+	}
 
 	return;
 }
@@ -1498,7 +1616,9 @@ static void hs_inspect_string(
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x26d,
 		type==_hs_type_string);
 
-	sprintf(buffer, "%s", (char const *)value);
+	/* port: no longer than hs_evaluate_inspect's buffer (a script's
+	string can be any length) */
+	snprintf(buffer, HS_INSPECT_BUFFER_SIZE, "%s", (char const *)value);
 
 	return;
 }
@@ -1517,6 +1637,14 @@ static void hs_inspect_enum(
 		(short)value>=0 && (short)value<enum_definition->count,
 		"enum_value>=0 && enum_value<enum_definition->count");
 
+	/* port: a value that isn't one of the enum's isn't looked up */
+	if ((short)value<0 || (short)value>=enum_definition->count)
+	{
+		sprintf(buffer, "<invalid %s %d>", hs_type_names[type], (short)value);
+
+		return;
+	}
+
 	sprintf(buffer, "%s", enum_definition->values[(short)value]);
 
 	return;
@@ -1527,13 +1655,7 @@ static long hs_long_to_boolean(
 {
 	long result;
 
-	/* BUG: only the low byte of this uninitialised long is written, and the whole long is returned; its
-	   upper three bytes are indeterminate. January homes result in the argument slot, so they are bits 8-31
-	   of n; where hs_string_to_boolean inlines this function they come from its 'push ecx' slot, which holds
-	   hs_cast's table index 254 (0x000000fe), so they are zero there. No January consumer reads a boolean
-	   cell beyond its low byte, but hs_return and the pass-through forms copy the whole long into hs thread
-	   stacks and hs globals, so these bytes reach the saved-game CRC and the save files
-	   (game_state_write_to_persistent_storage, game_state_write_to_file, game_state_write_core). */
+	result = 0;
 	*(boolean *)&result = n==0;
 
 	return result;
@@ -1544,12 +1666,7 @@ static long hs_short_to_boolean(
 {
 	long result;
 
-	/* BUG: only the low byte of this uninitialised long is written, and the whole long is returned; its
-	   upper three bytes are indeterminate. January homes result in the argument slot, so they are bits 8-31
-	   of s. No January consumer reads a boolean cell beyond its low byte, but hs_return and the pass-through
-	   forms copy the whole long into hs thread stacks and hs globals, so these bytes reach the saved-game CRC
-	   and the save files (game_state_write_to_persistent_storage, game_state_write_to_file,
-	   game_state_write_core). */
+	result = 0;
 	*(boolean *)&result = (short)s==0;
 
 	return result;
@@ -1602,12 +1719,7 @@ static long hs_real_to_short(
 {
 	long result;
 
-	/* BUG: only the low word of this uninitialised long is written, and the whole long is returned; its
-	   upper word is indeterminate. January homes result in the argument slot, so it is the upper word of r's
-	   bit pattern. No January consumer reads a short cell beyond its low word, but hs_return and the
-	   pass-through forms copy the whole long into hs thread stacks and hs globals, so these bytes reach the
-	   saved-game CRC and the save files (game_state_write_to_persistent_storage, game_state_write_to_file,
-	   game_state_write_core). */
+	result = 0;
 	*(short *)&result = (short)*(real *)&r;
 
 	return result;
@@ -1624,12 +1736,7 @@ static long hs_long_to_short(
 {
 	long result;
 
-	/* BUG: only the low word of this uninitialised long is written, and the whole long is returned; its
-	   upper word is indeterminate. January homes result in the argument slot, so it is the upper word of l
-	   (January returns l unchanged). No January consumer reads a short cell beyond its low word, but
-	   hs_return and the pass-through forms copy the whole long into hs thread stacks and hs globals, so these
-	   bytes reach the saved-game CRC and the save files (game_state_write_to_persistent_storage,
-	   game_state_write_to_file, game_state_write_core). */
+	result = 0;
 	*(short *)&result = (short)l;
 
 	return result;
@@ -1818,6 +1925,10 @@ void hs_evaluate_begin(
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x15,
 		function_index==_hs_function_begin);
 
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!expression_index || !result)
+		return;
+
 	if (initialize)
 	{
 		*expression_index = hs_syntax_get(hs_syntax_get(
@@ -1864,13 +1975,7 @@ void hs_evaluate_equality(
 		if (function_index==_hs_function_not_equal)
 			equal = !equal;
 
-		/* BUG: only the low byte of this uninitialised long is written, and the whole long is passed to
-		   hs_return; its upper three bytes are indeterminate. January reuses the function_index argument
-		   slot, which parameter_types has just filled with the argument type twice, so the long is
-		   (type<<16)|equal. No January consumer reads a boolean cell beyond its low byte, but hs_return and
-		   the pass-through forms copy the whole long into hs thread stacks and hs globals, so these bytes
-		   reach the saved-game CRC and the save files (game_state_write_to_persistent_storage,
-		   game_state_write_to_file, game_state_write_core). */
+		result_long = 0;
 		*(boolean *)&result_long = equal;
 		hs_return(thread_index, result_long);
 	}
@@ -1916,13 +2021,7 @@ void hs_evaluate_inequality(
 			break;
 		}
 
-		/* BUG: only the low byte of this uninitialised long is written, and the whole long is passed to
-		   hs_return; its upper three bytes are indeterminate. January reuses the function_index argument
-		   slot, where it has just spilled value1, so they are bits 8-31 of value1's bit pattern. No January
-		   consumer reads a boolean cell beyond its low byte, but hs_return and the pass-through forms copy
-		   the whole long into hs thread stacks and hs globals, so these bytes reach the saved-game CRC and
-		   the save files (game_state_write_to_persistent_storage, game_state_write_to_file,
-		   game_state_write_core). */
+		result_long = 0;
 		*(boolean *)&result_long = comparison;
 		hs_return(thread_index, result_long);
 	}
@@ -1944,6 +2043,10 @@ void hs_evaluate_logical(
 
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0xcf,
 		function_index==_hs_function_and || function_index==_hs_function_or);
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!expression_index || !value || !result)
+		return;
 
 	if (initialize)
 	{
@@ -1968,13 +2071,7 @@ void hs_evaluate_logical(
 	}
 	else
 	{
-		/* BUG: only the low byte of this uninitialised long is written, and the whole long is passed to
-		   hs_return; its upper three bytes are indeterminate. January reuses the initialize argument slot,
-		   so they are the upper bytes of the dword hs_thread_main pushed for initialize (stack residue from
-		   hs_thread_main's frame). No January consumer reads a boolean cell beyond its low byte, but
-		   hs_return and the pass-through forms copy the whole long into hs thread stacks and hs globals, so
-		   these bytes reach the saved-game CRC and the save files (game_state_write_to_persistent_storage,
-		   game_state_write_to_file, game_state_write_core). */
+		result_long = 0;
 		*(boolean *)&result_long = *result;
 
 		hs_return(thread_index, result_long);
@@ -1995,6 +2092,10 @@ void hs_evaluate_if(
 
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x77,
 		function_index==_hs_function_if);
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!condition || !expression_index || !result)
+		return;
 
 	if (initialize)
 	{
@@ -2042,11 +2143,30 @@ void hs_evaluate_set(
 	struct hs_thread_datum *thread = hs_thread_get(thread_index);
 	long variable_expression_index = hs_syntax_get(hs_syntax_get(
 		thread->stack->expression_index)->data)->next_node_index;
-	struct hs_syntax_node *variable = hs_syntax_get(variable_expression_index);
+	/* port: (none to get when there's no variable) */
+	struct hs_syntax_node *variable = variable_expression_index!=NONE ?
+		hs_syntax_get(variable_expression_index) :
+		NULL;
 	short type;
 	long global_index;
 
-	hs_stack_allocate(thread_index, sizeof(long));
+	/* port: a variable that isn't a global's name ends the thread: its
+	index would pick the global (the external one too) written through. Only
+	a damaged map's are (the compiler and hs_scenario_functions_check let
+	none run) */
+	if (!variable ||
+		!TEST_FLAG(variable->flags, _hs_syntax_node_primitive_bit) ||
+		!TEST_FLAG(variable->flags, _hs_syntax_node_global_bit) ||
+		hs_global_get_type((short)variable->data)==_hs_unparsed)
+	{
+		hs_syntax_error(thread_index);
+
+		return;
+	}
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!hs_stack_allocate(thread_index, sizeof(long)))
+		return;
 	type = hs_global_get_type((short)variable->data);
 
 	if (initialize)
@@ -2082,12 +2202,16 @@ void hs_evaluate_inspect(
 	long thread_index,
 	boolean initialize)
 {
-	char string[1024];
+	char string[HS_INSPECT_BUFFER_SIZE];
 	struct hs_thread_datum *thread = hs_thread_get(thread_index);
 	long *value = hs_stack_allocate(thread_index, sizeof(long));
 
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x2bc,
 		function_index==_hs_function_inspect);
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!value)
+		return;
 
 	if (initialize)
 	{
@@ -2100,14 +2224,17 @@ void hs_evaluate_inspect(
 		struct hs_syntax_node *expression = hs_syntax_get(hs_syntax_get(hs_syntax_get(
 			thread->stack->expression_index)->data)->next_node_index);
 
-		if (hs_type_inspectors[expression->type])
+		/* port: (the type was checked as the value was evaluated: checked
+		again before it picks an inspector) */
+		if (hs_type_valid(expression->type) && hs_type_inspectors[expression->type])
 		{
 			hs_type_inspectors[expression->type](expression->type, *value, string);
-			/* BUG (preserved for exact matching): the inspected value's text is passed as the
-			 * format (January 0x4bc840 +0xdd..+0xe6), so inspecting a string that contains '%'
-			 * reads arguments that were never passed. A corrected build should print it through
-			 * "%s". Source-policy approval pending (2026-09-27 audit). */
-			console_printf(FALSE, string);
+			/* port: printed through "%s". January passes the text as the
+			format (0x4bc840 +0xdd..+0xe6), so a '%' in an inspected string
+			read arguments that were never passed. A scenario script's
+			inspect is the game's chatter, as print is (hs_print) */
+			if (terminal_shows(terminal_command_running ? _terminal_message_serious : _terminal_message_chatter))
+				console_printf(FALSE, "%s", string);
 		}
 
 		hs_return(thread_index, 0);
@@ -2127,6 +2254,10 @@ void hs_evaluate_arithmetic(
 	real *value = hs_stack_allocate(thread_index, sizeof(real));
 	real *result = hs_stack_allocate(thread_index, sizeof(real));
 	long result_long;
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!argument_index || !expression_index || !value || !result)
+		return;
 
 	if (initialize)
 	{
@@ -2201,6 +2332,10 @@ void hs_evaluate_object_cast_up(
 		function_index>=_hs_function_object_to_unit &&
 		function_index<=_hs_function_object_to_unit);
 
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!object_index)
+		return;
+
 	if (initialize)
 	{
 		hs_evaluate(thread_index, hs_syntax_get(hs_syntax_get(
@@ -2246,6 +2381,10 @@ void hs_evaluate_begin_random(
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x45,
 		function_index==_hs_function_begin_random);
 
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!argument_count || !evaluated || !result)
+		return;
+
 	if (initialize)
 	{
 		long expression_index = hs_syntax_get(hs_syntax_get(
@@ -2258,8 +2397,10 @@ void hs_evaluate_begin_random(
 			*argument_count += 1;
 		}
 
+		/* port: one long holds LONG_BITS choices, so a list of that
+		many fits the mask this function already allocates */
 		match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x50,
-			*argument_count<LONG_BITS);
+			*argument_count<=LONG_BITS);
 
 		csmemset(evaluated, 0, BIT_VECTOR_SIZE_IN_BYTES(*argument_count));
 	}
@@ -2299,6 +2440,10 @@ void hs_evaluate_debug_string(
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x304,
 		(function_index>=_hs_function_debug_string__first) &&
 		(function_index<=_hs_function_debug_string__last));
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!expression_index || !argument_count || !arguments)
+		return;
 
 	if (initialize)
 	{
@@ -2365,6 +2510,10 @@ void hs_evaluate_sleep_until(
 
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x1e5,
 		function_index==_hs_function_sleep_until);
+
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!condition || !ticks || !timeout || !start_time || !argument_index)
+		return;
 
 	if (initialize)
 	{
@@ -2437,6 +2586,10 @@ void hs_evaluate_sleep(
 	match_assert("c:\\halo\\source\\hs\\hs_library_internal_runtime.h", 0x189,
 		function_index==_hs_function_sleep);
 
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!ticks || !script_index || !argument_index)
+		return;
+
 	if (initialize)
 	{
 		hs_evaluate(thread_index, hs_syntax_get(hs_syntax_get(
@@ -2506,6 +2659,7 @@ static void hs_thread_main(
 {
 	struct hs_thread_datum *thread = hs_thread_get(thread_index);
 	struct hs_script *script = NULL;
+	long *root_result;
 
 	hs_runtime_globals.executing_thread_index = (short)thread_index;
 	if (thread->type==_hs_thread_type_script)
@@ -2518,6 +2672,15 @@ static void hs_thread_main(
 			script->script_type!=_hs_script_static &&
 			script->script_type!=_hs_script_stub,
 			"found a static script at toplevel.");
+		/* port: a script that doesn't run (hs_scenario_functions_check)
+		gets no thread; one a saved game brings back sleeps for good */
+		if (hs_scenario_script_disabled((short)thread->script_index))
+		{
+			thread->sleep_until = NONE;
+			hs_runtime_globals.executing_thread_index = NONE;
+
+			return;
+		}
 	}
 
 	match_hs_assert("c:\\halo\\SOURCE\\hs\\hs_runtime.c", 0x2bd, thread_index,
@@ -2529,8 +2692,10 @@ static void hs_thread_main(
 		match_assert("c:\\halo\\SOURCE\\hs\\hs_runtime.c", 0x2c3, script);
 
 		thread->stack->size = 0;
-		hs_evaluate(thread_index, script->root_expression_index,
-			hs_stack_allocate(thread_index, sizeof(long)));
+		/* port: (the base frame, just emptied, has room) */
+		root_result = hs_stack_allocate(thread_index, sizeof(long));
+		if (root_result)
+			hs_evaluate(thread_index, script->root_expression_index, root_result);
 	}
 
 	while (thread->stack!=(struct hs_stack_frame *)thread->stack_data &&
@@ -2540,11 +2705,22 @@ static void hs_thread_main(
 	{
 		struct hs_syntax_node *expression = hs_syntax_get(thread->stack->expression_index);
 		boolean initialize = TEST_FLAG(thread->flags, _hs_thread_in_function_call_bit);
+		long index_count;
 
 		thread->stack->size = 0;
 		SET_FLAG(thread->flags, _hs_thread_in_function_call_bit, FALSE);
 
-		if (!TEST_FLAG(expression->flags, _hs_syntax_node_script_bit))
+		/* port: a function or script that isn't there isn't called, and the
+		thread is ended. hs_evaluate pushes only nodes whose index was
+		checked, but this index picks a function pointer */
+		index_count = TEST_FLAG(expression->flags, _hs_syntax_node_script_bit) ?
+			global_scenario_get()->hs_scripts.count :
+			hs_function_table_count;
+		if (expression->index<0 || expression->index>=index_count)
+		{
+			hs_syntax_error(thread_index);
+		}
+		else if (!TEST_FLAG(expression->flags, _hs_syntax_node_script_bit))
 		{
 			struct hs_function_definition *function = hs_function_get(expression->index);
 
@@ -2558,6 +2734,15 @@ static void hs_thread_main(
 		else
 		{
 			hs_script_evaluate(expression->index, thread_index, initialize);
+		}
+
+		/* port: a stack overflow (hs_stack_overflow) ends the thread: its
+		frames are let go, and a script's thread doesn't run again */
+		if (TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
+		{
+			thread->stack = (struct hs_stack_frame *)thread->stack_data;
+			thread->flags = 0;
+			thread->sleep_until = thread->type==_hs_thread_type_script ? NONE : 0;
 		}
 	}
 
@@ -2594,12 +2779,51 @@ static void hs_script_evaluate(
 	struct hs_thread_datum *thread = hs_thread_get(thread_index);
 	long *result = hs_stack_allocate(thread_index, sizeof(long));
 
-	if (initialize)
+	/* port: none on a stack overflow (hs_stack_overflow) */
+	if (!result)
+		return;
+
+	/* port: a static script that calls a function a map's scripts may not
+	isn't evaluated: it returns its type's default
+	(hs_scenario_functions_check) */
+	if (hs_scenario_script_disabled(script_index))
+		hs_return(thread_index, hs_type_default_value(script->return_type));
+	else if (initialize)
 		hs_evaluate(thread_index, script->root_expression_index, result);
 	else
 		hs_return(thread_index, *result);
 
 	return;
+}
+
+static long hs_type_default_value(
+	short type)
+{
+	union
+	{
+		real real_value;
+		long long_value;
+	} real_default;
+
+	switch (type)
+	{
+	case _hs_type_void:
+		return 0;
+	case _hs_type_boolean:
+		return _hs_type_boolean_default;
+	case _hs_type_real:
+		real_default.real_value = _hs_type_real_default;
+		return real_default.long_value;
+	case _hs_type_short_integer:
+		return _hs_type_short_integer_default;
+	case _hs_type_long_integer:
+		return _hs_type_long_integer_default;
+	case _hs_type_string:
+		return (long)_hs_type_string_default;
+	default:
+		/* (the rest's defaults, hs.c's _hs_type_*_default, are all NONE) */
+		return NONE;
+	}
 }
 
 static void *hs_stack_allocate(
@@ -2618,6 +2842,17 @@ static void *hs_stack_allocate(
 		frame->data+frame->size+size<=thread->stack_data+HS_THREAD_STACK_SIZE,
 		"stack overflow.");
 
+	/* port: none past the thread's stack (hs_stack_overflow); the caller
+	returns on NULL */
+	if (size<0 ||
+		size>thread->stack_data+HS_THREAD_STACK_SIZE-(frame->data+frame->size) ||
+		TEST_FLAG(thread->flags, _hs_thread_stack_overflow_bit))
+	{
+		hs_stack_overflow(thread_index);
+
+		return NULL;
+	}
+
 	result = frame->data+frame->size;
 	frame->size += (short)size;
 
@@ -2635,6 +2870,18 @@ static void hs_evaluate(
 	match_hs_assert("c:\\halo\\SOURCE\\hs\\hs_runtime.c", 0x2ff, thread_index,
 		valid_thread(thread), "corrupted stack.");
 	match_assert("c:\\halo\\SOURCE\\hs\\hs_runtime.c", 0x300, destination);
+
+	/* port: only a node with a value's type is evaluated. Those are the
+	ones hs_compile_postprocess checked: their function or script index, and
+	the type a constant or global casts from. A node that isn't there, or a
+	function's name (left unchecked, and never in a value's place in the
+	shipped maps), comes only from a damaged map: the thread is ended */
+	if (!expression || !hs_type_valid(expression->type))
+	{
+		hs_syntax_error(thread_index);
+
+		return;
+	}
 
 	if (TEST_FLAG(hs_syntax_get(expression_index)->flags, _hs_syntax_node_primitive_bit))
 	{
@@ -2658,9 +2905,12 @@ static void hs_evaluate(
 	else
 	{
 		thread->stack->result = destination;
-		hs_stack_push(thread_index);
-		SET_FLAG(thread->flags, _hs_thread_in_function_call_bit, TRUE);
-		thread->stack->expression_index = expression_index;
+		/* port: not pushed on a stack overflow (hs_stack_overflow) */
+		if (hs_stack_push(thread_index))
+		{
+			SET_FLAG(thread->flags, _hs_thread_in_function_call_bit, TRUE);
+			thread->stack->expression_index = expression_index;
+		}
 	}
 
 	return;
@@ -3113,6 +3363,11 @@ static long *hs_arguments_evaluate(
 	long *values = hs_stack_allocate(thread_index, formal_parameter_count*sizeof(long));
 	short *argument_index = hs_stack_allocate(thread_index, sizeof(short));
 	long *expression_index = hs_stack_allocate(thread_index, sizeof(long));
+
+	/* port: none on a stack overflow (hs_stack_overflow): as for arguments
+	still being evaluated, the caller returns on NULL */
+	if (!values || !argument_index || !expression_index)
+		return NULL;
 
 	if (initialize)
 	{

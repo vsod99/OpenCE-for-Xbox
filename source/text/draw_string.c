@@ -116,6 +116,7 @@ symbols in this file:
 #include "text/font_group.h"
 #include "text/international_strings.h"
 #include "text/text_group.h"
+#include "text_filter.h" /* port: port/linux/game/text_filter.c and text_filter_match.c */
 
 #include <ctype.h>
 
@@ -452,6 +453,14 @@ void draw_string_set_font(
 	return;
 }
 
+/* port: the font the next string is drawn with (rasterizer_text.c's
+high-res text) */
+long draw_string_get_font(
+	void)
+{
+	return font_drawing_globals.current_font_index;
+}
+
 void draw_string_set_format(
 	short style,
 	short justification,
@@ -756,10 +765,19 @@ static word parse_unicode_string(
 	switch (character)
 	{
 	case '|':
-		if (string[state->string_index++] == 'n')
+		/* port: the next character is taken only when it is the 'n' of
+		"|n"; any other '|' is a character, as parse_string has it. The
+		next character was taken whatever it was, so a string ending in '|'
+		(a player's name, a server's message) was read past its end */
+		if (string[state->string_index] == 'n')
 		{
+			state->string_index++;
 			state->character = '\r';
 			state->result = _parsed_end_of_line;
+		}
+		else
+		{
+			state->result = _parsed_character;
 		}
 		break;
 	case 0:
@@ -1004,6 +1022,10 @@ void draw_string(
 	struct parse_string_state state;
 	point2d cursor;
 
+	/* port: streamer mode's words hidden, in what is drawn and what is measured
+	(port/linux/game/text_filter.c) */
+	string = text_filter_string(string);
+
 	match_assert("c:\\halo\\SOURCE\\text\\draw_string.c", 648, bounds);
 	match_assert("c:\\halo\\SOURCE\\text\\draw_string.c", 649, string);
 
@@ -1201,6 +1223,10 @@ void draw_unicode_string(
 	short maximum_wrapped_line_index = 0;
 	struct parse_string_state state;
 	point2d cursor;
+
+	/* port: streamer mode's words hidden, in what is drawn and what is measured
+	(port/linux/game/text_filter.c) */
+	string = text_filter_unicode(string);
 
 	match_assert("c:\\halo\\SOURCE\\text\\draw_string.c", 848, bounds);
 	match_assert("c:\\halo\\SOURCE\\text\\draw_string.c", 849, string);
@@ -1449,6 +1475,51 @@ void draw_unicode_string_compute_bounds(
 	text_bounds->y1 = cursor_bounds->y1;
 
 	return;
+}
+
+/* port: the middle of a string's capitals as it is drawn in the bounds
+(the draw mode's font: the rows of its H with ink, on the line's baseline),
+for what is drawn beside it, centred on it (voice chat's speakers:
+port/linux/game/network_voice.c) */
+short draw_unicode_string_capital_middle(
+	rectangle2d const *bounds,
+	wchar_t const *string)
+{
+	rectangle2d text_bounds;
+	rectangle2d cursor_bounds;
+	struct font_header *font;
+	struct font_character *capital;
+	short baseline;
+	short top = NONE;
+	short bottom = NONE;
+	short row;
+
+	draw_unicode_string_compute_bounds(bounds, string, &text_bounds, &cursor_bounds);
+	font = text_bounds_globals.last_font_header;
+	if (!font)
+		return (short)((bounds->y0 + bounds->y1) / 2);
+	baseline = (short)(cursor_bounds.y0 + font->ascending_height);
+	capital = font_get_character_by_ascii_code(font, 'H');
+	for (row = 0; capital && row < capital->bitmap_height; row++)
+	{
+		byte const *pixels = (byte const *)font->pixels.address + capital->pixels_offset + row * capital->bitmap_width;
+		short column;
+
+		for (column = 0; column < capital->bitmap_width; column++)
+		{
+			if (pixels[column])
+			{
+				if (top == NONE)
+					top = row;
+				bottom = row;
+				break;
+			}
+		}
+	}
+	/* (no H: the middle of the font's height above the baseline) */
+	if (top == NONE)
+		return (short)(baseline - font->ascending_height / 2);
+	return (short)(baseline - capital->bitmap_origin_y + (top + bottom + 1) / 2);
 }
 
 short draw_string_pick(

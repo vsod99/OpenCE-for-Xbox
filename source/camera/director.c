@@ -121,10 +121,12 @@ symbols in this file:
 
 #include "camera_scripting.h"
 #include "dead_camera.h"
+#include "coop_spectate.h" /* port: port/linux/game/coop_spectate.c */
 #include "editor_flying_camera.h"
 #include "first_person_camera.h"
 #include "flying_camera.h"
 #include "following_camera.h"
+#include "passenger_camera.h" /* port: port/linux/game/passenger_camera.c */
 #include "observer.h"
 #include "orbiting_camera.h"
 
@@ -136,6 +138,9 @@ symbols in this file:
 
 #include "units/unit_definitions.h"
 #include "units/units.h"
+
+/* network_game_globals.c's */
+boolean network_game_distributed_client(void);
 
 /* ---------- constants */
 
@@ -501,10 +506,7 @@ static void director_process_variables(
 			&variables[variable_index];
 		struct director_variable_instance *instance =
 			&director->debug_variables[variable_index];
-		/* BUG (original): January tests the height definition for every
-		 * variable. A corrected build should test definition->has_hyper_scale.
-		 */
-		real hyper_scale = variables[_variable_height].has_hyper_scale
+		real hyper_scale = definition->has_hyper_scale
 			? director->debug_input_scale
 			: 1.f;
 		real velocity_scale =
@@ -614,6 +616,9 @@ static void director_choose_game_perspective(
 	short local_player_index,
 	boolean force)
 {
+	/* port: remember only local display choices, never a shared seat flag */
+	static boolean passenger_views[MAXIMUM_NUMBER_OF_LOCAL_PLAYERS];
+	boolean passenger = passenger_camera_enabled(local_player_index);
 	director_perspective perspective;
 	short following;
 	long unit_index;
@@ -621,7 +626,13 @@ static void director_choose_game_perspective(
 
 	unit_index = player_control_get_unit_index(local_player_index);
 	following = director_desired_perspective(unit_index, &perspective);
-	if (force || director->seat_state != perspective)
+	/* port: the local passenger view must not change the deterministic
+	camera used by player_aim_projectile. Reconsider a menu toggle even
+	when the seat's enter/exit state has not changed. */
+	if (passenger)
+		following = TRUE;
+	if (force || director->seat_state != perspective ||
+		passenger != passenger_views[local_player_index])
 	{
 		if (following == TRUE)
 		{
@@ -646,6 +657,8 @@ static void director_choose_game_perspective(
 		director->seat_state = perspective;
 	}
 
+	/* port: a menu toggle can change the view without changing seats */
+	passenger_views[local_player_index] = passenger;
 	return;
 }
 
@@ -697,27 +710,42 @@ static void director_choose_camera_game(
 	}
 	else
 	{
-		struct player_datum *player = player_get(local_player_get_player_index(local_player_index));
-		boolean use_dead_camera = player->unit_index == NONE && player->statistics.deaths > 0;
+		long player_index = local_player_get_player_index(local_player_index);
+		struct player_datum *player = player_get(player_index);
+		/* port: and a network co-op player who hasn't spawned yet, waiting for
+		the level's first checkpoint, watches too */
+		boolean use_dead_camera = player->unit_index == NONE &&
+			(player->statistics.deaths > 0 || players_coop_waiting_to_start(player_index));
 
-		if (key)
+		/* (port: not a client in another's game, the host's rules: a flying
+		camera would see all of it, and one behind the player round its
+		corners) */
+		if (key && !network_game_distributed_client())
 			director_rotate_cameras(local_player_index, director_game_camera_modes, 3);
 		if (!*director_camera_scripted)
 		{
 			director_choose_game_perspective(local_player_index, initialize);
 			if (use_dead_camera)
 			{
-				if (director->camera_proc != (director_camera_update_proc)dead_camera_update)
+				/* port: a dead network co-op player watches a living teammate
+				(port/linux/game/coop_spectate.c), or its own body if nobody is alive */
+				long watched_unit_index = coop_spectating() ? coop_spectate_unit(local_player_index) : NONE;
+
+				if (director->camera_proc != (director_camera_update_proc)dead_camera_update ||
+					(watched_unit_index != NONE &&
+						((struct dead_camera *)director->camera_data)->unit_index != watched_unit_index))
 				{
 					dead_camera_new(
 						(struct dead_camera *)director->camera_data,
 						local_player_index,
-						NONE);
+						watched_unit_index);
 					director_set_camera(
 						local_player_index,
 						(director_camera_update_proc)dead_camera_update,
 						TRUE);
 				}
+				if (watched_unit_index != NONE)
+					coop_spectate_camera((struct dead_camera *)director->camera_data);
 			}
 			else if (director->camera_proc == (director_camera_update_proc)dead_camera_update)
 			{
@@ -864,9 +892,10 @@ static boolean director_update_controls(
 		struct mouse_state const *mouse = input_get_mouse_state();
 
 		switch_camera = input_key_is_down(_key_backspace) == TRUE;
-		if ((director->camera_proc !=
+		/* port: the passenger follows their aim, never the debug mouse orbit */
+		if (!passenger_camera_enabled(local_player_index) && ((director->camera_proc !=
 				(director_camera_update_proc)first_person_camera_update &&
-			mouse->buttons[1]) || input_key_is_down(_key_tab))
+			mouse->buttons[1]) || input_key_is_down(_key_tab)))
 		{
 			SET_FLAG(control_flags, _camera_control_forward_bit,
 				input_key_is_down(_key_w));

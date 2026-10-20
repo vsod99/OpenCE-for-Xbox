@@ -53,6 +53,7 @@ symbols in this file:
 /* ---------- headers */
 
 #include "cseries/cseries.h"
+#include "passenger_camera.h" /* port: port/linux/game/passenger_camera.c */
 #include "cseries/errors.h"
 #include "bitmaps/bitmap_group.h"
 #include "cache/texture_cache.h"
@@ -405,10 +406,15 @@ static void render_weapon_hud(
 	short const *new_state_flags,
 	short const *new_overlay_flags,
 	short const *new_numbers);
+static boolean weapon_hud_state_index_valid(
+	short state_index,
+	short state_count);
 
 /* ---------- globals */
 
 static struct weapon_hud_globals *weapon_hud_globals = NULL;
+/* port: a crosshair's bad sequence or bitmap was reported (once) */
+static boolean crosshair_bad_bitmap_reported = FALSE;
 
 /* ---------- public code */
 
@@ -478,6 +484,20 @@ void scripted_hud_show_crosshair(
 		show);
 
 	return;
+}
+
+/* port: the scripts' crosshair flag, for network co-op
+(port/linux/game/network_coop.c) */
+long hud_weapon_port_script_flags(
+	void)
+{
+	return weapon_hud_globals->script_flags;
+}
+
+void hud_weapon_port_set_script_flags(
+	long flags)
+{
+	weapon_hud_globals->script_flags = flags;
 }
 
 static struct weapon_hud_state *get_hud_state(
@@ -708,6 +728,11 @@ static void hud_update_weapon_local_player(
 		long render_flags = 0;
 		short definition_count = 1;
 		short crosshair_index;
+		/* port: a weapon of one magazine has no secondary ammunition to warn
+		of. Its second magazine (empty) set the secondary states off: "fired
+		secondary with no ammo" at every pull of the trigger, coldsnap's
+		master HUD's NO FUEL beside the weapon's own NO AMMO */
+		boolean const secondary_magazine = weapon_state->magazine_count > 1;
 
 		if (weapon_index != get_hud_state(local_player_index)->last_weapon_index &&
 			weapon_index == NONE)
@@ -750,8 +775,9 @@ static void hud_update_weapon_local_player(
 					result = weapon_state->magazines[0].can_fire;
 					break;
 
+				/* port: (secondary_magazine) */
 				case _crosshair_state_secondary_trigger_ready:
-					result = weapon_state->magazines[1].can_fire;
+					result = secondary_magazine && weapon_state->magazines[1].can_fire;
 					break;
 
 				case _crosshair_state_aim:
@@ -835,33 +861,42 @@ static void hud_update_weapon_local_player(
 						weapon_state->magazines[0].rounds_loaded <= root_definition->flash_cutoffs.loaded_ammo;
 					break;
 
+				/* port: (secondary_magazine) */
 				case _crosshair_state_flash_secondary_ammo:
-					result = (weapon_state->magazines[1].rounds_remaining || weapon_state->magazines[1].rounds_loaded) &&
+					result = secondary_magazine &&
+						(weapon_state->magazines[1].rounds_remaining || weapon_state->magazines[1].rounds_loaded) &&
 						weapon_state->magazines[1].rounds_remaining &&
 						weapon_state->magazines[1].rounds_loaded <= root_definition->flash_cutoffs.loaded_ammo;
 					break;
 
+				/* port: these two read a weapon of one magazine's missing second
+				as empty, flashing it and showing it fired empty at each pull */
 				case _crosshair_state_flash_secondary_total_ammo:
-					result = weapon_state->magazines[1].rounds_remaining <=
+					result = weapon_state->magazine_count > 1 &&
+						weapon_state->magazines[1].rounds_remaining <=
 							root_definition->flash_cutoffs.total_ammo &&
 						!weapon_state->magazines[1].reloading;
 					break;
 
+				/* port: (secondary_magazine) */
 				case _crosshair_state_secondary_reload:
-					result = weapon_state->magazines[1].reloading;
+					result = secondary_magazine && weapon_state->magazines[1].reloading;
 					break;
 
 				case _crosshair_state_fired_secondary_with_no_ammo:
 					/* January (T+0x3b7 shared tail `test ch,8`) and the later /Od build (0x638a07
 					   `and edx,0x800`) both test the primary trigger for this secondary state. */
-					result = (!weapon_state->magazines[1].rounds_loaded &&
+					result = weapon_state->magazine_count > 1 &&
+						((!weapon_state->magazines[1].rounds_loaded &&
 							!weapon_state->magazines[1].rounds_remaining &&
 							TEST_FLAG(unit->unit.control_flags, _unit_control_weapon_primary_trigger_bit)) ||
-						state->value.reference_data != NONE;
+						state->value.reference_data != NONE);
 					break;
 
+				/* port: (secondary_magazine) */
 				case _crosshair_state_flash_secondary_ammo_none_for_reload:
-					result = (weapon_state->magazines[1].rounds_remaining || weapon_state->magazines[1].rounds_loaded) &&
+					result = secondary_magazine &&
+						(weapon_state->magazines[1].rounds_remaining || weapon_state->magazines[1].rounds_loaded) &&
 						!weapon_state->magazines[1].rounds_remaining &&
 						weapon_state->magazines[1].rounds_loaded <= root_definition->flash_cutoffs.loaded_ammo;
 					break;
@@ -871,10 +906,7 @@ static void hud_update_weapon_local_player(
 						"c:\\halo\\SOURCE\\interface\\hud_weapon.c",
 						0x16E,
 						!"unreachable");
-					/* BUG (preserved for exact matching): January (T+0x404) and the later /Od build (0x638ac2)
-					   leave result unassigned in this arm. The arm is unreachable in defined execution:
-					   crosshair_index only takes the values 0..NUMBER_OF_CROSSHAIR_STATES-1 (0..18), and each of
-					   those 19 states has a case above that assigns result. */
+					result = 0;
 					break;
 				}
 
@@ -947,6 +979,9 @@ static void crosshairs_draw(
 	long stack_buffer[STACK_BUFFER_LENGTH];
 	boolean firing_active = FALSE;
 
+	/* port: project the passenger's shot once for all pieces of its reticle */
+	if (!passenger_camera_reticle_begin(player->local_player_index, weapon_index))
+		return;
 	csmemset(
 		stack_buffer,
 		0x62,
@@ -1009,7 +1044,8 @@ static void crosshairs_draw(
 						struct weapon_hud_crosshairs_element);
 					short state_index = element->crosshair_type;
 
-					if (TEST_FLAG(render_flags, state_index) &&
+					if (weapon_hud_state_index_valid(state_index, NUMBER_OF_WEAPON_HUD_CROSSHAIR_STATES) &&
+						TEST_FLAG(render_flags, state_index) &&
 						TEST_FLAG(map_type_flags, element->use_on_map_type))
 					{
 						struct crosshair_state *state = &crosshair->states[state_index];
@@ -1034,14 +1070,25 @@ static void crosshairs_draw(
 									!TEST_FLAG(item->placement.multiplayer_scaling_flags, _hud_dont_scale_size_bit) ?
 									0.5f :
 									1.0f;
-								struct bitmap_group_sequence *sequence = !TEST_FLAG(item->flags, _hud_crosshair_not_a_sprite_bit) ?
-									TAG_BLOCK_GET_ELEMENT(
-										&bitmap_group_get(verify_tag_reference(&element->crosshairs.bitmap))->sequences,
-										item->sequence_index,
-										struct bitmap_group_sequence) :
-									NULL;
+								struct bitmap_group_sequence *sequence = NULL;
 								short frame_index;
 								pixel32 color;
+
+								/* port: a sprite item's sequence is the map's. Only one the
+								bitmap has is used, and the item isn't drawn otherwise (its
+								state still runs, below) */
+								if (!TEST_FLAG(item->flags, _hud_crosshair_not_a_sprite_bit))
+								{
+									struct bitmap_group *sequence_group = bitmap_group_get(verify_tag_reference(&element->crosshairs.bitmap));
+
+									if (item->sequence_index >= 0 && item->sequence_index < sequence_group->sequences.count)
+									{
+										sequence = TAG_BLOCK_GET_ELEMENT(
+											&sequence_group->sequences,
+											item->sequence_index,
+											struct bitmap_group_sequence);
+									}
+								}
 
 								switch (state_index)
 								{
@@ -1131,7 +1178,9 @@ static void crosshairs_draw(
 								case _crosshair_state_flash_secondary_ammo_none_for_reload:
 								case _crosshair_state_primary_trigger_ready:
 								case _crosshair_state_secondary_trigger_ready:
-									if (item->frame_rate > 0)
+									/* port: a sequence with no sprites (or none) stays on frame 0
+									rather than dividing by zero */
+									if (item->frame_rate > 0 && sequence && sequence->sprites.count > 0)
 									{
 										frame_index = (short)(((game_time_get() - state->value.reference_data) /
 											item->frame_rate / TICKS_PER_SECOND) % sequence->sprites.count);
@@ -1172,6 +1221,17 @@ static void crosshairs_draw(
 								{
 									continue;
 								}
+								/* port: nor does a sprite item whose sequence isn't there */
+								if (!sequence && !TEST_FLAG(item->flags, _hud_crosshair_not_a_sprite_bit))
+								{
+									if (!crosshair_bad_bitmap_reported)
+									{
+										crosshair_bad_bitmap_reported = TRUE;
+										error(_error_silent, "crosshair %d item %d has no sequence #%d (not drawn)",
+											crosshair_index, item_index, item->sequence_index);
+									}
+									continue;
+								}
 								match_vassert(
 									"c:\\halo\\SOURCE\\interface\\hud_weapon.c",
 									0x4A5,
@@ -1184,14 +1244,25 @@ static void crosshairs_draw(
 										strip_path_name(tag_get_name(definition_indices[definition_index]))));
 								{
 									struct bitmap_group *bitmap_group = bitmap_group_get(verify_tag_reference(&element->crosshairs.bitmap));
-									struct bitmap_data *bitmap = TAG_BLOCK_GET_ELEMENT(
-										&bitmap_group->bitmaps,
-										sequence ?
-											TAG_BLOCK_GET_ELEMENT(&sequence->sprites, frame_index, struct bitmap_group_sprite)->bitmap_index :
-											item->sequence_index,
-										struct bitmap_data);
+									short bitmap_index = sequence ?
+										TAG_BLOCK_GET_ELEMENT(&sequence->sprites, frame_index, struct bitmap_group_sprite)->bitmap_index :
+										item->sequence_index;
+									/* port: the bitmap (the sprite's, or the item's own) must be
+									one the group has, or the item isn't drawn */
+									struct bitmap_data *bitmap = bitmap_index >= 0 && bitmap_index < bitmap_group->bitmaps.count ?
+										TAG_BLOCK_GET_ELEMENT(
+											&bitmap_group->bitmaps,
+											bitmap_index,
+											struct bitmap_data) :
+										NULL;
 
-									if (_texture_cache_bitmap_get_hardware_format(bitmap, FALSE, TRUE))
+									if (!bitmap && !crosshair_bad_bitmap_reported)
+									{
+										crosshair_bad_bitmap_reported = TRUE;
+										error(_error_silent, "crosshair %d item %d has no bitmap #%d (not drawn)",
+											crosshair_index, item_index, bitmap_index);
+									}
+									if (bitmap && _texture_cache_bitmap_get_hardware_format(bitmap, FALSE, TRUE))
 									{
 										if (TEST_FLAG(item->flags, _hud_crosshair_hide_outside_area_bit))
 										{
@@ -1236,7 +1307,8 @@ static void crosshairs_draw(
 												color,
 												in_multiplayer,
 												interface_bitmap,
-												TRUE);
+												/* port: not scaled with display.fov (view_fov.c) */
+												FALSE);
 										}
 										else
 										{
@@ -1252,7 +1324,10 @@ static void crosshairs_draw(
 												color,
 												in_multiplayer,
 												bitmap_group->type == _bitmap_group_type_interface_bitmaps,
-												TRUE);
+												/* port: a reticle, scaled with display.fov
+												(view_fov.c); a scope's picture keeps its
+												place */
+												state_index != _crosshair_state_zoom);
 										}
 									}
 								}
@@ -1264,8 +1339,35 @@ static void crosshairs_draw(
 		}
 	}
 
+	/* port: other HUD elements keep their ordinary anchors */
+	passenger_camera_reticle_end();
 	match_assert_stack_frame("c:\\halo\\SOURCE\\interface\\hud_weapon.c", 0x4E2);
 	return;
+}
+
+/* port: a hud element's state (or crosshair) type is the map's, and indexes
+the state tables (8 states, 19 crosshair states; retail elements use up to 7
+and 18): an element of any other is not drawn, and that is said once */
+static boolean weapon_hud_state_index_valid(
+	short state_index,
+	short state_count)
+{
+	static boolean bad_state_reported = FALSE;
+
+	if (VALID_INDEX(state_index, state_count))
+		return TRUE;
+
+	if (!bad_state_reported)
+	{
+		bad_state_reported = TRUE;
+		error(
+			_error_silent,
+			"weapon hud element of state %d (of %d) not drawn",
+			state_index,
+			state_count);
+	}
+
+	return FALSE;
 }
 
 static void render_weapon_hud(
@@ -1381,33 +1483,43 @@ static void render_weapon_hud(
 			local_player_count() > 1);
 		state_flags[3] = flags;
 
-		flags = state_flags[4];
-		SET_FLAG(
-			flags,
-			_hud_draw_flashing_bit,
-			weapon_state->magazines[1].rounds_remaining <= cutoffs->total_ammo);
-		SET_FLAG(
-			flags,
-			_hud_draw_disabled_bit,
-			weapon_state->magazines[1].rounds_remaining == 0);
-		SET_FLAG(
-			flags,
-			_hud_draw_in_multiplayer_bit,
-			local_player_count() > 1);
-		state_flags[4] = flags;
+		/* port: a weapon of one magazine has no secondary ammunition, so
+		nothing of it flashes or shows empty (the overlays below likewise) */
+		if (weapon_state->magazine_count > 1)
+		{
+			flags = state_flags[4];
+			SET_FLAG(
+				flags,
+				_hud_draw_flashing_bit,
+				weapon_state->magazines[1].rounds_remaining <= cutoffs->total_ammo);
+			SET_FLAG(
+				flags,
+				_hud_draw_disabled_bit,
+				weapon_state->magazines[1].rounds_remaining == 0);
+			SET_FLAG(
+				flags,
+				_hud_draw_in_multiplayer_bit,
+				local_player_count() > 1);
+			state_flags[4] = flags;
 
-		flags = state_flags[5];
-		SET_FLAG(
-			flags,
-			_hud_draw_flashing_bit,
-			weapon_state->magazines[1].rounds_loaded <= cutoffs->loaded_ammo &&
-				!weapon_state->magazines[1].reloading);
-		SET_FLAG(flags, _hud_draw_disabled_bit, FALSE);
-		SET_FLAG(
-			flags,
-			_hud_draw_in_multiplayer_bit,
-			local_player_count() > 1);
-		state_flags[5] = flags;
+			flags = state_flags[5];
+			SET_FLAG(
+				flags,
+				_hud_draw_flashing_bit,
+				weapon_state->magazines[1].rounds_loaded <= cutoffs->loaded_ammo &&
+					!weapon_state->magazines[1].reloading);
+			SET_FLAG(flags, _hud_draw_disabled_bit, FALSE);
+			SET_FLAG(
+				flags,
+				_hud_draw_in_multiplayer_bit,
+				local_player_count() > 1);
+			state_flags[5] = flags;
+		}
+		else
+		{
+			state_flags[4] = local_player_count() > 1 ? FLAG(_hud_draw_in_multiplayer_bit) : 0;
+			state_flags[5] = state_flags[4];
+		}
 
 		for (state_index = 0;
 			state_index < NUMBER_OF_WEAPON_HUD_FLASH_REFERENCES;
@@ -1515,7 +1627,9 @@ static void render_weapon_hud(
 		SET_FLAG(flags, _weapon_overlay_on_always_bit, TRUE);
 		overlay_flags[3] = flags;
 
-		flags = overlay_flags[0];
+		/* port: the secondary magazine's overlays are 4 and 5, as its states
+		and numbers are: these wrote over the primary's 0 and 1 */
+		flags = overlay_flags[4];
 		SET_FLAG(
 			flags,
 			_weapon_overlay_on_flashing_bit,
@@ -1534,9 +1648,9 @@ static void render_weapon_hud(
 			_weapon_overlay_on_default_bit,
 			flags == 0);
 		SET_FLAG(flags, _weapon_overlay_on_always_bit, TRUE);
-		overlay_flags[0] = flags;
+		overlay_flags[4] = flags;
 
-		flags = overlay_flags[1];
+		flags = overlay_flags[5];
 		SET_FLAG(
 			flags,
 			_weapon_overlay_on_flashing_bit,
@@ -1554,7 +1668,11 @@ static void render_weapon_hud(
 			_weapon_overlay_on_default_bit,
 			flags == 0);
 		SET_FLAG(flags, _weapon_overlay_on_always_bit, TRUE);
-		overlay_flags[1] = flags;
+		overlay_flags[5] = flags;
+		/* port: a weapon without a second magazine draws none of its overlays,
+		as the Xbox never set these (its states above none either) */
+		if (weapon_state->magazine_count < 2)
+			overlay_flags[4] = overlay_flags[5] = 0;
 
 		number_values[0] = weapon_state->magazines[0].rounds_remaining;
 		number_values[1] = weapon_state->magazines[0].rounds_loaded;
@@ -1633,7 +1751,8 @@ static void render_weapon_hud(
 			struct weapon_hud_static_element);
 
 		if (!TEST_FLAG(element->header.runtime_flags, _hud_element_runtime_invalid_bit) &&
-			TEST_FLAG(map_type_flags, element->header.use_on_map_type))
+			TEST_FLAG(map_type_flags, element->header.use_on_map_type) &&
+			weapon_hud_state_index_valid(element->header.state_type, NUMBER_OF_WEAPON_HUD_FLASH_REFERENCES))
 		{
 			/* (the zoomed view's, at the middle: hud_zoomed_layout_begin) */
 			rectangle2d window_bounds;
@@ -1663,7 +1782,8 @@ static void render_weapon_hud(
 			struct weapon_hud_meter_element);
 
 		if (!TEST_FLAG(element->header.runtime_flags, _hud_element_runtime_invalid_bit) &&
-			TEST_FLAG(map_type_flags, element->header.use_on_map_type))
+			TEST_FLAG(map_type_flags, element->header.use_on_map_type) &&
+			weapon_hud_state_index_valid(element->header.state_type, NUMBER_OF_WEAPON_HUD_FLASH_REFERENCES))
 		{
 			byte value;
 			rectangle2d window_bounds;
@@ -1698,7 +1818,8 @@ static void render_weapon_hud(
 			struct weapon_hud_number_element);
 
 		if (!TEST_FLAG(element->header.runtime_flags, _hud_element_runtime_invalid_bit) &&
-			TEST_FLAG(map_type_flags, element->header.use_on_map_type))
+			TEST_FLAG(map_type_flags, element->header.use_on_map_type) &&
+			weapon_hud_state_index_valid(element->header.state_type, NUMBER_OF_WEAPON_HUD_FLASH_REFERENCES))
 		{
 			short magazine_size = 1;
 			short value;
@@ -1717,6 +1838,10 @@ static void render_weapon_hud(
 						struct weapon_magazine_definition);
 
 				magazine_size = magazine->rounds_loaded_maximum;
+				/* port: the map's; a magazine of none divides by one (an
+				integer divide by zero halts) */
+				if (magazine_size == 0)
+					magazine_size = 1;
 			}
 
 			state_index = element->header.state_type;
@@ -1771,7 +1896,8 @@ static void render_weapon_hud(
 			struct weapon_hud_overlays_element);
 
 		if (!TEST_FLAG(element->runtime_flags, _hud_element_runtime_invalid_bit) &&
-			TEST_FLAG(map_type_flags, element->use_on_map_type))
+			TEST_FLAG(map_type_flags, element->use_on_map_type) &&
+			weapon_hud_state_index_valid(element->state_type, NUMBER_OF_WEAPON_HUD_FLASH_REFERENCES))
 		{
 			state_index = element->state_type;
 			hud_draw_weapon_overlays(

@@ -159,6 +159,17 @@ static struct rasterizer_vertex_shader_runtime_globals vertex_shader_runtime_glo
 
 /* ---------- public code */
 
+/* port: the vertex shader the device has is no longer known (the loading
+screen set the fixed-function pipeline itself: progress_bar.c,
+rasterizer_forget_hardware_state); the next permutation set is selected */
+void rasterizer_vertex_shader_runtime_forget(
+	void)
+{
+	vertex_shader_runtime_globals.current_vertex_shader_index = NONE;
+
+	return;
+}
+
 void rasterizer_set_vertex_shader_permutation(
 	short vertex_shader_index,
 	short vertex_type,
@@ -219,6 +230,30 @@ void rasterizer_set_vertex_shader_permutation(
 			876,
 			FALSE,
 			"### ERROR unsupported vertex shader");
+	}
+
+	/* port: a shader, vertex type and permutation the tables have (the type
+	and permutation can be a map's), before the asserts read the table; the
+	current shader stays, said once */
+	if (!translation_table ||
+		!VALID_INDEX(vertex_type, NUMBER_OF_RASTERIZER_VERTEX_TYPES) ||
+		!VALID_INDEX(permutation_index, permutation_count) ||
+		translation_table[vertex_type * permutation_count + permutation_index] == NONE)
+	{
+		static boolean reported = FALSE;
+
+		if (!reported)
+		{
+			error(
+				_error_silent,
+				"### ERROR no vertex shader #%d for vertex type #%d permutation #%d; it is not set",
+				vertex_shader_index,
+				vertex_type,
+				permutation_index);
+			reported = TRUE;
+		}
+
+		return;
 	}
 
 	match_assert(

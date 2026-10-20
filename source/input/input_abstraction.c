@@ -68,6 +68,7 @@ symbols in this file:
 #include "scenario/scenario.h"
 #include "units/vehicle_definitions.h"
 #include "units/vehicles.h"
+#include "halo_keyboard.h" /* port */
 
 /* ---------- constants */
 
@@ -179,6 +180,205 @@ static real const stick_direction_angles[] =
 	-STICK_DIAGONAL_ANGLE,
 	-STICK_SECOND_QUADRANT_DIAGONAL_ANGLE,
 };
+
+/* port: the keyboard and mouse's own controls (port/linux/include/
+halo_keyboard.h): the actions held, taken as the controller's game controls
+(held for as many ticks as input_xbox.c counts a button), its movement, and
+reloading; Start and Back they press on the controller itself */
+static signed char const keyboard_game_controls[NUMBER_OF_GAME_CONTROLS] =
+{
+	HALO_KEYBOARD_JUMP,
+	HALO_KEYBOARD_SWITCH_GRENADE,
+	HALO_KEYBOARD_ACTION,
+	HALO_KEYBOARD_SWITCH_WEAPON,
+	HALO_KEYBOARD_MELEE,
+	HALO_KEYBOARD_FLASHLIGHT,
+	HALO_KEYBOARD_THROW_GRENADE,
+	HALO_KEYBOARD_FIRE,
+	-1,
+	-1,
+	HALO_KEYBOARD_CROUCH,
+	HALO_KEYBOARD_ZOOM,
+};
+
+static struct
+{
+	byte ticks[NUMBER_OF_GAME_CONTROLS];
+	long down_times[NUMBER_OF_GAME_CONTROLS];
+	byte reload_ticks;
+	long reload_down_time;
+} keyboard_controls[MAXIMUM_GAMEPADS];
+
+static void keyboard_hold_ticks(
+	byte *ticks,
+	long *down_time,
+	boolean down)
+{
+	long now = (long)system_milliseconds();
+
+	if (!down)
+	{
+		*ticks = 0;
+	}
+	else if (*ticks == 0)
+	{
+		*ticks = 1;
+		*down_time = now;
+	}
+	else
+	{
+		long held = now - *down_time;
+
+		held = held < 0 ? 0 : MIN(held, (long)UNSIGNED_CHAR_MAX * 1000 / TICKS_PER_SECOND);
+		*ticks = (byte)PIN(1 + held * TICKS_PER_SECOND / 1000, 2, UNSIGNED_CHAR_MAX);
+	}
+	return;
+}
+
+static void keyboard_controls_update(
+	long controller_index,
+	struct game_input_state *state)
+{
+	unsigned long held = halo_keyboard_actions((short)controller_index);
+	long control_index;
+	long x, y;
+
+	for (control_index = 0; control_index < NUMBER_OF_GAME_CONTROLS; control_index++)
+	{
+		if (keyboard_game_controls[control_index] < 0)
+			continue;
+		keyboard_hold_ticks(
+			&keyboard_controls[controller_index].ticks[control_index],
+			&keyboard_controls[controller_index].down_times[control_index],
+			TEST_FLAG(held, keyboard_game_controls[control_index]));
+		state->buttons[control_index] = MAX(state->buttons[control_index],
+			keyboard_controls[controller_index].ticks[control_index]);
+	}
+	keyboard_hold_ticks(
+		&keyboard_controls[controller_index].reload_ticks,
+		&keyboard_controls[controller_index].reload_down_time,
+		TEST_FLAG(held, HALO_KEYBOARD_RELOAD));
+	x = TEST_FLAG(held, HALO_KEYBOARD_STRAFE_RIGHT) - TEST_FLAG(held, HALO_KEYBOARD_STRAFE_LEFT);
+	y = TEST_FLAG(held, HALO_KEYBOARD_MOVE_FORWARD) - TEST_FLAG(held, HALO_KEYBOARD_MOVE_BACKWARD);
+	if (x || y)
+	{
+		/* (diagonals on the unit circle) */
+		real length = x && y ? 0.70710678f : 1.f;
+
+		/* port: crouched, below the full stick's 0.98 that stands a grounded
+		biped up (player_control.c), as a stick's crouch walk is */
+		if (TEST_FLAG(held, HALO_KEYBOARD_CROUCH))
+			length *= 0.97f;
+
+		state->forward_movement = y * length;
+		state->strafe = -x * length;
+	}
+	{
+		/* port: the touch controls' stick (port/linux/src/xinput_sdl.c)
+		moves the player whatever the profile's sticks do, as the keys do */
+		extern int halo_linux_touch_move(short controller_index, real *forward, real *strafe);
+		real forward;
+		real strafe;
+
+		if (halo_linux_touch_move((short)controller_index, &forward, &strafe))
+		{
+			state->forward_movement = forward;
+			state->strafe = strafe;
+		}
+	}
+	return;
+}
+
+/* port: whether the controller's player holds the keyboard's reload key, and
+for how many ticks its jump key (which skips cutscenes, as the
+controller's A does) */
+boolean input_abstraction_port_reload(
+	short controller_index)
+{
+	return controller_index >= 0 && controller_index < MAXIMUM_GAMEPADS &&
+		keyboard_controls[controller_index].reload_ticks != 0;
+}
+
+boolean input_abstraction_port_action_only(
+	short controller_index)
+{
+	return controller_index >= 0 && controller_index < MAXIMUM_GAMEPADS &&
+		keyboard_controls[controller_index].ticks[_game_control_action] != 0;
+}
+
+byte input_abstraction_port_accept(
+	short controller_index)
+{
+	return controller_index >= 0 && controller_index < MAXIMUM_GAMEPADS ?
+		keyboard_controls[controller_index].ticks[_game_control_jump] : 0;
+}
+
+/* port: how far the controller's player pulls the fire control, which a
+trigger with an analog rate of fire reads (weapons.c): a game input state's
+buttons count the ticks a control is held, not its pressure, so a click
+reads as no pull at all. The keyboard and mouse pull all the way. */
+real input_abstraction_port_primary_trigger(
+	short controller_index)
+{
+	struct gamepad_state const *gamepad;
+	short button_index;
+
+	if (controller_index < 0 || controller_index >= MAXIMUM_GAMEPADS)
+		return 0.f;
+	if (keyboard_controls[controller_index].ticks[_game_control_primary_trigger])
+		return 1.f;
+	gamepad = input_get_gamepad_state(controller_index);
+	if (!gamepad)
+		return 0.f;
+	button_index = input_abstraction_globals.player_control_preferences[controller_index].game_control_to_xbox_buttons[_game_control_primary_trigger];
+	if (button_index < NUMBER_OF_GAMEPAD_ANALOG_BUTTONS)
+		return gamepad->analog_buttons[button_index] * (1.f / 255.f);
+	return gamepad->buttons[button_index] ? 1.f : 0.f;
+}
+
+/* port: the game control on each of the controller's buttons by its
+profile's mapping (NONE for none), numbered as the gamepad's buttons are
+(input.h): the touch controls name their buttons by it (touch_game.c) */
+void input_abstraction_port_button_controls(
+	short controller_index,
+	short *controls)
+{
+	short button_index;
+	short control_index;
+
+	for (button_index = 0; button_index < NUMBER_OF_GAMEPAD_BUTTONS; button_index++)
+	{
+		controls[button_index] = NONE;
+	}
+	if (controller_index < 0 || controller_index >= MAXIMUM_GAMEPADS)
+		return;
+	for (control_index = 0; control_index < NUMBER_OF_GAME_CONTROLS; control_index++)
+	{
+		byte button_index_bound = input_abstraction_globals.player_control_preferences[controller_index].
+			game_control_to_xbox_buttons[control_index];
+
+		if (button_index_bound < NUMBER_OF_GAMEPAD_BUTTONS && controls[button_index_bound] == NONE)
+		{
+			controls[button_index_bound] = control_index;
+		}
+	}
+}
+
+/* port: whether the controller's player looks inverted, as its right stick
+does (input_abstraction_update): its profile's invert, or flying an aircraft
+with its profile's aircraft invert; the touch controls' swipe follows it
+(player_control.c) */
+boolean input_abstraction_port_look_inverted(
+	short controller_index)
+{
+	struct game_input_preferences const *preferences;
+
+	if (controller_index < 0 || controller_index >= MAXIMUM_GAMEPADS)
+		return FALSE;
+	preferences = &input_abstraction_globals.player_control_preferences[controller_index];
+	return preferences->invert_look ||
+		(preferences->invert_look_aircraft_control && local_player_is_piloting_aircraft(controller_index));
+}
 
 /* ---------- public code */
 
@@ -553,6 +753,7 @@ void input_abstraction_update(
 					error(_error_silent, "unknown joystick preset");
 					break;
 			}
+			keyboard_controls_update(controller_index, state);
 			input_abstraction_globals.controller_available[controller_index] = TRUE;
 		}
 		else

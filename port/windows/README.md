@@ -28,7 +28,25 @@ You do not need the Xbox SDK.
 2. Enter `python configure.py`.
 3. Enter `ninja windows`.
 
-`configure.py` generates the Windows build only on Windows.
+`configure.py` generates the Windows build only on Windows, and with
+`--windows-cross`, which cross-compiles it from Linux: the same clang and
+lld build against an MSVC toolchain, whose directories
+`--windows-vctools-dir` (the versioned folder under `VC/Tools/MSVC`, the
+one with `include` and `lib`) and `--windows-sdk-dir` (the SDK folder with
+`Include` and `Lib`) name, or `VCToolsInstallDir` and `WindowsSdkDir`. The
+build passes them to clang in `INCLUDE` and `LIB`. `--windows-cc` names
+the cross compiler (a run-of-the-mill clang by default).
+
+    python configure.py --windows-cross \
+        --windows-vctools-dir "$VCToolsInstallDir" \
+        --windows-sdk-dir "$WindowsSdkDir"
+    ninja windows
+
+The toolchain can be an [msvc-wine](https://github.com/mstorsjo/msvc-wine)
+install or an unmodified MSVC from a Windows install (from an NTFS volume,
+for instance). The SDK must have a versioned folder in each of `Include`
+and `Lib` (`Include/<version>/um`): a plain `xwin splat` does not, a splat
+made with `xwin splat --use-winsysroot-style` does.
 
 The build uses all the instructions of the processor of the computer that
 builds it (`-march=native`). Such a build does not always start on a
@@ -52,6 +70,8 @@ The game finds the game data as on Linux. Refer to "Start the game" in
 | Settings | `config.toml` next to `halo.exe` |
 | Saved games | `%APPDATA%\halo`, or `paths.saves` in `config.toml` |
 | Log | `debug.txt` in the data root (the folder that contains `maps\`) |
+| Log of the port | The console. The release build has no console: `halo.log` next to `halo.exe` |
+| Crash reports | `crashes\` next to `halo.exe`, until the game sends them |
 
 ## How the port operates
 
@@ -86,7 +106,8 @@ These files use only the Windows SDK:
 | --- | --- |
 | `src/win32_files.c`, `src/win32_net.c` | The file and socket functions of `port/linux/src/posix.h`. |
 | `src/win32_posix.c` | The POSIX functions on Windows threads, critical sections, condition variables, `VirtualAlloc` and the performance counter. |
-| `src/win32_memory_watch.c` | The write tracking of textures, with a vectored exception handler. It also writes reports of crashes. |
+| `src/win32_memory_watch.c` | The write tracking of textures, with a vectored exception handler. |
+| `src/win32_crash.c` | The crash reports. Refer to "Crash reports". |
 
 `port.json` gives the Linux files that these files replace, and the Windows
 libraries of the link.
@@ -107,6 +128,57 @@ prevents this:
 MSVC gives file scope to a structure tag in a prototype. clang does not.
 Thus the build also includes the declarations of the Linux build
 (`build/windows/halo_msvc_tags.h`).
+
+## Crash reports
+
+A crash writes the faulting address and the calls that led to it to
+`debug.txt` and to the log. The builds of the workflow (the releases)
+also send a crash report to the Sentry project of the developers:
+
+1. The game starts a second copy of `halo.exe` (`halo.exe --crash-report`).
+   This copy writes a minidump of the game to `crashes\` next to
+   `halo.exe`, and the game stops. A minidump contains the stacks and the
+   registers of the threads, and the list of the modules. It does not
+   contain the other memory of the game.
+2. At the first crash, the copy asks the player whether to send crash
+   reports. `crash_reports.upload` in `config.toml` keeps the answer:
+   `"yes"` sends this report and all the reports after it, and `"no"` sends
+   no reports and does not ask again. The answer `"no"` deletes the
+   minidump.
+3. The copy sends the minidump and a copy of `halo.log` to Sentry, then
+   deletes them. If it cannot send them (for example, with no network
+   connection), the game sends them when it starts the next time
+   (`halo.exe --crash-upload`, in the background). `crashes\` keeps at
+   most 8 reports.
+
+Sentry finds the function names and the source lines of the minidump in
+the PDBs (`halo.pdb`, `SDL3.pdb`). The `release` job of the workflow
+uploads the PDBs and the executables of each build of main to Sentry. This
+needs the `SENTRY_AUTH_TOKEN` secret of the repository: an organization
+auth token from the settings of the Sentry organization (the token gives
+the organization and its region). The `SENTRY_PROJECT` variable of the
+repository can give the slug of the project; without it, the job uses the
+id of the project in the DSN. For a personal token instead, also set the
+`SENTRY_ORG` variable (the slug of the organization) and the `SENTRY_URL`
+variable (`https://de.sentry.io`).
+
+Each release also has the PDBs as `halo-windows-<configuration>-symbols.zip`.
+`tools/symbolize_crash.py` uses them to add the function names and the
+source lines to the crash lines of a `debug.txt` or a `halo.log`:
+
+```
+python tools/symbolize_crash.py debug.txt halo.exe
+```
+
+Give the `halo.exe` of the build that crashed, with its `halo.pdb` next to
+it. The tool needs `llvm-symbolizer` (LLVM).
+
+Builds without a build number (a local build, or a build of a branch other
+than main) send no crash reports. To test the crash reports with such a
+build, set the `HALO_CRASH_REPORTS_ANY_BUILD` environment variable.
+
+The crash reports also include the crashes of `abort()` and of an invalid
+argument to a function of the C runtime.
 
 ## Limits
 

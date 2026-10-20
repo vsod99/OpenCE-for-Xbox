@@ -127,12 +127,19 @@ enum
 	MAXIMUM_SERVER_UPDATES = 32,
 	MAXIMUM_CLIENT_UPDATES = 128,
 
+	/* the host's ticks after a client machine's player's last input that
+	the player's input is held: after them it stands still
+	(update_server_next_update) */
+	DISTRIBUTED_INPUT_SILENCE_TICKS = 10,
+
 	/* the one-shot buttons: they fire on the tick they are first seen and stay latched until released */
 	LATCHED_CONTROL_FLAGS =
 		FLAG(_unit_control_integrated_light_bit) |
 		FLAG(_unit_control_action_bit) |
 		FLAG(_unit_control_use_equipment_bit) |
-		FLAG(_unit_control_weapon_reload_bit),
+		FLAG(_unit_control_weapon_reload_bit) |
+		/* port: latched with the action it goes with (units.h) */
+		FLAG(UNIT_CONTROL_PORT_ACTION_ONLY_BIT),
 };
 
 /* ---------- macros */
@@ -253,11 +260,13 @@ static struct
 } update_client_relayed_actions[MAXIMUM_NUMBER_OF_PLAYERS];
 
 /* ... the host: the last tick of each client machine's player's it has
-had (their buttons of that tick and before it are in) */
+had (their buttons of that tick and before it are in), and the host's game
+time when it had it (update_server_next_update: a machine gone silent) */
 static struct
 {
 	boolean valid;
 	long tick;
+	long received_time;
 } update_server_distributed_inputs[MAXIMUM_NUMBER_OF_PLAYERS];
 
 /* ... a client: each local player's last tick, its action, and the buttons
@@ -347,11 +356,36 @@ void update_server_start(
 	return;
 }
 
+/* port: a player's queue is at its player's index, and the slot of a player
+who left the game is reused (network_game_spawn_player): that player's queue
+goes first, which datum_new_at_index would find in the way. The same player
+added again keeps its queue. TRUE when the slot is the player's already */
+static boolean update_queue_make_room(
+	struct data_array *queues,
+	long player_index)
+{
+	short absolute_index = (short)player_index;
+	struct datum_header *header;
+
+	if (absolute_index < 0 || absolute_index >= queues->maximum_count)
+		return FALSE;
+	header = (struct datum_header *)((byte *)queues->data + queues->size * absolute_index);
+	if (!header->identifier)
+		return FALSE;
+	if (header->identifier == (short)(player_index >> 16))
+		return TRUE;
+	datum_delete(queues, (long)header->identifier << 16 | (unsigned short)absolute_index);
+
+	return FALSE;
+}
+
 void update_server_add_player(
 	long player_index)
 {
 	long queue_index;
 
+	if (update_queue_make_room(update_server_globals.queues, player_index))
+		return;
 	queue_index = datum_new_at_index(update_server_globals.queues, player_index);
 	match_assert(
 		"c:\\halo\\SOURCE\\game\\player_queues_new.c",
@@ -411,6 +445,23 @@ void update_server_next_update(
 			sizeof(struct player_action));
 		update->update.actions[queue_index].control_flags |= update_server_pending_control_flags[queue_index];
 		update_server_pending_control_flags[queue_index] = 0;
+		/* port: a client machine's player whose input has stopped coming
+		(its network lost, until the host drops it) stands still, its
+		buttons and trigger let go, where it faces: its last input held
+		would walk it off a ledge, or empty its weapon. (A datagram or two
+		lost is not that: the last input is held a third of a second.) */
+		if (update_server_distributed_inputs[queue_index].valid &&
+			game_time_initialized() &&
+			game_time_get() - update_server_distributed_inputs[queue_index].received_time >
+				DISTRIBUTED_INPUT_SILENCE_TICKS)
+		{
+			struct player_action *action = &update->update.actions[queue_index];
+
+			action->throttle.i = 0.f;
+			action->throttle.j = 0.f;
+			action->primary_trigger = 0.f;
+			action->control_flags = 0;
+		}
 		update->update.action_count += 1;
 	}
 	update_client_handle_server_update(&update->update, update_number);
@@ -532,6 +583,8 @@ void update_client_add_player(
 {
 	long queue_index;
 
+	if (update_queue_make_room(update_client_globals.queues, player_index))
+		return;
 	queue_index = datum_new_at_index(update_client_globals.queues, player_index);
 	match_assert(
 		"c:\\halo\\SOURCE\\game\\player_queues_new.c",
@@ -968,11 +1021,15 @@ void update_queues_reset_and_fill_with_lies(
 	}
 	if (update_server_globals.initialized)
 	{
+		struct data_iterator iterator;
 		struct update_server_queue_datum *queue;
 
 		update_server_start();
-		queue = datum_get(update_server_globals.queues, 0);
-		queue->next_update_number = update_server_globals.next_update_number_to_build;
+		/* port: co-op player slots can have gaps, including slot zero.
+		Reset every live queue after a checkpoint load, not just slot zero. */
+		data_iterator_new(&iterator, update_server_globals.queues);
+		while ((queue = data_iterator_next(&iterator)) != NULL)
+			queue->next_update_number = update_server_globals.next_update_number_to_build;
 	}
 	else if (update_client_globals.initialized)
 	{
@@ -1079,6 +1136,8 @@ void update_server_handle_distributed_input(
 	{
 		return;
 	}
+	update_server_distributed_inputs[absolute_index].received_time =
+		game_time_initialized() ? game_time_get() : 0;
 	queue->current_action = *action;
 }
 

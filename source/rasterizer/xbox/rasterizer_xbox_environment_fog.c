@@ -138,6 +138,7 @@ symbols in this file:
 #include "rasterizer/rasterizer_model_types.h"
 #include "rasterizer/rasterizer_transparent_geometry.h"
 #include "render/render.h"
+#include "view_fov.h" /* port: port/linux/game/view_fov.c */
 #include "shaders/shader_definitions.h"
 #include "shaders/shaders.h"
 #include <stddef.h>
@@ -177,11 +178,6 @@ enum
 enum
 {
 	MAXIMUM_ATMOSPHERE_DOMINANT_WARNINGS = 20,
-};
-
-enum
-{
-	NUMBER_OF_PIXEL_SHADER_STAGES = 8,
 };
 
 enum
@@ -389,6 +385,8 @@ static boolean fog_screen_active[MAXIMUM_WINDOWS] = {0};
 static unsigned __int64 last_frame_index[MAXIMUM_WINDOWS] = {0};
 static short atmosphere_dominant_warning_count = 0;
 static boolean reported_bad_animation_index = FALSE;
+/* port: said once */
+static boolean reported_fog_screen_without_bitmaps = FALSE;
 static struct rasterizer_model_begin_parameters const *model = NULL;
 static boolean model_parameters_cached = FALSE;
 static struct render_lighting const *cached_lighting = NULL;
@@ -398,6 +396,8 @@ static boolean local_fog_screen_first_time = TRUE;
 
 static boolean rasterizer_environment_fog_screen_is_active(
 	void);
+static boolean rasterizer_environment_fog_screen_layer_count_valid(
+	struct fog_screen const *screen);
 static void rasterizer_environment_fog_screen_wind_update(
 	struct fog_screen const *screen,
 	struct rasterizer_environment_fog_screen_wind *wind);
@@ -762,6 +762,30 @@ boolean local_random_boolean(
 	return local_random() > 0x8000;
 }
 
+/* port: a fog screen with no more layers than the layer arrays hold (a map's
+count); one with more isn't drawn, said once */
+static boolean rasterizer_environment_fog_screen_layer_count_valid(
+	struct fog_screen const *screen)
+{
+	static boolean reported = FALSE;
+
+	if (screen->layer_count<=MAXIMUM_ENVIRONMENT_FOG_SCREEN_LAYERS)
+	{
+		return TRUE;
+	}
+	if (!reported)
+	{
+		error(
+			_error_silent,
+			"### ERROR fog screen has %d layers (max=#%d); it is not drawn",
+			screen->layer_count,
+			MAXIMUM_ENVIRONMENT_FOG_SCREEN_LAYERS);
+		reported = TRUE;
+	}
+
+	return FALSE;
+}
+
 static boolean rasterizer_environment_fog_screen_is_active(
 	void)
 {
@@ -785,6 +809,7 @@ static boolean rasterizer_environment_fog_screen_is_active(
 				global_window_parameters.rasterizer_target == _rasterizer_target_render_primary &&
 				(screen = global_window_parameters.fog.screen) != NULL &&
 				screen->layer_count > 0 &&
+				rasterizer_environment_fog_screen_layer_count_valid(screen) &&
 				screen->map.index != NONE &&
 				screen->far_distance != 0.0f &&
 				screen->far_density != 0.0f &&
@@ -1119,6 +1144,18 @@ void _rasterizer_environment_fog_screen_begin(
 					"c:\\halo\\SOURCE\\rasterizer\\xbox\\rasterizer_xbox_environment_fog.c",
 					653,
 					bitmap_group && bitmap_group->bitmaps.count>0);
+				/* port: a map with no bitmaps has no frame to pick (it divided by
+				zero); the screen isn't drawn, as on a base z failure */
+				if (bitmap_group->bitmaps.count<=0)
+				{
+					if (!reported_fog_screen_without_bitmaps)
+					{
+						error(_error_silent, "### ERROR fog screen map has no bitmaps; it is not drawn");
+						reported_fog_screen_without_bitmaps = TRUE;
+					}
+
+					return;
+				}
 
 				if (screen->animation_period != 0.0f)
 				{
@@ -1284,7 +1321,14 @@ void _rasterizer_environment_fog_screen_begin(
 		{
 			boolean success;
 			boolean clear_z_buffer;
+			boolean stick_to_drawn_surface;
 			real vsh_constants__texscale[VSH_CONSTANTS__TEXSCALE_COUNT][4];
+
+			/* port: at the stock field of view the redrawn canopy lands on the
+			canopy. At any other angle, less or equal still accepts that
+			redraw where it has slid onto the sky */
+			stick_to_drawn_surface =
+				render_fov_reticle_scale(render.local_player_index) != 1.0f;
 
 			if (pass == 0)
 			{
@@ -1308,6 +1352,8 @@ void _rasterizer_environment_fog_screen_begin(
 			{
 				clear_z_buffer = FALSE;
 			}
+			if (stick_to_drawn_surface)
+				clear_z_buffer = FALSE;
 
 			success = IDirect3DDevice8_Clear(
 				global_d3d_device,
@@ -1324,7 +1370,7 @@ void _rasterizer_environment_fog_screen_begin(
 			IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ALPHATESTENABLE, FALSE);
 			IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ZENABLE, TRUE);
 			IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ZFUNC,
-				pass != 0 ? D3DCMP_EQUAL : D3DCMP_LESSEQUAL);
+				pass != 0 || stick_to_drawn_surface ? D3DCMP_EQUAL : D3DCMP_LESSEQUAL);
 			IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ZWRITEENABLE, pass == 0);
 			IDirect3DDevice8_SetRenderState(global_d3d_device, D3DRS_ZBIAS, 0);
 

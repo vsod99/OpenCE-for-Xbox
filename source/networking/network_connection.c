@@ -212,6 +212,7 @@ symbols in this file:
 #include "bungie_net/network/transport_endpoint_winsock.h"
 #include "memory/circular_queue.h"
 #include "network_connection.h"
+#include "networking/network_messages.h" /* port: NETWORK_GAME_CLIENT_PORT */
 
 /* ---------- constants */
 
@@ -226,9 +227,16 @@ enum
 	/* the per-tick update of 128 players is 3,857 bytes */
 	RELIABLE_MESSAGE_MAXIMUM_SIZE = HALO_PORT_MAXIMUM_NETWORK_MESSAGE_SIZE,
 	/* how long what a stream write could not send waits for a peer that is
-	not reading */
-	NETWORK_CONNECTION_WRITE_TIMEOUT = 2000,
+	not reading: as long as a host waits for a machine it hears nothing from
+	(NETWORK_GAME_SERVER_CLIENT_TIMEOUT), so that a machine whose network
+	stops for a while is not dropped sooner for the state sent to it while
+	it could not take it (the outgoing queue holds that, and a peer that
+	overflows it is dropped at once) */
+	NETWORK_CONNECTION_WRITE_TIMEOUT = 15000,
 	MAXIMUM_RESERVED_NETWORK_PORT = 1023,
+	/* datagrams that could not be read (too large, or empty) skipped in a
+	frame before the rest wait for the next */
+	MAXIMUM_SKIPPED_DATAGRAMS_PER_IDLE = 64,
 	_transport_type_udp = 0x11,
 	_transport_type_tcp,
 	_connection_closed_bit = 4,
@@ -291,6 +299,10 @@ struct network_server_connection
 	boolean allow_client_connections;
 };
 
+/* port: what the unreliable queue keeps after each datagram: its source's
+IPv4 address and port */
+#define DATAGRAM_SOURCE_SIZE (sizeof(unsigned long) + sizeof(word))
+
 /* ---------- prototypes */
 
 static boolean network_client_reliable_connection_read(
@@ -298,6 +310,10 @@ static boolean network_client_reliable_connection_read(
 	void *message,
 	word *buffer_size,
 	struct transport_address *source_address);
+/* port: (below) */
+static word network_connection_datagram_port(
+	struct network_connection *connection,
+	word well_known_port);
 static struct network_connection *network_connection_create_client_from_endpoint(
 	struct transport_endpoint *reliable_endpoint);
 static boolean network_connection_idle_client_reliable_endpoint(
@@ -319,6 +335,8 @@ static boolean network_connection_write_reliable(
 	void const *message,
 	word buffer_size);
 static boolean network_connection_flush_reliable(
+	struct network_connection *connection);
+static void network_connection_flush_reliable_last(
 	struct network_connection *connection);
 static long network_connection_datagram_size(
 	byte const *datagram);
@@ -477,6 +495,15 @@ boolean network_connection_connect(
 		return FALSE;
 	}
 	success = TRUE;
+	/* port: a connection made is open, whatever came before it. A write
+	made before connecting (while searching for games, to no socket yet)
+	marked it closed, and every write of the join request then failed. */
+	SET_FLAG(connection->flags, _connection_closed_bit, FALSE);
+	SET_FLAG(connection->flags, _connection_going_stale_bit, FALSE);
+	if (connection->reliable_outgoing_queue)
+	{
+		circular_queue_reset(connection->reliable_outgoing_queue);
+	}
 
 	if (connection->unreliable_endpoint)
 	{
@@ -497,6 +524,7 @@ boolean network_connection_connect(
 
 	if (connection->reliable_endpoint)
 	{
+		connection->reliable_address_valid = FALSE;
 		if (process_reference)
 		{
 			result = connect_endpoint_async(connection->reliable_endpoint, remote_address, process_reference);
@@ -520,6 +548,20 @@ boolean network_connection_connect(
 					transport_error_to_string(result));
 				return FALSE;
 			}
+			/* port: connect_endpoint leaves the stream blocking; a write the
+			host is not taking waits in the outgoing queue instead
+			(network_connection_write_reliable), and reads go on until the
+			stream has no more (network_connection_idle_client_reliable_endpoint) */
+			if (set_endpoint_blocking(connection->reliable_endpoint, FALSE) != _transport_error_none)
+			{
+				error(2, "could not make the reliable endpoint non-blocking");
+				return FALSE;
+			}
+			/* (the host's address, which every message read from the stream
+			is from, found once) */
+			connection->reliable_address_valid = get_endpoint_address(
+				connection->reliable_endpoint,
+				&connection->reliable_address) == _transport_error_none;
 		}
 	}
 
@@ -595,6 +637,9 @@ static boolean network_client_unreliable_connection_read(
 {
 	message_header header;
 	unsigned long source_ipv4_address;
+	/* port: the datagram's source port, kept after its address
+	(DATAGRAM_SOURCE_SIZE) */
+	word source_port;
 	word message_size;
 
 	match_assert(
@@ -638,9 +683,11 @@ static boolean network_client_unreliable_connection_read(
 				message_size,
 				*buffer_size);
 		}
-		else if (message_size + sizeof(source_ipv4_address) <= (unsigned long)circular_queue_size(connection->unreliable_incoming_queue) &&
+		/* port: and its source port (DATAGRAM_SOURCE_SIZE) */
+		else if (message_size + DATAGRAM_SOURCE_SIZE <= (unsigned long)circular_queue_size(connection->unreliable_incoming_queue) &&
 			circular_queue_dequeue_data(connection->unreliable_incoming_queue, message, message_size, TRUE) &&
-			circular_queue_dequeue_data(connection->unreliable_incoming_queue, &source_ipv4_address, sizeof(source_ipv4_address), TRUE))
+			circular_queue_dequeue_data(connection->unreliable_incoming_queue, &source_ipv4_address, sizeof(source_ipv4_address), TRUE) &&
+			circular_queue_dequeue_data(connection->unreliable_incoming_queue, &source_port, sizeof(source_port), TRUE))
 		{
 			*(message_header *)message = header;
 			match_vassert(
@@ -651,7 +698,8 @@ static boolean network_client_unreliable_connection_read(
 			if (source_address)
 			{
 				source_address->address.long_words[0] = source_ipv4_address;
-				source_address->port = 0;
+				/* port: the port kept, where the Xbox had 0 */
+				source_address->port = source_port;
 				source_address->address_length = IPV4_ADDRESS_LENGTH;
 			}
 			*buffer_size = message_size;
@@ -694,8 +742,8 @@ void network_connection_delete(
 			connection);
 		if (connection->reliable_outgoing_queue)
 		{
-			/* (what the peer will take now of what waits: its last messages) */
-			network_connection_flush_reliable(connection);
+			/* (what the peer will take of what waits: its last messages) */
+			network_connection_flush_reliable_last(connection);
 			circular_queue_delete(connection->reliable_outgoing_queue);
 		}
 		if (connection->reliable_endpoint)
@@ -945,7 +993,13 @@ static struct network_connection *network_connection_create_client_from_endpoint
 		TRUE,
 		"c:\\halo\\SOURCE\\networking\\network_connection.c",
 		0x347);
-	if (connection)
+	/* port: the endpoint deleted with a connection not made (as it is when
+	its queue is not) */
+	if (!connection)
+	{
+		delete_transport_endpoint(reliable_endpoint);
+	}
+	else
 	{
 		connection->flags = FLAG(_connection_create_serverside_client_bit);
 		connection->reliable_endpoint = reliable_endpoint;
@@ -991,7 +1045,13 @@ static boolean network_connection_idle_client_reliable_endpoint(
 		connection->reliable_incoming_queue);
 
 	free_space = circular_queue_free_space(connection->reliable_incoming_queue);
-	while (success && endpoint_readable(connection->reliable_endpoint, 0) && free_space > 0)
+	/* (port: a connected stream that does not block is read until it has no
+	more, without a select() before each read) */
+	while (success &&
+		free_space > 0 &&
+		(((boolean)endpoint_connected(connection->reliable_endpoint) &&
+			!endpoint_blocking(connection->reliable_endpoint)) ||
+			endpoint_readable(connection->reliable_endpoint, 0)))
 	{
 		long bytes_read;
 
@@ -1151,7 +1211,9 @@ struct network_connection *network_connection_new(
 
 			address.address_length = IPV4_ADDRESS_LENGTH;
 			address.address.long_words[0] = 0;
-			address.port = well_known_port;
+			/* port: a client's free port, if another game has the client
+			port (network_connection_datagram_port) */
+			address.port = network_connection_datagram_port(connection, well_known_port);
 			connection->well_known_port = well_known_port;
 			if (bind_endpoint(connection->unreliable_endpoint, &address) ||
 				set_endpoint_blocking(connection->unreliable_endpoint, FALSE))
@@ -1197,6 +1259,22 @@ struct network_connection *network_connection_new(
 	}
 
 	return connection;
+}
+
+/* port: a client binds any free port when another game on this computer
+already has the client port. SO_REUSEADDR would let both bind it, and
+Windows would deliver the host's datagrams to only one of them. */
+static word network_connection_datagram_port(
+	struct network_connection *connection,
+	word well_known_port)
+{
+	if (TEST_FLAG(connection->flags, _connection_create_clientside_client_bit) &&
+		transport_udp_port_taken(well_known_port))
+	{
+		network_event("the client port %d is another game's; listening on another", well_known_port);
+		return 0;
+	}
+	return well_known_port;
 }
 
 static boolean network_client_reliable_connection_read(
@@ -1254,6 +1332,13 @@ static boolean network_client_reliable_connection_read(
 				*buffer_size);
 			close_connection = TRUE;
 		}
+		/* port: a message marked encrypted, which the game never sends
+		(anyone may: the assert below halted a debug build) */
+		else if (TEST_FLAG(header, 0))
+		{
+			error(_error_silent, "got a message marked encrypted; closing the connection");
+			close_connection = TRUE;
+		}
 		else if (message_size <= circular_queue_size(connection->reliable_incoming_queue) &&
 			circular_queue_dequeue_data(connection->reliable_incoming_queue, message, message_size, TRUE))
 		{
@@ -1263,10 +1348,10 @@ static boolean network_client_reliable_connection_read(
 				0x394,
 				!TEST_FLAG(header, 0),
 				"encryption should not be active");
-			if (source_address && get_endpoint_address(connection->reliable_endpoint, source_address))
+			if (source_address)
 			{
-				memset(source_address, 0, sizeof(*source_address));
-				source_address->address_length = IPV4_ADDRESS_LENGTH;
+				/* (the peer's, found when the stream connected) */
+				network_connection_get_address(connection, source_address, NULL);
 			}
 			*buffer_size = message_size;
 			success = TRUE;
@@ -1282,6 +1367,8 @@ static boolean network_client_reliable_connection_read(
 
 	return success;
 }
+
+static boolean network_connection_last_read_unreliable;
 
 boolean network_connection_read(
 	struct network_connection *connection,
@@ -1303,12 +1390,23 @@ boolean network_connection_read(
 		connection->flags&FLAG(_connection_create_serverside_client_bit));
 
 	result = network_client_reliable_connection_read(connection, buffer, buffer_size, source_address);
+	network_connection_last_read_unreliable = FALSE;
 	if (!result && TEST_FLAG(connection->flags, _connection_create_clientside_client_bit))
 	{
 		result = network_client_unreliable_connection_read(connection, buffer, buffer_size, source_address);
+		network_connection_last_read_unreliable = result;
 	}
 
 	return result;
+}
+
+/* port: whether the message network_connection_read last gave a client came
+in a datagram (which anyone can send as the host) rather than over its
+connection to the host */
+boolean network_connection_last_read_was_unreliable(
+	void)
+{
+	return network_connection_last_read_unreliable;
 }
 
 boolean network_server_close_client_connection(
@@ -1375,8 +1473,31 @@ boolean network_connection_disconnect(
 		{
 			network_connection_idle_client_reliable_endpoint(connection);
 		}
-		network_connection_flush_reliable(connection);
+		network_connection_flush_reliable_last(connection);
+	}
+	/* (port: and a stream that was lost, whose socket stays until then; the
+	next connection makes a new one) */
+	if (connection->reliable_endpoint &&
+		(connection->flags & (FLAG(_connection_create_clientside_client_bit) | FLAG(_connection_create_serverside_client_bit))))
+	{
+		/* (blocking again first, as connect_endpoint expects of the
+		endpoint: it keeps a non-blocking one's new socket blocking, and
+		waits on its connect() without its own timeout) */
+		if (!endpoint_blocking(connection->reliable_endpoint))
+		{
+			set_endpoint_blocking(connection->reliable_endpoint, TRUE);
+		}
 		disconnect_endpoint(connection->reliable_endpoint);
+	}
+	connection->reliable_address_valid = FALSE;
+	/* (and the connection is open again, with nothing of the last one:
+	port) */
+	SET_FLAG(connection->flags, _connection_closed_bit, FALSE);
+	SET_FLAG(connection->flags, _connection_going_stale_bit, FALSE);
+	connection->last_keep_alive_time = system_milliseconds();
+	if (connection->unreliable_incoming_queue)
+	{
+		circular_queue_reset(connection->unreliable_incoming_queue);
 	}
 	/* (the next stream starts afresh) */
 	if (connection->reliable_outgoing_queue)
@@ -1396,9 +1517,10 @@ boolean network_connection_disconnect(
 
 		address.address_length = IPV4_ADDRESS_LENGTH;
 		address.address.ipv4_address = 0;
-		address.port = connection->well_known_port;
-
 		delete_transport_endpoint(connection->unreliable_endpoint);
+		/* port: (network_connection_datagram_port, once the old endpoint
+		let the port go) */
+		address.port = network_connection_datagram_port(connection, connection->well_known_port);
 		connection->unreliable_address_valid = FALSE;
 		connection->unreliable_endpoint = create_transport_endpoint(_transport_type_udp);
 		success = connection->unreliable_endpoint &&
@@ -1447,34 +1569,35 @@ static boolean network_connection_idle_server_reliable_endpoint(
 			{
 				if (endpoint == connection->connection.reliable_endpoint)
 				{
+					/* port: a client's place in the list (a client whose
+					stream failed is out of the set, and in the list until the
+					game closes it): with none free, one more is refused, not
+					accepted and let go with its socket */
+					long free_index;
+
+					for (free_index = 0;
+						free_index < NETWORK_CONNECTION_MAXIMUM_CLIENTS && connection->client_list[free_index];
+						free_index++);
 					if (connection->allow_client_connections &&
+						free_index < NETWORK_CONNECTION_MAXIMUM_CLIENTS &&
 						count_endpoints_in_set(connection->endpoint_set) < NETWORK_CONNECTION_MAXIMUM_CLIENTS + 1)
 					{
 						struct transport_endpoint *accepted_endpoint = accept_endpoint(endpoint);
 						struct network_connection *client_connection = NULL;
 
 						if (accepted_endpoint &&
-							set_endpoint_blocking(accepted_endpoint, FALSE) == _transport_error_none)
+							set_endpoint_blocking(accepted_endpoint, FALSE) != _transport_error_none)
 						{
-							client_connection = network_connection_create_client_from_endpoint(accepted_endpoint);
+							delete_transport_endpoint(accepted_endpoint);
+							accepted_endpoint = NULL;
 						}
+						/* (which deletes the endpoint if it fails) */
+						if (accepted_endpoint)
+							client_connection = network_connection_create_client_from_endpoint(accepted_endpoint);
 						if (client_connection)
 						{
-							long client_index;
-
-							for (client_index = 0; client_index < NETWORK_CONNECTION_MAXIMUM_CLIENTS; client_index++)
-							{
-								if (!connection->client_list[client_index])
-								{
-									*new_client_connection = client_connection;
-									connection->client_list[client_index] = client_connection;
-									break;
-								}
-							}
-							if (client_index >= NETWORK_CONNECTION_MAXIMUM_CLIENTS)
-							{
-								error(_error_silent, "error adding new client");
-							}
+							*new_client_connection = client_connection;
+							connection->client_list[free_index] = client_connection;
 						}
 						else
 						{
@@ -1548,7 +1671,8 @@ boolean network_connection_idle(
 	long timeout,
 	struct network_connection **new_client_connection)
 {
-	byte buffer[DATAGRAM_MAXIMUM_SIZE + sizeof(unsigned long)];
+	/* port: room for the source's port too (DATAGRAM_SOURCE_SIZE) */
+	byte buffer[DATAGRAM_MAXIMUM_SIZE + DATAGRAM_SOURCE_SIZE];
 	unsigned long current_time = system_milliseconds();
 	boolean success = TRUE;
 
@@ -1630,9 +1754,13 @@ boolean network_connection_idle(
 	if (success && connection->unreliable_endpoint)
 	{
 		long free_space = circular_queue_free_space(connection->unreliable_incoming_queue);
+		/* port: the datagrams that could not be read, skipped (one too large,
+		or empty, which anyone may send), up to this many a frame */
+		long skipped = 0;
 
 		while (success &&
-			free_space >= DATAGRAM_MAXIMUM_SIZE + sizeof(unsigned long))
+			/* port: (DATAGRAM_SOURCE_SIZE) */
+			free_space >= DATAGRAM_MAXIMUM_SIZE + DATAGRAM_SOURCE_SIZE)
 		{
 			struct transport_address source_address;
 			long buffer_size;
@@ -1676,6 +1804,11 @@ boolean network_connection_idle(
 				"endpoint read buffer overflowed");
 			if (buffer_size <= 0)
 			{
+				if ((buffer_size == 0 || buffer_size == _transport_error_endpoint_io) &&
+					++skipped < MAXIMUM_SKIPPED_DATAGRAMS_PER_IDLE)
+				{
+					continue;
+				}
 				return success;
 			}
 
@@ -1698,6 +1831,9 @@ boolean network_connection_idle(
 					&source_ipv4_address,
 					sizeof(source_ipv4_address));
 				buffer_size += sizeof(source_ipv4_address);
+				/* port: and its source port, which the readers take back */
+				csmemcpy(buffer + buffer_size, &source_address.port, sizeof(source_address.port));
+				buffer_size += sizeof(source_address.port);
 				success = circular_queue_queue_data(
 					connection->unreliable_incoming_queue,
 					buffer,
@@ -1837,7 +1973,30 @@ static boolean network_connection_flush_reliable(
 	return TRUE;
 }
 
-/* the length a received datagram's header (in network byte order) says */
+/* port: what waits, sent before the stream closes (its last messages: a
+player removed, a machine leaving), for as long as the peer takes it up to
+half a second (the stream is not blocking: a peer that reads nothing does
+not hold the game) */
+static void network_connection_flush_reliable_last(
+	struct network_connection *connection)
+{
+	unsigned long start_time = system_milliseconds();
+
+	/* (and not at all for a peer that has taken nothing lately: gone, its
+	connection dropped for it) */
+	while (connection->reliable_outgoing_queue && circular_queue_size(connection->reliable_outgoing_queue) > 0 &&
+		network_connection_flush_reliable(connection) &&
+		circular_queue_size(connection->reliable_outgoing_queue) > 0 &&
+		system_milliseconds() - start_time < 500 &&
+		system_milliseconds() - connection->reliable_outgoing_time < 100)
+	{
+		Sleep(5);
+	}
+}
+
+/* the length a received datagram's header (in network byte order) says;
+NONE for one marked encrypted, which the game never sends (anyone may: the
+read asserts none is, network_client_unreliable_connection_read) */
 static long network_connection_datagram_size(
 	byte const *datagram)
 {
@@ -1845,6 +2004,8 @@ static long network_connection_datagram_size(
 
 	csmemcpy(&header, datagram, sizeof(header));
 	byte_swap_message_header(&header, _byte_order_host);
+	if (TEST_FLAG(header, 0))
+		return NONE;
 
 	return GET_MESSAGE_SIZE(header);
 }

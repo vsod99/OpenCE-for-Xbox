@@ -67,6 +67,7 @@ symbols in this file:
 /* ---------- headers */
 
 #include "cseries/cseries.h"
+#include "cseries/errors.h"
 #include "cutscene/cinematics.h"
 #include "effects/player_effects.h"
 #include "game/game.h"
@@ -85,6 +86,7 @@ symbols in this file:
 #include "tag_files/tag_groups.h"
 #include "units/unit_definitions.h"
 #include "units/units.h"
+#include "network_chat.h" /* port: port/linux/game/network_chat.c */
 
 /* ---------- constants */
 
@@ -381,6 +383,38 @@ void scripted_hud_blink_motion_sensor(
 	return;
 }
 
+/* port: the scripts' show and blink flags, for network co-op
+(port/linux/game/network_coop.c) */
+long hud_unit_port_script_flags(
+	void)
+{
+	return unit_hud_globals->script_flags;
+}
+
+void hud_unit_port_set_script_flags(
+	long flags)
+{
+	unit_hud_globals->script_flags = flags;
+}
+
+/* port: whether the shield's fall from the last value the HUD saw is a hit.
+The host drains an overshield by about 0.00074 a tick and moves the HUD's
+last value with it (hud_tick_shield), so on the host the two stay equal. A
+network client's shield falls with the host's updates instead, after the
+HUD has taken its last value for the tick, so each frame it was a tick
+behind: the meter flashed and the shield damage sound played for the whole
+overshield, where the Xbox plays nothing. A small step from past full (0.02
+or less, about 25 ticks of drain) is that drain; a larger one is a hit,
+which still flashes the meter and plays the sound. */
+static boolean hud_shield_drop_is_hit(
+	real last_shield_vitality,
+	real shield_vitality)
+{
+	if (!(last_shield_vitality > shield_vitality))
+		return FALSE;
+	return !(last_shield_vitality > 1.0f && last_shield_vitality - shield_vitality <= 0.02f);
+}
+
 void hud_play_unit_sounds(
 	struct player_datum const *player,
 	boolean show_hud)
@@ -430,11 +464,13 @@ void hud_play_unit_sounds(
 							sound_flags = TEST_FLAG(
 								unit->object.damage_flags,
 								_object_shield_charging_bit);
+							/* port: not an overshield's drain (hud_shield_drop_is_hit) */
 							SET_FLAG(
 								sound_flags,
 								_unit_hud_shield_damage,
-								hud_state->last_shield_vitality >
-									unit->object.shield_vitality);
+								hud_shield_drop_is_hit(
+									hud_state->last_shield_vitality,
+									unit->object.shield_vitality));
 							SET_FLAG(
 								sound_flags,
 								_unit_hud_shield_low,
@@ -479,7 +515,8 @@ void hud_play_unit_sounds(
 					sound_flags,
 					&hud_definition->warning_sounds,
 					hud_state->last_sound_handles,
-					&hud_state->sound_flags);
+					&hud_state->sound_flags,
+					(short)NUMBEROF(hud_state->last_sound_handles));
 			}
 		}
 	}
@@ -514,20 +551,39 @@ static void hud_update_unit_local_player(
 
 			if (hud_state->last_shield_vitality > unit->object.shield_vitality)
 			{
-				if (hud_state->fade_time < 0.0f || hud_state->fade_time > 1.0f)
-					hud_state->last_shield_hit_time = game_time_get();
-
-				if (game_time_get() - hud_state->last_shield_hit_time < 15)
+				/* port: an overshield's drain is not a hit
+				(hud_shield_drop_is_hit). The step is closed here, so one late
+				packet cannot leave the meter a little behind and keep the
+				flash going, and a hit's flash already fading goes on fading,
+				as when the shield holds still. */
+				if (!hud_shield_drop_is_hit(hud_state->last_shield_vitality, unit->object.shield_vitality))
 				{
-					hud_state->fade_time = 0.0f;
+					hud_state->last_shield_vitality = unit->object.shield_vitality;
+					if (hud_state->fade_time > 0.0f)
+					{
+						hud_state->fade_time +=
+							(real)(game_time_get() - hud_state->last_shield_hit_time) *
+							(1.0f / TICKS_PER_SECOND);
+					}
+					hud_state->last_shield_hit_time = game_time_get();
 				}
 				else
 				{
-					hud_state->last_shield_vitality = unit->object.shield_vitality;
-					hud_state->fade_time +=
-						(real)(game_time_get() - hud_state->last_shield_hit_time) *
-						(1.0f / TICKS_PER_SECOND);
-					hud_state->last_shield_hit_time = game_time_get();
+					if (hud_state->fade_time < 0.0f || hud_state->fade_time > 1.0f)
+						hud_state->last_shield_hit_time = game_time_get();
+
+					if (game_time_get() - hud_state->last_shield_hit_time < 15)
+					{
+						hud_state->fade_time = 0.0f;
+					}
+					else
+					{
+						hud_state->last_shield_vitality = unit->object.shield_vitality;
+						hud_state->fade_time +=
+							(real)(game_time_get() - hud_state->last_shield_hit_time) *
+							(1.0f / TICKS_PER_SECOND);
+						hud_state->last_shield_hit_time = game_time_get();
+					}
 				}
 			}
 			else if (hud_state->last_shield_vitality < unit->object.shield_vitality)
@@ -591,8 +647,8 @@ void hud_render_damage_indicators(
 	{
 		struct hud_damage_indicators_definition *definition =
 			&hud_globals->damage_indicators;
-		real theta;
-		real_point2d screen_position;
+		real theta = 0.0f;
+		real_point2d screen_position = { 0 };
 		real scale = hud_globals_get_scale(local_player_count() > 1);
 		byte damage_indicators[NUMBER_OF_HUD_DAMAGE_INDICATOR_DIRECTIONS];
 		short direction;
@@ -655,10 +711,6 @@ void hud_render_damage_indicators(
 							render.camera.viewport_bounds.y1) / 2);
 					break;
 
-				/* theta and screen_position are left unassigned only by this default arm. Not reached unassigned: the
-				 * arm's assertion failure calls system_exit, which does not return in January
-				 * (0x47c960 jumps to halt_and_catch_fire 0x4f21c0, which loops or calls exit).
-				 * Source-policy approval pending (2026-09-27 audit). */
 				default:
 					match_assert(
 						"c:\\halo\\SOURCE\\interface\\hud_unit.c",
@@ -1097,6 +1149,8 @@ void hud_render_unit_interface(
 					struct hud_absolute_placement_definition absolute_placement;
 					short draw_flags = 0;
 					point2d corner;
+					/* port: its picture's left (NONE: none drawn) */
+					short motion_sensor_left = NONE;
 
 					absolute_placement.corner = _hud_anchor_bottom_left;
 					SET_FLAG(
@@ -1122,12 +1176,16 @@ void hud_render_unit_interface(
 
 					if (hud_definition->motion_sensor.background.interface_bitmap.index != NONE)
 					{
+						/* port: none, unless it is drawn (its bitmap can be missing) */
+						hud_draw_last_left = NONE;
 						hud_draw_static_element(
 							local_player_index,
 							&absolute_placement,
 							&hud_definition->motion_sensor.background,
 							draw_flags,
 							NONE);
+						/* port: where it is (the text chat goes above it) */
+						motion_sensor_left = hud_draw_last_left;
 					}
 					if (hud_definition->motion_sensor.foreground.interface_bitmap.index != NONE)
 					{
@@ -1151,6 +1209,14 @@ void hud_render_unit_interface(
 						local_player_index,
 						local_player_count() > 1,
 						&corner);
+					/* port: the text chat goes above it: the top of its circle, as
+					far above the blips' centre as the picture's left edge is left
+					of it (the picture is taller than the circle) */
+					if (motion_sensor_left != NONE)
+					{
+						network_chat_note_motion_sensor(local_player_index, motion_sensor_left,
+							(short)(corner.y - (corner.x - motion_sensor_left)));
+					}
 				}
 
 				{
@@ -1205,6 +1271,26 @@ void hud_render_unit_interface(
 							&hud_definition->auxilary_meters,
 							meter_index,
 							struct auxilary_meter_definition);
+
+						/* port: the type is the map's and indexes the flash times
+						and values (one type, the integrated light, which every
+						retail meter is): a meter of any other is not drawn, and
+						that is said once */
+						if (!VALID_INDEX(meter->type, (short)NUMBEROF(hud_state->auxilary_flash_time)))
+						{
+							static boolean bad_meter_type_reported = FALSE;
+
+							if (!bad_meter_type_reported)
+							{
+								bad_meter_type_reported = TRUE;
+								error(
+									_error_silent,
+									"unit hud auxilary meter of type %d (of %d) not drawn",
+									meter->type,
+									(short)NUMBEROF(hud_state->auxilary_flash_time));
+							}
+							continue;
+						}
 
 						if (TEST_FLAG(
 								hud_state->auxilary_active_type_flags,

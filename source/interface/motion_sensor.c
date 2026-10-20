@@ -329,11 +329,18 @@ static void motion_sensor_update(
 	}
 	else
 	{
-		short local_player_slots[4] = { 0 };
+		/* port: each local player's blip count, by local player, and the
+		local players in scan order, as two arrays of four. The Xbox's kept
+		both in one array of four (the counts first, the order from 2) and
+		had two camera positions, all it needed for its two player co-op;
+		three or four local players (split screen) wrote past both and into
+		stack_buffer ("corrupt stack at 0") */
+		short blip_counts[MAXIMUM_LOCAL_PLAYERS] = { 0 };
+		short scan_players[MAXIMUM_LOCAL_PLAYERS];
 		short player_count = local_player_count();
 		short local_player_index = local_player_get_next(NONE);
 		struct object_iterator iter;
-		real_point3d camera_positions[2];
+		real_point3d camera_positions[MAXIMUM_LOCAL_PLAYERS];
 		boolean done = FALSE;
 		short player_scan_index;
 
@@ -352,7 +359,7 @@ static void motion_sensor_update(
 					local_player_get_player_index(local_player_index))->unit_index;
 			short blip_index;
 
-			local_player_slots[player_scan_index + 2] = local_player_index;
+			scan_players[player_scan_index] = local_player_index;
 			camera_positions[local_player_index].x = 0.0f;
 			camera_positions[local_player_index].y = 0.0f;
 			camera_positions[local_player_index].z = 0.0f;
@@ -374,6 +381,9 @@ static void motion_sensor_update(
 			local_player_index = local_player_get_next(local_player_index);
 		}
 
+		/* (port: the scan shared by the local players: friends and enemies
+		alike, each player's own pass keeps his friends: update_motion_sensor) */
+		game_engine_motion_sensor_viewer(NONE);
 		object_iterator_new(&iter, _object_mask_unit, TRUE);
 		while (object_iterator_next(&iter) && !done)
 		{
@@ -394,7 +404,7 @@ static void motion_sensor_update(
 					player_scan_index++)
 				{
 					short scan_player_index =
-						local_player_slots[player_scan_index + 2];
+						scan_players[player_scan_index];
 					long player_index =
 						local_player_get_player_index(scan_player_index);
 
@@ -403,7 +413,7 @@ static void motion_sensor_update(
 							local_player_get_player_index(scan_player_index))
 							->unit_index != NONE)
 					{
-						short blip_index = local_player_slots[scan_player_index];
+						short blip_index = blip_counts[scan_player_index];
 
 						if (blip_index >= MAXIMUM_MOTION_SENSOR_BLIPS)
 						{
@@ -449,7 +459,7 @@ static void motion_sensor_update(
 
 								player->unit_indices[blip_index] = iter.index;
 								sensor->blip_count++;
-								local_player_slots[scan_player_index] =
+								blip_counts[scan_player_index] =
 									(short)(blip_index + 1);
 							}
 						}
@@ -506,6 +516,8 @@ static void update_motion_sensor(
 
 	csmemset(stack_buffer, 0x62, sizeof(stack_buffer));
 	player = get_motion_sensor_data(local_player_index);
+	/* (port: the FRIENDS radar's viewer: this player) */
+	game_engine_motion_sensor_viewer(local_player_index);
 	game_time_get();
 	if (motion_sensor_globals->update)
 	{
@@ -988,6 +1000,7 @@ static void blip_begin(
 		reference);
 
 	blip_player_index = local_player_index;
+	game_engine_motion_sensor_viewer(local_player_index);
 	scale[0] = in_multiplayer ? 0.75f : 1.0f;
 	center_point = *reference;
 	rasterizer_hud_motion_sensor_blip_begin();

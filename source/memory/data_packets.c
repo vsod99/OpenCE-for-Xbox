@@ -217,9 +217,10 @@ static void _data_packet_verify(
 
 	field = fields;
 	total_size = 0;
-	/* BUG (original): a first version-ineligible field reads an indeterminate
-	 * field_size; later ineligible fields reuse the preceding size. A corrected
-	 * build should initialize field_size to zero before the loop. */
+	/* port: the original's bug fixed: a first version-ineligible field read
+	an indeterminate field_size, and later ineligible fields reused the size
+	before them (no field of the game's has a version limit) */
+	field_size = 0;
 	while (field->type != _data_packet_field_end)
 	{
 		if (field->type < 0 || field->type >= _data_packet_field_type_count)
@@ -349,8 +350,12 @@ static void _data_packet_encode(
 				byte const *data = decoded_data + sizeof(short);
 
 				match_assert("c:\\halo\\SOURCE\\memory\\data_packets.c", 253, data_size>=0 && data_size<=field->count);
+				/* (a bad size fails the packet: port) */
 				if (data_size < 0 || data_size > field->count)
+				{
+					state->overflow = TRUE;
 					data_size = 0;
+				}
 				data_encode_integer(state, data_size, field->count);
 				data_encode_memory(state, data, data_size, 1);
 				break;
@@ -370,8 +375,12 @@ static void _data_packet_encode(
 					field + 1,
 					&element_field_count);
 				match_assert("c:\\halo\\SOURCE\\memory\\data_packets.c", 281, element_count>=0 && element_count<=field->count);
+				/* (a bad count fails the packet: port) */
 				if (element_count < 0 || element_count > field->count)
+				{
+					state->overflow = TRUE;
 					element_count = 0;
+				}
 				data_encode_integer(state, element_count, field->count);
 				while (element_count-- > 0)
 				{
@@ -531,8 +540,13 @@ static void _data_packet_decode(
 
 				element_count = (short)data_decode_integer(state, field->count);
 				_data_packet_verify(packet_definition, NULL, field + 1, &element_field_count);
+				/* port: no more than the field holds (the rest of the packet is
+				not to be read then) */
 				if (element_count < 0 || element_count > field->count)
+				{
+					state->overflow = TRUE;
 					element_count = 0;
+				}
 				*(short *)decoded_data = element_count;
 				element = decoded_data + sizeof(short);
 				while (element_count-- > 0)
