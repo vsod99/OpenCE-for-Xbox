@@ -514,9 +514,10 @@ jobs:
     # https://halocombatevolved.com/ (port/web/README.md, "Hosting"). Only
     # main, only once every platform built and the release is out (the site
     # and the release are one build), and a deployment is never cancelled
-    # halfway. The repository's Pages source must be GitHub Actions.
+    # halfway. The repository's Pages source must be GitHub Actions. Only
+    # OpenCE's own repository: a fork has no site to deploy to.
     needs: [release]
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.repository == 'OpenCommunityEdition/OpenCE' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
