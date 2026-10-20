@@ -390,6 +390,13 @@ void data_delete_all(
 
 	for (absolute_index = 0; absolute_index<data->maximum_count; absolute_index++)
 	{
+#ifdef HALO_XBOX
+		/* port: only the identifiers not zero already are written: the
+		original Xbox port backs the game state's pages as they are first
+		written (port/xbox/src/nxdk_memory.c), and its arrays are mostly
+		never used */
+		if (((struct datum_header *)((byte *)data->data+data->size*absolute_index))->identifier)
+#endif
 		((struct datum_header *)((byte *)data->data+data->size*absolute_index))->identifier = 0;
 	}
 

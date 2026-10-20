@@ -2211,6 +2211,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		last_frame = frame;
 		last_blank = blank;
 	}
+	xbox_game_state_frame(frame);
 	/* (between frames: the updater's question takes the screen there) */
 	xbox_update_frame();
 }

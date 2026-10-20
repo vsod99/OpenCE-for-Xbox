@@ -238,7 +238,9 @@ void *xbox_virtual_allocate(unsigned long size)
 	return base;
 }
 
-void *xbox_game_state_allocate(unsigned long address, unsigned long size)
+/* the game state with every page backed at once (when it cannot be backed
+as it is written: below) */
+static void *game_state_allocate_committed(unsigned long address, unsigned long size)
 {
 	PVOID base = (PVOID)address;
 	SIZE_T region_size = size;
@@ -420,6 +422,296 @@ void *halo_custom_edition_tag_cache(void)
 	return custom_edition_tag_cache;
 }
 
+/* ---------- the game state, backed as it is written
+
+The game state's pools are sized for the largest games the native builds
+play, and every machine in a game must have the same sizes
+(halo_port_capacity.h), but a game uses a small part of them: in a
+sixteen-player Blood Gulch, 0.9 MB of 17.7 MB held anything. So its
+addresses are reserved, each of its pages is at first the one page of
+zeros, read only, and a page is given memory of its own when it is first
+written: every program here runs in the processor's most privileged mode,
+and the page fault is looked at here before the kernel's handler has it.
+The faults take pages from a stock refilled between frames (the kernel's
+allocator is called from the fault only when the stock is out). Pages that
+hold only zeros again, as each map's pools are emptied, go back to the page
+of zeros between frames (xbox_game_state_frame). */
+#define GAME_STATE_ON_DEMAND 1
+#define GAME_STATE_MAXIMUM_PAGES (0x02000000UL / PAGE_BYTES)
+#define STOCK_TARGET_PAGES 256
+#define STOCK_MAXIMUM_PAGES 1024
+#define CR0_WRITE_PROTECT 0x00010000UL
+#define PAGE_FAULT_VECTOR 14
+
+static struct
+{
+	unsigned long base, end;
+	/* an unwritten page's page table entry: the page of zeros, read only
+	(or, without the processor's write protection, not present) */
+	unsigned long zero_entry;
+	/* each page's own memory (from MmAllocateSystemMemory), or NULL */
+	void *pages[GAME_STATE_MAXIMUM_PAGES];
+	void *stock[STOCK_MAXIMUM_PAGES];
+	unsigned long stock_count;
+	unsigned long backed, most_backed, faults, faults_unstocked, reclaimed;
+} demand;
+
+/* (the kernel's page fault handler: the entry below goes on to it) */
+unsigned long xbox_page_fault_original;
+void xbox_page_fault_entry(void);
+int xbox_game_state_fault(unsigned long address, unsigned long error);
+
+/* the page fault: the processor has pushed the error code, then the
+fault's flags, code segment and address to return to */
+__asm__(
+	".text\n"
+	".globl _xbox_page_fault_entry\n"
+	"_xbox_page_fault_entry:\n"
+	"\tpushal\n"
+	"\tcld\n"
+	"\tmovl 32(%esp), %ecx\n"
+	"\tmovl %cr2, %eax\n"
+	"\tpushl %ecx\n"
+	"\tpushl %eax\n"
+	"\tcall _xbox_game_state_fault\n"
+	"\taddl $8, %esp\n"
+	"\ttestl %eax, %eax\n"
+	"\tpopal\n"
+	"\tjz 1f\n"
+	"\taddl $4, %esp\n"
+	"\tiretl\n"
+	"1:\n"
+	"\tjmp *_xbox_page_fault_original\n");
+
+static unsigned long interrupts_disable(void)
+{
+	unsigned long flags;
+
+	__asm__ __volatile__("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) :: "memory");
+	return flags;
+}
+
+static void interrupts_restore(unsigned long flags)
+{
+	__asm__ __volatile__("pushl %0\n\tpopfl" :: "r"(flags) : "memory", "cc");
+}
+
+static void page_invalidate(unsigned long address)
+{
+	__asm__ __volatile__("invlpg (%0)" :: "r"(address) : "memory");
+}
+
+/* (no SSE in the fault: the faulting code's registers are not saved) */
+static void page_zero(void *page)
+{
+	unsigned long count = PAGE_BYTES / 4;
+
+	__asm__ __volatile__("rep stosl" : "+D"(page), "+c"(count) : "a"(0) : "memory");
+}
+
+static BOOL page_is_zero(const void *page)
+{
+	const unsigned long *words = (const unsigned long *)page;
+	unsigned long index;
+
+	for (index = 0; index < PAGE_BYTES / 4; index++)
+	{
+		if (words[index])
+			return FALSE;
+	}
+	return TRUE;
+}
+
+__attribute__((used)) int xbox_game_state_fault(unsigned long address, unsigned long error)
+{
+	unsigned long page = address & ~(PAGE_BYTES - 1);
+	unsigned long index;
+	void *memory;
+
+	(void)error;
+	if (address < demand.base || address >= demand.end)
+		return 0;
+	index = (page - demand.base) / PAGE_BYTES;
+	if (demand.pages[index])
+	{
+		/* (backed already: the processor still had the old entry) */
+		page_invalidate(page);
+		return 1;
+	}
+	if (demand.stock_count)
+	{
+		memory = demand.stock[--demand.stock_count];
+	}
+	else
+	{
+		memory = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+		demand.faults_unstocked++;
+		if (!memory)
+			return 0;
+	}
+	page_zero(memory);
+	demand.pages[index] = memory;
+	*page_table_entry(page) = ((unsigned long)MmGetPhysicalAddress(memory) & PAGE_FRAME) |
+		PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
+	page_invalidate(page);
+	demand.faults++;
+	if (++demand.backed > demand.most_backed)
+		demand.most_backed = demand.backed;
+	return 1;
+}
+
+static void stock_refill(void)
+{
+	while (demand.stock_count < STOCK_TARGET_PAGES)
+	{
+		void *memory = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+		unsigned long flags;
+
+		if (!memory)
+			break;
+		flags = interrupts_disable();
+		demand.stock[demand.stock_count++] = memory;
+		interrupts_restore(flags);
+	}
+}
+
+/* pages holding only zeros back to the page of zeros, and the stock kept
+at its size */
+static void game_state_reclaim(void)
+{
+	unsigned long index;
+
+	for (index = 0; index < (demand.end - demand.base) / PAGE_BYTES; index++)
+	{
+		void *memory = demand.pages[index], *release = NULL;
+		unsigned long flags;
+
+		if (!memory || !page_is_zero(memory))
+			continue;
+		/* (looked at again with nothing else running, then taken away) */
+		flags = interrupts_disable();
+		if (page_is_zero(memory))
+		{
+			unsigned long page = demand.base + index * PAGE_BYTES;
+
+			*page_table_entry(page) = demand.zero_entry;
+			page_invalidate(page);
+			demand.pages[index] = NULL;
+			demand.backed--;
+			demand.reclaimed++;
+			if (demand.stock_count < STOCK_MAXIMUM_PAGES)
+				demand.stock[demand.stock_count++] = memory;
+			else
+				release = memory;
+		}
+		interrupts_restore(flags);
+		if (release)
+			MmFreeSystemMemory(release, PAGE_BYTES);
+	}
+	while (demand.stock_count > STOCK_TARGET_PAGES)
+	{
+		unsigned long flags = interrupts_disable();
+		void *memory = demand.stock_count > STOCK_TARGET_PAGES ? demand.stock[--demand.stock_count] : NULL;
+
+		interrupts_restore(flags);
+		if (memory)
+			MmFreeSystemMemory(memory, PAGE_BYTES);
+	}
+}
+
+static BOOL game_state_on_demand_start(unsigned long address, unsigned long size)
+{
+	unsigned long first = address & ~(PAGE_TABLE_SPAN - 1);
+	unsigned long end = (address + size + PAGE_TABLE_SPAN - 1) & ~(PAGE_TABLE_SPAN - 1);
+	unsigned long page_tables = (end - first) / PAGE_TABLE_SPAN;
+	unsigned char *tables;
+	unsigned long index, cr0, idt[2], flags;
+	unsigned short *gate;
+	PVOID base = (PVOID)first;
+	SIZE_T region_size = end - first;
+
+	if (size > GAME_STATE_MAXIMUM_PAGES * PAGE_BYTES || (address | size) & (PAGE_BYTES - 1) || !page_tables_found())
+		return FALSE;
+	if (!NT_SUCCESS(NtAllocateVirtualMemory(&base, 0, &region_size, MEM_RESERVE, PAGE_READWRITE)) ||
+		(unsigned long)base != first)
+	{
+		platform_log("the game state: cannot reserve %08lx-%08lx", first, end);
+		return FALSE;
+	}
+	tables = MmAllocateContiguousMemoryEx(page_tables * PAGE_BYTES, 0, 0xFFFFFFFF, PAGE_BYTES, PAGE_READWRITE);
+	if (!tables)
+		return FALSE;
+	__asm__ __volatile__("movl %%cr0, %0" : "=r"(cr0));
+	if (cr0 & CR0_WRITE_PROTECT)
+	{
+		void *zero = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+
+		if (!zero)
+		{
+			MmFreeContiguousMemory(tables);
+			return FALSE;
+		}
+		page_zero(zero);
+		demand.zero_entry = ((unsigned long)MmGetPhysicalAddress(zero) & PAGE_FRAME) | PAGE_PRESENT | PAGE_ACCESSED;
+	}
+	demand.base = address;
+	demand.end = address + size;
+	memset(tables, 0, page_tables * PAGE_BYTES);
+	for (index = 0; index < page_tables; index++)
+	{
+		*page_directory_entry(first + index * PAGE_TABLE_SPAN) =
+			((unsigned long)MmGetPhysicalAddress(tables + index * PAGE_BYTES) & PAGE_FRAME) |
+			PAGE_PRESENT | PAGE_WRITABLE | PAGE_ACCESSED;
+	}
+	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
+	for (index = 0; index < size / PAGE_BYTES; index++)
+		*page_table_entry(address + index * PAGE_BYTES) = demand.zero_entry;
+	__asm__ __volatile__("movl %%cr3, %%eax\n\tmovl %%eax, %%cr3" ::: "eax", "memory");
+	stock_refill();
+	/* the page fault's gate in the interrupt descriptor table, written with
+	the write protection off (the table may be in a read-only page) */
+	__asm__ __volatile__("sidt %0" : "=m"(*(unsigned char (*)[6])((unsigned char *)idt + 2)));
+	gate = (unsigned short *)(idt[1] + PAGE_FAULT_VECTOR * 8);
+	flags = interrupts_disable();
+	xbox_page_fault_original = gate[0] | ((unsigned long)gate[3] << 16);
+	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0 & ~CR0_WRITE_PROTECT) : "memory");
+	gate[0] = (unsigned short)((unsigned long)xbox_page_fault_entry & 0xFFFF);
+	gate[3] = (unsigned short)((unsigned long)xbox_page_fault_entry >> 16);
+	__asm__ __volatile__("movl %0, %%cr0" :: "r"(cr0) : "memory");
+	interrupts_restore(flags);
+	platform_log("the game state: %lu KB at %08lx, backed as it is written (%s); the kernel's page fault handler at %08lx",
+		size / 1024, address, demand.zero_entry ? "unwritten pages read the page of zeros" : "unwritten pages not present",
+		xbox_page_fault_original);
+	return TRUE;
+}
+
+void *xbox_game_state_allocate(unsigned long address, unsigned long size)
+{
+	if (GAME_STATE_ON_DEMAND && game_state_on_demand_start(address, size))
+		return (void *)address;
+	return game_state_allocate_committed(address, size);
+}
+
+static BOOL game_state_on_demand_contains(const void *address)
+{
+	return demand.base && (unsigned long)address >= demand.base && (unsigned long)address < demand.end;
+}
+
+/* between frames: the stock refilled, and now and then the zeroed pages
+taken back and the use logged */
+void xbox_game_state_frame(unsigned long frame)
+{
+	if (!demand.base)
+		return;
+	stock_refill();
+	if (frame % 300 == 0)
+	{
+		game_state_reclaim();
+		platform_log("the game state: %lu KB backed, at most %lu KB; %lu faults, %lu without stock; %lu KB taken back",
+			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.reclaimed * 4);
+	}
+}
+
 /* ---------- XAPI */
 
 LPVOID WINAPI XPhysicalAlloc(SIZE_T size, ULONG_PTR physical_address, ULONG_PTR alignment, DWORD protect)
@@ -440,6 +732,9 @@ LPVOID WINAPI XPhysicalAlloc(SIZE_T size, ULONG_PTR physical_address, ULONG_PTR 
 
 VOID WINAPI XPhysicalFree(LPVOID address)
 {
+	/* (the game state backed as it is written is kept to the end) */
+	if (game_state_on_demand_contains(address))
+		return;
 	if (platform_is_contiguous(address))
 	{
 		platform_contiguous_free(address);
@@ -458,6 +753,14 @@ VOID WINAPI XPhysicalFree(LPVOID address)
 by: halo_xbox_prefix.h) */
 BOOL WINAPI halo_xbox_VirtualProtect(LPVOID address, SIZE_T size, DWORD new_protect, PDWORD old_protect)
 {
+	/* (the game state backed as it is written keeps its own page tables:
+	its pages stay as they are) */
+	if (game_state_on_demand_contains(address))
+	{
+		if (old_protect)
+			*old_protect = PAGE_READWRITE;
+		return TRUE;
+	}
 	if (old_protect)
 		*old_protect = MmQueryAddressProtect(address);
 	if (platform_is_contiguous(address))
@@ -486,5 +789,8 @@ VOID WINAPI XPhysicalProtect(LPVOID address, SIZE_T size, DWORD new_protect)
 
 DWORD WINAPI XQueryMemoryProtect(LPVOID address)
 {
+	if (game_state_on_demand_contains(address))
+		return PAGE_READWRITE;
 	return MmQueryAddressProtect(address);
 }
+
