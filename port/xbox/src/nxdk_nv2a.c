@@ -15,14 +15,15 @@ pbkit's own context DMAs for the color and depth buffers start at its
 buffers. The device draws into the game's surfaces wherever they are, so
 it binds two more over all of the low 64 MB (XBOX_GPU_DMA_COLOR and
 _ZETA), as pbkit's texture and vertex ones already are. A third
-(XBOX_GPU_DMA_REPORT) is the visibility tests' reports, with the fence
-after them.
+(XBOX_GPU_DMA_REPORT) is the visibility tests' reports, and a fourth
+(XBOX_GPU_DMA_SEMAPHORE) the fence, a page of its own.
 */
 
 #include <hal/video.h>
 #include <pbkit/pbkit.h>
 #include <xboxkrnl/xboxkrnl.h>
 #include <windows.h>
+#include <stdlib.h>
 
 #include "nxdk_platform.h"
 
@@ -42,8 +43,8 @@ static BOOL gpu_ready;
 /* the console's video setting (the dashboard's), as the mode was set */
 static DWORD video_settings;
 static uint32_t *push_buffer_head;
-static struct s_CtxDma color_dma, zeta_dma, report_dma;
-static volatile unsigned long *reports;
+static struct s_CtxDma color_dma, zeta_dma, report_dma, semaphore_dma;
+static volatile unsigned long *reports, *fence;
 
 __attribute__((constructor)) static void gpu_start(void)
 {
@@ -70,14 +71,26 @@ __attribute__((constructor)) static void gpu_start(void)
 	pb_bind_channel(&color_dma);
 	pb_bind_channel(&zeta_dma);
 	/* uncached: the CPU reads what the GPU writes */
-	reports = MmAllocateContiguousMemoryEx(XBOX_GPU_FENCE_OFFSET + 16, 0, 0x03ffffff, 4096,
+	reports = MmAllocateContiguousMemoryEx(XBOX_GPU_REPORT_BYTES, 0, 0x03ffffff, 4096,
 		PAGE_READWRITE | PAGE_NOCACHE);
-	if (reports)
+	fence = MmAllocateContiguousMemoryEx(4096, 0, 0x03ffffff, 4096, PAGE_READWRITE | PAGE_NOCACHE);
+	if (reports && fence)
 	{
-		reports[XBOX_GPU_FENCE_OFFSET / 4] = 0;
-		pb_create_dma_ctx(XBOX_GPU_DMA_REPORT, DMA_CLASS_3D, (DWORD)reports, XBOX_GPU_FENCE_OFFSET + 16 - 1,
-			&report_dma);
+		fence[0] = 0;
+		pb_create_dma_ctx(XBOX_GPU_DMA_REPORT, DMA_CLASS_3D, (DWORD)reports, XBOX_GPU_REPORT_BYTES - 1, &report_dma);
 		pb_bind_channel(&report_dma);
+		/* (as small as nxdk_pgraph_tests', which run on consoles) */
+		pb_create_dma_ctx(XBOX_GPU_DMA_SEMAPHORE, DMA_CLASS_3D, (DWORD)fence, 0x1f, &semaphore_dma);
+		pb_bind_channel(&semaphore_dma);
+	}
+	else
+	{
+		/* (neither, then: the device waits for the GPU to be idle) */
+		if (reports)
+			MmFreeContiguousMemory((void *)reports);
+		if (fence)
+			MmFreeContiguousMemory((void *)fence);
+		reports = fence = NULL;
 	}
 	/* the push buffer's head, where pbkit jumps back to */
 	pb_reset();
@@ -106,9 +119,24 @@ void xbox_gpu_screen(unsigned long *width, unsigned long *height, unsigned long 
 	*pitch = pb_back_buffer_pitch();
 }
 
+/* the reports, or NULL: HALO_GPU_REPORTS=0 (environment.txt) leaves them
+and the fence unused, the device waiting for the GPU to be idle instead
+(on a console, the NV2A refuses NV097_SET_CONTEXT_DMA_SEMAPHORE with the
+report DMA, "GPU Error : protection error", which xemu takes; asked here,
+not at the start, as D: is mounted by then) */
 volatile unsigned long *xbox_gpu_reports(void)
 {
-	return reports;
+	static int enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *setting = getenv("HALO_GPU_REPORTS");
+
+		enabled = !(setting && setting[0] == '0');
+		if (!enabled)
+			platform_log("GPU: no reports or fence (HALO_GPU_REPORTS=0): the device waits for the GPU to be idle");
+	}
+	return enabled ? reports : NULL;
 }
 
 unsigned long xbox_gpu_back_buffer(void)
@@ -163,17 +191,37 @@ struct xbox_gpu_push xbox_gpu_push;
 
 static uint32_t *kicked_end;
 
+/* HALO_GPU_TRACE=1 (environment.txt): every block of methods sent to the
+GPU at once and waited for, so that pbkit's report of a method the NV2A
+refuses names that method (as pbkit's own pb_trace_mode does: slow, for
+finding such errors on a console); asked at the first kick, after the
+start, as D: is mounted by then */
+static int gpu_trace = -1;
+
 /* the GPU told of all written, before a wait on it or pbkit's own methods */
 void xbox_gpu_kick(void)
 {
 	uint32_t *write_end = (uint32_t *)xbox_gpu_push.write_end;
 
+	if (gpu_trace < 0)
+	{
+		const char *setting = getenv("HALO_GPU_TRACE");
+
+		gpu_trace = setting && setting[0] == '1';
+		if (gpu_trace)
+			platform_log("GPU: tracing (HALO_GPU_TRACE=1): each block of methods waited for");
+	}
 	if (write_end != kicked_end)
 	{
 		pb_end(write_end);
 		kicked_end = write_end;
+		if (gpu_trace)
+		{
+			while (pb_busy())
+				;
+		}
 	}
-	xbox_gpu_push.kick_end = (unsigned long *)(kicked_end + KICK_BYTES / 4);
+	xbox_gpu_push.kick_end = (unsigned long *)(gpu_trace ? kicked_end : kicked_end + KICK_BYTES / 4);
 }
 
 /* a new place to write from (pbkit's, after a flip): nothing known free */
@@ -258,7 +306,7 @@ void xbox_gpu_wait_idle(void)
 
 unsigned long xbox_gpu_fence(void)
 {
-	return reports ? reports[XBOX_GPU_FENCE_OFFSET / 4] : 0;
+	return fence ? fence[0] : 0;
 }
 
 void xbox_gpu_wait_fence(unsigned long fence)

@@ -206,7 +206,9 @@ static struct
 	D3DSurface back_buffer;
 	D3DSurface depth_buffer;
 	D3DSurface *render_target;
-	D3DSurface *depth_stencil;
+	/* the depth buffer drawn with (NULL if the one set cannot go with the
+	render target: SetRenderTarget), and the one set */
+	D3DSurface *depth_stencil, *depth_stencil_set;
 	D3DVIEWPORT8 viewport;
 	D3DMATRIX transforms[D3DTS_MAX];
 	DWORD shader_constant_mode;
@@ -364,6 +366,14 @@ static DWORD surface_zeta_format(DWORD format, BOOL *floating)
 	}
 }
 
+/* a surface color format's bytes a pixel */
+static unsigned long surface_pixel_bytes(DWORD color_format)
+{
+	return color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 ||
+		color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8 || !color_format ? 4 :
+		color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8 ? 1 : 2;
+}
+
 static unsigned long log2_unsigned(unsigned long value)
 {
 	unsigned long result = 0;
@@ -414,15 +424,17 @@ static void surface_apply(void)
 		logged = color.format;
 		color_format = NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8;
 	}
-	color_pitch = color.linear ? color.pitch : color.width * (color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8 ||
-		color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8 ? 4 : color_format == NV097_SET_SURFACE_FORMAT_COLOR_LE_B8 ? 1 : 2);
+	color_pitch = color.linear ? color.pitch : color.width * surface_pixel_bytes(color_format);
 	if (device.depth_stencil)
 	{
 		xgpu_texture_describe(device.depth_stencil->Format, device.depth_stencil->Size, &zeta);
 		zeta_format = surface_zeta_format(zeta.format, &floating);
 		zeta_pitch = zeta.linear ? zeta.pitch : zeta.width * (zeta_format == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4);
 	}
-	format = color_format | (zeta_format ? zeta_format : NV097_SET_SURFACE_FORMAT_ZETA_Z24S8) << 4;
+	/* (with no depth buffer, a zeta format of the target's size of pixel:
+	the NV2A refuses a pair of another, above) */
+	format = color_format | (zeta_format ? zeta_format : surface_pixel_bytes(color_format) == 4 ?
+		NV097_SET_SURFACE_FORMAT_ZETA_Z24S8 : NV097_SET_SURFACE_FORMAT_ZETA_Z16) << 4;
 	device.surface_format = format;
 	device.swizzled_width = color.linear ? 0 : color.width;
 	device.swizzled_height = color.linear ? 0 : color.height;
@@ -560,7 +572,7 @@ static void device_start(void)
 	back_buffer_initialize(&device.back_buffer);
 	d3d8_surface_initialize(&device.depth_buffer, D3DFMT_LIN_D24S8, SCREEN_WIDTH, SCREEN_HEIGHT);
 	device.render_target = &device.back_buffer;
-	device.depth_stencil = &device.depth_buffer;
+	device.depth_stencil = device.depth_stencil_set = &device.depth_buffer;
 	for (index = 0; index < D3DTS_MAX; index++)
 	{
 		device.transforms[index]._11 = 1.0f;
@@ -581,13 +593,10 @@ static void device_start(void)
 		(NV097_SET_TRANSFORM_EXECUTION_MODE_RANGE_MODE_PRIV << __builtin_ctz(NV097_SET_TRANSFORM_EXECUTION_MODE_RANGE_MODE)));
 	PUSH1(p, NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN, 0);
 	push_end(p);
-	/* every simple state, as the defaults left them */
+	/* every simple state, as the defaults left them (the combiners' count of
+	none among them: D3DDevice_SetRenderState_Simple) */
 	for (index = 0; index < D3DRS_SIMPLE_MAX; index++)
-	{
-		p = push_begin(2);
-		PUSH1(p, D3DSIMPLERENDERSTATEENCODE[index] & 0xffff, D3D__RenderState[index]);
-		push_end(p);
-	}
+		D3DDevice_SetRenderState_Simple(D3DSIMPLERENDERSTATEENCODE[index], D3D__RenderState[index]);
 	device.surface_dirty = TRUE;
 	device.states_dirty = TRUE;
 	device.textures_dirty = TRUE;
@@ -655,11 +664,39 @@ void WINAPI D3DDevice_GetBackBuffer(INT back_buffer, D3DBACKBUFFER_TYPE type, D3
 
 HRESULT WINAPI D3DDevice_GetDepthStencilSurface(D3DSurface **result)
 {
-	*result = device.depth_stencil;
+	*result = device.depth_stencil_set;
 	if (!*result)
 		return D3DERR_NOTFOUND;
 	(*result)->Common++;
 	return S_OK;
+}
+
+/* whether a depth buffer can be drawn with a render target: the NV2A
+draws only with one of the same size of pixel ("GPU Error : invalid data"
+at NV097_SET_SURFACE_FORMAT otherwise, which xemu takes), and a swizzled
+target with no linear one; else the target is drawn with none, as the
+Xbox's Direct3D does not allow the pair */
+static BOOL depth_stencil_fits(D3DSurface *render_target, D3DSurface *depth_stencil)
+{
+	struct xgpu_texture_description color, zeta;
+	BOOL floating, fits;
+	static BOOL logged;
+
+	if (!render_target || !depth_stencil)
+		return depth_stencil != NULL;
+	xgpu_texture_describe(render_target->Format, render_target->Size, &color);
+	xgpu_texture_describe(depth_stencil->Format, depth_stencil->Size, &zeta);
+	fits = surface_pixel_bytes(surface_color_format(color.format)) ==
+		(surface_zeta_format(zeta.format, &floating) == NV097_SET_SURFACE_FORMAT_ZETA_Z16 ? 2 : 4) &&
+		(color.linear || !zeta.linear);
+	if (!fits && !logged)
+	{
+		platform_log("Direct3D: a %lux%lu render target (format %lu) drawn without its depth buffer (format %lu), "
+			"which the NV2A cannot pair with it", color.width, color.height, (unsigned long)color.format,
+			(unsigned long)zeta.format);
+		logged = TRUE;
+	}
+	return fits;
 }
 
 void WINAPI D3DDevice_SetRenderTarget(D3DSurface *render_target, D3DSurface *depth_stencil)
@@ -675,7 +712,8 @@ void WINAPI D3DDevice_SetRenderTarget(D3DSurface *render_target, D3DSurface *dep
 		if (i == screenshot_target_count && i < SCREENSHOT_TARGETS)
 			screenshot_targets[screenshot_target_count++] = *render_target;
 	}
-	device.depth_stencil = depth_stencil;
+	device.depth_stencil_set = depth_stencil;
+	device.depth_stencil = depth_stencil_fits(device.render_target, depth_stencil) ? depth_stencil : NULL;
 	device.surface_dirty = TRUE;
 	/* as Direct3D, the viewport becomes the whole new target */
 	if (device.render_target)
@@ -742,16 +780,20 @@ static DWORD fence_insert(void)
 	if (!xbox_gpu_reports())
 		return fence_inserted;
 	p = push_begin(6);
-	PUSH1(p, NV097_SET_CONTEXT_DMA_SEMAPHORE, XBOX_GPU_DMA_REPORT);
-	PUSH1(p, NV097_SET_SEMAPHORE_OFFSET, XBOX_GPU_FENCE_OFFSET);
+	PUSH1(p, NV097_SET_CONTEXT_DMA_SEMAPHORE, XBOX_GPU_DMA_SEMAPHORE);
+	PUSH1(p, NV097_SET_SEMAPHORE_OFFSET, 0);
 	PUSH1(p, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, ++fence_inserted);
 	push_end(p);
 	return fence_inserted;
 }
 
-/* a fence of this frame's draws so far is sent first */
+/* a fence of this frame's draws so far is sent first (and the triangles
+joined so far ended: with no reports there is no fence's push to end them,
+and a GPU left inside a begin is never idle) */
 static BOOL fence_passed(DWORD fence)
 {
+	if (triangles_open)
+		triangles_close();
 	if (!xbox_gpu_reports())
 		return !xbox_gpu_busy();
 	if ((LONG)(fence - fence_inserted) > 0)
@@ -764,6 +806,8 @@ static BOOL fence_passed(DWORD fence)
 
 static void fence_wait(DWORD fence)
 {
+	if (triangles_open)
+		triangles_close();
 	if (!xbox_gpu_reports())
 	{
 		xbox_gpu_wait_idle();
@@ -887,8 +931,9 @@ HRESULT WINAPI D3DDevice_GetVisibilityTestResult(DWORD index, UINT *result, ULON
 
 	if (index >= XBOX_GPU_REPORT_BYTES / 16)
 		return E_INVALIDARG;
-	/* with no reports, everything is visible */
-	count = reports ? reports[index * 4 + 2] : 0x7fffffff;
+	/* with no reports (HALO_GPU_REPORTS=0), nothing is visible: the lens
+	flares the tests are for are not drawn, rather than drawn through walls */
+	count = reports ? reports[index * 4 + 2] : 0;
 	if (count == VISIBILITY_TEST_PENDING)
 	{
 		xbox_gpu_kick();
@@ -903,12 +948,38 @@ HRESULT WINAPI D3DDevice_GetVisibilityTestResult(DWORD index, UINT *result, ULON
 
 /* ---------- render states */
 
-/* the simple ones are their methods' values */
+/* whether the combiners were last given no stages (below) */
+static BOOL combiner_stages_none;
+
+/* the simple ones are their methods' values. A combiner count of none
+(D3DRS_PSCOMBINERCOUNT, the pixel shader's before one is set) xemu takes as
+the final combiner alone, but the NV2A refuses ("GPU Error : invalid data",
+pbkit's handler then halting the console): it is given one stage instead,
+whose outputs are discarded, and stage 0's outputs are given back with a
+count of stages again */
 void D3DFASTCALL D3DDevice_SetRenderState_Simple(DWORD method, DWORD value)
 {
-	DWORD *p = push_begin(2);
+	DWORD *p = push_begin(6);
 
-	PUSH1(p, method & 0xffff, value);
+	method &= 0xffff;
+	if (method == NV097_SET_COMBINER_CONTROL)
+	{
+		BOOL none = !(value & NV097_SET_COMBINER_CONTROL_ITERATION_COUNT);
+
+		if (none != combiner_stages_none)
+		{
+			PUSH1(p, NV097_SET_COMBINER_COLOR_OCW, none ? 0 : D3D__RenderState[D3DRS_PSRGBOUTPUTS0]);
+			PUSH1(p, NV097_SET_COMBINER_ALPHA_OCW, none ? 0 : D3D__RenderState[D3DRS_PSALPHAOUTPUTS0]);
+			combiner_stages_none = none;
+		}
+		if (none)
+			value |= NV097_SET_COMBINER_CONTROL_ITERATION_COUNT_ONE;
+	}
+	else if (combiner_stages_none && (method == NV097_SET_COMBINER_COLOR_OCW || method == NV097_SET_COMBINER_ALPHA_OCW))
+	{
+		value = 0;
+	}
+	PUSH1(p, method, value);
 	push_end(p);
 }
 
@@ -1138,6 +1209,15 @@ static DWORD texture_mag_filter(DWORD mag)
 	return mag >= D3DTEXF_QUINCUNX ? 4 : mag == D3DTEXF_POINT ? 1 : 2;
 }
 
+/* the convolution kernel (bits 13 to 15 of the filter), Gaussian or else
+quincunx: the NV2A refuses none, even with no convolution filter ("GPU
+Error : invalid data" at NV097_SET_TEXTURE_FILTER, the system halted),
+which xemu takes */
+static DWORD texture_convolution_kernel(DWORD min, DWORD mag)
+{
+	return (min == D3DTEXF_GAUSSIANCUBIC || mag == D3DTEXF_GAUSSIANCUBIC ? 2 : 1) << 13;
+}
+
 /* ---------- the PC menus' pictures */
 
 /* the most memory the decoded pictures keep (contiguous memory, which a
@@ -1271,15 +1351,17 @@ static void art_decode(struct art_texture *art, const unsigned char *png, unsign
 	width = largest_power_of_two(png_width, ART_LARGEST);
 	height = largest_power_of_two(png_height, ART_LARGEST);
 	art_make_room(width * height * 4, ART_BUDGET);
+	/* (write combined: the GPU reads past the processor's caches,
+	d3d8_resources.c) */
 	texels = platform_contiguous_alloc(width * height * 4, D3DTEXTURE_ALIGNMENT, PLATFORM_ANY_PHYSICAL_ADDRESS,
-		PAGE_READWRITE);
+		PAGE_READWRITE | PAGE_WRITECOMBINE);
 	/* (out of contiguous memory: then with what the pictures not drawn
 	lately hold) */
 	if (!texels && art_bytes)
 	{
 		art_make_room(width * height * 4, 0);
 		texels = platform_contiguous_alloc(width * height * 4, D3DTEXTURE_ALIGNMENT, PLATFORM_ANY_PHYSICAL_ADDRESS,
-			PAGE_READWRITE);
+			PAGE_READWRITE | PAGE_WRITECOMBINE);
 	}
 	if (!texels)
 	{
@@ -1389,7 +1471,8 @@ static void texture_stage_apply(DWORD *(*p), int stage)
 		bias_fixed = 0xfff;
 	if (bias_fixed < -0x1000)
 		bias_fixed = -0x1000;
-	filter = ((DWORD)bias_fixed & 0x1fff) | (texture_min_filter(ts[D3DTSS_MINFILTER], ts[D3DTSS_MIPFILTER]) << 16) |
+	filter = ((DWORD)bias_fixed & 0x1fff) | texture_convolution_kernel(ts[D3DTSS_MINFILTER], ts[D3DTSS_MAGFILTER]) |
+		(texture_min_filter(ts[D3DTSS_MINFILTER], ts[D3DTSS_MIPFILTER]) << 16) |
 		(texture_mag_filter(ts[D3DTSS_MAGFILTER]) << 24) | (ts[D3DTSS_COLORSIGN] & 0xf0000000);
 
 	/* offset, format, address, control 0 and 1, filter, image rectangle,
@@ -1399,7 +1482,13 @@ static void texture_stage_apply(DWORD *(*p), int stage)
 	*(*p)++ = format;
 	PUSH1(*p, base + 0x08, (ts[D3DTSS_ADDRESSU] & 0xf) | (ts[D3DTSS_ADDRESSV] & 0xf) << 8 |
 		(ts[D3DTSS_ADDRESSW] & 0xf) << 16 | D3D__RenderState[D3DRS_WRAP0 + stage]);
-	PUSH2(*p, base + 0x0c, control, description.linear ? description.pitch << 16 : 0);
+	/* (the pitch only for a linear texture: the NV2A refuses a pitch of
+	none, "GPU Error : invalid data" at NV097_SET_TEXTURE_CONTROL1, which
+	xemu takes, and a swizzled texture has no use for one) */
+	if (description.linear)
+		PUSH2(*p, base + 0x0c, control, description.pitch << 16);
+	else
+		PUSH1(*p, base + 0x0c, control);
 	PUSH1(*p, base + 0x14, filter);
 	if (description.linear)
 		PUSH1(*p, base + 0x1c, description.width << 16 | description.height);
@@ -2199,6 +2288,11 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	(void)destination_rectangle;
 	(void)unused;
 	(void)unused2;
+	/* (the triangles joined so far ended before pbkit's methods for the
+	flip: the NV2A refuses them inside a begin, "GPU Error : invalid
+	operation", and with no reports no fence's push ends them) */
+	if (triangles_open)
+		triangles_close();
 	fence = fence_insert();
 	if (screenshot_frame())
 	{
