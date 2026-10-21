@@ -409,6 +409,13 @@ jobs:
       - name: Release
         run: python3 tools/ci_build.py xbox release
 
+      # the 64 MB console's build (ninja xbox64): multiplayer only
+      - name: Debug, 64 MB
+        run: python3 tools/ci_build.py xbox64 debug
+
+      - name: Release, 64 MB
+        run: python3 tools/ci_build.py xbox64 release
+
       - name: Compile cache
         run: ccache --show-stats
 
@@ -424,8 +431,20 @@ jobs:
           path: dist/halo-xbox-release
           retention-days: 3
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: halo-xbox64-debug
+          path: dist/halo-xbox64-debug
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: halo-xbox64-release
+          path: dist/halo-xbox64-release
+          retention-days: 3
+
   release:
-    # The eight builds (and the Windows builds' PDBs) as a release, tagged
+    # Every build (the 64 MB Xbox's too, and the Windows builds' PDBs) as a release, tagged
     # build-<run number> and marked latest
     # (every file keeps its name from release to release, for the README's
     # latest/download links); then all but the newest five build-* releases

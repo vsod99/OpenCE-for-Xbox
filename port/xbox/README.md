@@ -2,10 +2,11 @@
 
 Work in progress: a build of the game for the original Xbox, from the same
 sources as the native ports, that plays with them over system link and
-internet play. It needs a modified console with 128 MB of memory: the native
-builds' game state (`port/linux/include/halo_port_capacity.h`), which every
-machine in a game must share, does not fit in 64 MB beside the tag, texture
-and sound caches.
+internet play. The whole game needs a modified console with 128 MB of
+memory: the native builds' game state (`port/linux/include/halo_port_capacity.h`),
+which every machine in a game must share, does not fit in 64 MB beside the
+tag, texture and sound caches. A second build plays multiplayer on an
+unmodified 64 MB console ("The 64 MB console", below).
 
 The build uses [nxdk](https://github.com/XboxDev/nxdk) (clang, lld, no
 Microsoft SDK). Until the console is ready, everything runs in
@@ -86,6 +87,34 @@ folded into one. A library's functions must be called directly, not through
 (expat is built with `XML_STATIC`). The XBE's "limit to 64 MB" flag, which
 cxbe always sets, is cleared (`tools/xbox_xbe.py`): with it, a 128 MB
 console gives the program 64 MB.
+
+### The 64 MB console
+
+`ninja xbox64` builds `build/xbox64/halo/bin/default.xbe` with
+`HALO_XBOX_64MB`, its own memory layout, for an unmodified console (its
+XBE keeps the "limit to 64 MB" flag). It plays multiplayer only, system
+link and internet play, with every other build: its game state, and all
+that the machines send each other, are the other builds'. Campaign and
+co-op maps, Halo Custom Edition maps and the Bink videos are refused.
+CI builds it as `halo-xbox64-release.zip` (and `-debug`), which updates
+itself from that zip.
+
+It fits because most of the memory the game reserves is never written
+(all the Xbox builds do this; the 64 MB build depends on it):
+
+- The game state (20 MB) is reserved without memory: every page reads as
+  the shared page of zeros until it is first written, when the page fault
+  (`nxdk_memory.c`, hooked ahead of the kernel's) gives it a page of its
+  own; all-zero pages are taken back every 300 frames. A 16-player game
+  writes about 1 MB of it.
+- The port's largest static arrays (`HALO_PORT_SPARSE`) and the heap's
+  large blocks (`GlobalAlloc` of 256 KB or more) are made the same way.
+  A file read into such memory goes through a bounce buffer: the disk's
+  DMA would otherwise write the shared page.
+- The texture cache (13 MB) lies inside the tag cache, past the tags a
+  stock multiplayer map loads (a map whose tags reach it is refused), and
+  the sound cache is 2 MB, the push buffer 1 MB. The menus' pictures keep
+  at most 1.5 MB, given back a second after no menu draws them.
 
 The menus are the PC version's (`port/assets/menus`), with their pictures
 at the size the original game drew them: `tools/xbox_menu_art.py` (Pillow)
@@ -252,7 +281,7 @@ menu on pbkit's text screen, the game's last frame waiting behind it: A
 updates, B carries on (asked again at the next start), Y stops the
 questions (`update.auto = false`; CHECK FOR UPDATES in Network Setup turns
 them on again). The update downloads the release's `halo-xbox-release.zip`
-(or `-debug`) over HTTPS into `update.partial` in the XBE's folder, shows
+(or `-debug`; `halo-xbox64-*` for the 64 MB build) over HTTPS into `update.partial` in the XBE's folder, shows
 how far it has got, unpacks it, puts its files in place of the running
 XBE's (under the running XBE's name, if it was renamed; the old ones become
 `.old`, deleted at the next start) and starts the new XBE. The server's

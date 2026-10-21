@@ -7,6 +7,7 @@
     python tools/ci_build.py linux profile
     python tools/ci_build.py web release
     python tools/ci_build.py xbox debug
+    python tools/ci_build.py xbox64 release
 
 Builds are portable (any x86-64 processor), so they run on other
 computers. Debug builds skip link-time and profile-guided optimisation,
@@ -43,6 +44,8 @@ OUTPUTS = {
     # own disc (the workflow's xbox job brings nxdk), and internet play's
     # brokers, which it reads beside itself
     "xbox": ["build/xbox/halo/bin/default.xbe", "build/xbox/halo/bin/brokers.txt"],
+    # (and the 64 MB console's: multiplayer only, port/xbox/README.md)
+    "xbox64": ["build/xbox64/halo/bin/default.xbe", "build/xbox64/halo/bin/brokers.txt"],
     "android": [],  # the APK, below
     "web": [],  # the site, below
 }

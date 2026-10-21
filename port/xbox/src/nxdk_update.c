@@ -62,7 +62,12 @@ its clock, and its connection over lwIP's sockets.
 #endif
 
 #define UPDATE_REPOSITORY "OpenCommunityEdition/OpenCE"
+/* (the 64 MB console's build is its own release: halo-xbox64-*.zip) */
+#ifdef HALO_XBOX_64MB
+#define UPDATE_ASSET "halo-xbox64-" HALO_BUILD_FLAVOR ".zip"
+#else
 #define UPDATE_ASSET "halo-xbox-" HALO_BUILD_FLAVOR ".zip"
+#endif
 #define UPDATE_FOLDER "D:\\"
 #define UPDATE_DIRECTORY UPDATE_FOLDER "update.partial"
 #define UPDATE_XBE "default.xbe"
