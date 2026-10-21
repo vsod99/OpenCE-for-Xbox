@@ -406,6 +406,10 @@ symbols in this file:
 #include "view_fov.h" /* port: display.fov, before the projection and culling */
 #ifdef HALO_XBOX
 #include "xbox_demo.h" /* port: port/xbox/src/xbox_demo.c */
+#include "xbox_memory.h" /* port: port/xbox/src/nxdk_memory.c */
+
+/* port: the game ended because memory ran short, until the main menu */
+static boolean main_memory_short_ended = FALSE;
 #endif
 
 #if defined(HALO_WINDOWS) || defined(HALO_ANDROID) || defined(__linux__)
@@ -3519,6 +3523,31 @@ static boolean main_loop_iteration(
 				xbox_demo_core_loaded();
 #endif
 			}
+
+#ifdef HALO_XBOX
+			/* port: memory ran short in a game (the 64 MB console's, or a
+			game too large for the console): the game ends, and the main
+			menu says why, rather than an allocation failing */
+			if (main_globals.main_menu_scenario_loaded)
+			{
+				main_memory_short_ended = FALSE;
+			}
+			else if (!main_memory_short_ended && xbox_memory_short())
+			{
+				main_memory_short_ended = TRUE;
+				error(_error_silent, "the Xbox ran short of memory: the game ends");
+				display_error_text_when_main_menu_loaded(L"The Xbox ran out of memory,\r\nand the game was ended.");
+				if (main_globals.connection==_game_connection_network_client ||
+					main_globals.connection==_game_connection_network_server)
+				{
+					network_game_abort();
+				}
+				else
+				{
+					main_goto_main_menu();
+				}
+			}
+#endif
 
 			if (main_globals.want_to_be_at_main_menu)
 			{

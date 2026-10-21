@@ -470,6 +470,12 @@ keeps less idle) */
 #define STOCK_TARGET_PAGES 256
 #endif
 #define STOCK_MAXIMUM_PAGES 1024
+/* memory running short: pages held back for the faults the kernel has no
+page for, which carry the game on until the frame ends and the game is
+ended (xbox_memory_short, main.c); and the free memory under which the
+game is ended between frames, before any allocation fails */
+#define RESERVE_PAGES 128
+#define LOW_WATER_PAGES 256
 #define CR0_WRITE_PROTECT 0x00010000UL
 #define PAGE_FAULT_VECTOR 14
 
@@ -498,6 +504,11 @@ static struct
 	unsigned long static_count;
 	void *stock[STOCK_MAXIMUM_PAGES];
 	unsigned long stock_count;
+	void *reserve[RESERVE_PAGES];
+	unsigned long reserve_count;
+	/* (xbox_memory_short: the reserve in use, or free memory under the low
+	water mark, as the last frame ended) */
+	int short_of_memory;
 	unsigned long backed, most_backed, faults, faults_unstocked, fault_races, reclaimed;
 } demand;
 
@@ -637,6 +648,8 @@ __attribute__((used)) int xbox_sparse_fault(unsigned long address, unsigned long
 	{
 		memory = page_take();
 		demand.faults_unstocked++;
+		if (!memory && demand.reserve_count)
+			memory = demand.reserve[--demand.reserve_count];
 		if (!memory)
 			return 0;
 		/* (the kernel's allocator can let another thread run, which may have
@@ -666,6 +679,18 @@ __attribute__((used)) int xbox_sparse_fault(unsigned long address, unsigned long
 
 static void stock_refill(void)
 {
+	/* (the reserve first) */
+	while (demand.reserve_count < RESERVE_PAGES)
+	{
+		void *memory = page_take();
+		unsigned long flags;
+
+		if (!memory)
+			break;
+		flags = interrupts_disable();
+		demand.reserve[demand.reserve_count++] = memory;
+		interrupts_restore(flags);
+	}
 	while (demand.stock_count < STOCK_TARGET_PAGES)
 	{
 		void *memory = page_take();
@@ -1151,9 +1176,20 @@ long xbox_sparse_read_through(void *destination, unsigned long size,
 taken back and the use logged */
 void xbox_game_state_frame(unsigned long frame)
 {
+	MM_STATISTICS statistics;
+	int short_of_memory;
+
 	if (!demand.range_count)
 		return;
 	stock_refill();
+	statistics.Length = sizeof(statistics);
+	statistics.AvailablePages = 0;
+	short_of_memory = demand.reserve_count < RESERVE_PAGES ||
+		(NT_SUCCESS(MmQueryStatistics(&statistics)) && statistics.AvailablePages < LOW_WATER_PAGES);
+	if (short_of_memory && !demand.short_of_memory)
+		platform_log("memory: short (%lu KB free, %lu KB of the reserve left)",
+			(unsigned long)statistics.AvailablePages * (PAGE_BYTES / 1024), demand.reserve_count * (PAGE_BYTES / 1024));
+	demand.short_of_memory = short_of_memory;
 	if (frame % 300 == 0)
 	{
 		if (sparse_heap_ready)
@@ -1165,6 +1201,13 @@ void xbox_game_state_frame(unsigned long frame)
 			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.fault_races,
 			demand.reclaimed * 4);
 	}
+}
+
+/* whether memory ran short as the last frame ended (port/xbox/include/
+xbox_memory.h; main.c ends the game) */
+int xbox_memory_short(void)
+{
+	return demand.short_of_memory;
 }
 
 /* ---------- XAPI */
