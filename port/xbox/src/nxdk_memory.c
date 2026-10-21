@@ -498,7 +498,7 @@ static struct
 	unsigned long static_count;
 	void *stock[STOCK_MAXIMUM_PAGES];
 	unsigned long stock_count;
-	unsigned long backed, most_backed, faults, faults_unstocked, reclaimed;
+	unsigned long backed, most_backed, faults, faults_unstocked, fault_races, reclaimed;
 } demand;
 
 static void *game_state_pages[GAME_STATE_MAXIMUM_PAGES];
@@ -558,6 +558,35 @@ static void page_zero(void *page)
 	__asm__ __volatile__("rep stosl" : "+D"(page), "+c"(count) : "a"(0) : "memory");
 }
 
+/* a page of the kernel's for a sparse range, and back. The kernel moves
+pages it has given out, fixing up the mappings it knows of, to make room
+for a contiguous allocation (on a 64 MB console, often): the entries made
+here it does not know of, and would go on mapping the old page, someone
+else's by then. So the pages are locked where they are while they are the
+ranges' */
+static void *page_take(void)
+{
+	void *memory = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+
+	while (memory)
+	{
+		ULONG_PTR physical = (ULONG_PTR)MmGetPhysicalAddress(memory);
+
+		MmLockUnlockPhysicalPage(physical, FALSE);
+		/* (moved before it was locked: the lock is on the old page) */
+		if ((ULONG_PTR)MmGetPhysicalAddress(memory) == physical)
+			break;
+		MmLockUnlockPhysicalPage(physical, TRUE);
+	}
+	return memory;
+}
+
+static void page_give(void *memory)
+{
+	MmLockUnlockPhysicalPage((ULONG_PTR)MmGetPhysicalAddress(memory), TRUE);
+	MmFreeSystemMemory(memory, PAGE_BYTES);
+}
+
 static BOOL page_is_zero(const void *page)
 {
 	const unsigned long *words = (const unsigned long *)page;
@@ -606,10 +635,23 @@ __attribute__((used)) int xbox_sparse_fault(unsigned long address, unsigned long
 	}
 	else
 	{
-		memory = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+		memory = page_take();
 		demand.faults_unstocked++;
 		if (!memory)
 			return 0;
+		/* (the kernel's allocator can let another thread run, which may have
+		freed a block, moving the ranges, or faulted on this page meanwhile:
+		its memory is kept) */
+		range = sparse_range_find(address);
+		if (!range || range->pages[(page - range->base) / PAGE_BYTES])
+		{
+			if (demand.stock_count < STOCK_MAXIMUM_PAGES)
+				demand.stock[demand.stock_count++] = memory;
+			demand.fault_races++;
+			page_invalidate(page);
+			return range != NULL;
+		}
+		index = (page - range->base) / PAGE_BYTES;
 	}
 	page_zero(memory);
 	range->pages[index] = memory;
@@ -626,7 +668,7 @@ static void stock_refill(void)
 {
 	while (demand.stock_count < STOCK_TARGET_PAGES)
 	{
-		void *memory = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+		void *memory = page_take();
 		unsigned long flags;
 
 		if (!memory)
@@ -672,7 +714,7 @@ static void sparse_reclaim(void)
 			}
 			interrupts_restore(flags);
 			if (release)
-				MmFreeSystemMemory(release, PAGE_BYTES);
+				page_give(release);
 		}
 	}
 	while (demand.stock_count > STOCK_TARGET_PAGES)
@@ -682,7 +724,7 @@ static void sparse_reclaim(void)
 
 		interrupts_restore(flags);
 		if (memory)
-			MmFreeSystemMemory(memory, PAGE_BYTES);
+			page_give(memory);
 	}
 }
 
@@ -815,7 +857,7 @@ static BOOL game_state_on_demand_start(unsigned long address, unsigned long size
 	__asm__ __volatile__("movl %%cr0, %0" : "=r"(cr0));
 	if (cr0 & CR0_WRITE_PROTECT)
 	{
-		void *zero = MmAllocateSystemMemory(PAGE_BYTES, PAGE_READWRITE);
+		void *zero = page_take();
 
 		if (!zero)
 			return FALSE;
@@ -987,7 +1029,7 @@ void xbox_sparse_zero(void *address, unsigned long size)
 		}
 		interrupts_restore(flags);
 		if (release)
-			MmFreeSystemMemory(release, PAGE_BYTES);
+			page_give(release);
 	}
 }
 
@@ -1036,7 +1078,7 @@ void xbox_sparse_free(void *address)
 	for (index = 0; index < pages; index++)
 	{
 		if (backing[index])
-			MmFreeSystemMemory(backing[index], PAGE_BYTES);
+			page_give(backing[index]);
 	}
 	free(backing);
 }
@@ -1119,8 +1161,9 @@ void xbox_game_state_frame(unsigned long frame)
 		sparse_reclaim();
 		if (sparse_heap_ready)
 			RtlLeaveCriticalSection(&sparse_heap_lock);
-		platform_log("sparse memory: %lu KB backed, at most %lu KB; %lu faults, %lu without stock; %lu KB taken back",
-			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.reclaimed * 4);
+		platform_log("sparse memory: %lu KB backed, at most %lu KB; %lu faults, %lu without stock (%lu raced); %lu KB taken back",
+			demand.backed * 4, demand.most_backed * 4, demand.faults, demand.faults_unstocked, demand.fault_races,
+			demand.reclaimed * 4);
 	}
 }
 
