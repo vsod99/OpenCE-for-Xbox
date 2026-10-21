@@ -143,6 +143,9 @@ void render_sky(
 /* ---------- globals */
 
 struct render_globals render;
+/* port: sparse on the original Xbox port: most of it is for views a game
+seldom has (halo_port_capacity.h) */
+HALO_PORT_SPARSE(render);
 
 static boolean render_invalid_fog_warning_displayed;
 

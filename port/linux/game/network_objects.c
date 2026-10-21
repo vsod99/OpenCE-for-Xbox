@@ -1465,6 +1465,16 @@ static boolean distributed_host_rest_state_due(
 		since < REST_STATE_REPEATS * REST_STATE_REPEAT_TICKS && since % REST_STATE_REPEAT_TICKS == 0;
 }
 
+/* the tables the host builds a tick's states and inventories in, at file
+scope so that they are sparse on the original Xbox (HALO_PORT_SPARSE): a
+game fills only as much of them as it has objects */
+static struct distributed_object_state send_states_table[MAXIMUM_TRACKED_OBJECTS + RESTING_STATES_PER_TICK];
+HALO_PORT_SPARSE(send_states_table);
+static struct distributed_inventory send_inventories_table[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(send_inventories_table);
+static real_point3d send_inventory_origins_table[MAXIMUM_TRACKED_OBJECTS];
+HALO_PORT_SPARSE(send_inventory_origins_table);
+
 /* where the moving objects are, to each client those near its players
 every tick, those further less often, and the vehicle it drives itself
 (which it has already) every few ticks, with which of its ticks the host
@@ -1474,7 +1484,7 @@ static void distributed_host_send_states(
 	void)
 {
 	/* (one come to rest may be in its turn too) */
-	static struct distributed_object_state states[MAXIMUM_TRACKED_OBJECTS + RESTING_STATES_PER_TICK];
+	struct distributed_object_state *states = send_states_table;
 	static byte kinds[MAXIMUM_TRACKED_OBJECTS + RESTING_STATES_PER_TICK];
 	struct distributed_object_state_message message;
 	short limit = MIN(MAXIMUM_ENTRIES_PER_MESSAGE, DATAGRAM_ENTRIES(struct distributed_object_state));
@@ -1656,9 +1666,9 @@ see its shots less) */
 static void distributed_host_send_inventories(
 	void)
 {
-	static struct distributed_inventory inventories[MAXIMUM_TRACKED_OBJECTS];
+	struct distributed_inventory *inventories = send_inventories_table;
 	static byte kinds[MAXIMUM_TRACKED_OBJECTS];
-	static real_point3d origins[MAXIMUM_TRACKED_OBJECTS];
+	real_point3d *origins = send_inventory_origins_table;
 	struct distributed_inventory_message message;
 	short limit = MIN(MAXIMUM_ENTRIES_PER_MESSAGE, DATAGRAM_ENTRIES(struct distributed_inventory));
 	long inventory_count = 0;

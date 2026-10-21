@@ -1340,6 +1340,7 @@ static struct
 	/* each line's low pass */
 	float lowpass[REVERB_LINES];
 } reverb;
+HALO_PORT_SPARSE(reverb);
 
 static float clamp_real(float value, float minimum, float maximum)
 {

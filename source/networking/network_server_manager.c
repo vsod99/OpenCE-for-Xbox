@@ -2882,6 +2882,7 @@ static void network_game_server_refuse_late_joiner(
 was started with (by machine index): those added and gone while it loaded
 it, whose messages it did not hear, it is told of once it has */
 static struct network_player late_joiner_players[MAXIMUM_NETWORK_MACHINE_COUNT][NUMBEROF(((struct network_game *)0)->players)];
+HALO_PORT_SPARSE(late_joiner_players); /* port: sparse on the original Xbox port (halo_port_capacity.h) */
 
 static boolean network_game_server_same_player(
 	struct network_player const *player0,

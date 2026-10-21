@@ -530,6 +530,7 @@ static struct
 	short cluster_entry_counts[MAXIMUM_CLUSTERS_PER_STRUCTURE];
 	struct lights_port_entry entries[LIGHTS_PORT_MAXIMUM_ENTRIES];
 } lights_port;
+HALO_PORT_SPARSE(lights_port); /* port: sparse on the original Xbox port (halo_port_capacity.h) */
 struct lights_game_globals *lights_game_globals = NULL;
 short debug_rasterizer_light_count;
 struct lights_globals lights_globals;

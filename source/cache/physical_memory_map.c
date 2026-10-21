@@ -146,6 +146,10 @@ void physical_memory_verify(
 		address += 0x1000)
 	{
 		page_status = XQueryMemoryProtect(address);
+#ifdef HALO_XBOX_64MB
+		/* port: (the 64 MB console's texture cache in it is write combined) */
+		page_status &= ~PAGE_WRITECOMBINE;
+#endif
 #line 77 "c:\\halo\\SOURCE\\cache\\physical_memory_map.c"
 		match_assert(__FILE__, __LINE__, page_status == PAGE_READWRITE);
 	}

@@ -203,6 +203,9 @@ static void ai_debug_render_path_nodes(
 /* ---------- globals */
 
 struct ai_debug_state ai_debug;
+/* port: sparse on the original Xbox port, which shows none of it
+(halo_port_capacity.h) */
+HALO_PORT_SPARSE(ai_debug);
 
 struct actor_debug_info *actor_debug_array = NULL;
 struct path_debug_storage *actor_path_debug_array = NULL;
