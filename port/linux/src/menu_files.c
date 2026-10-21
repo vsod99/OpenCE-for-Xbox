@@ -35,6 +35,13 @@ high-res HUD's are (hud_hires.c).
 
 #define MAXIMUM_DEPTH 32
 #define MAXIMUM_ART 1024
+/* the 64 MB Xbox's menu pictures are not in the program, where they would
+take its memory for as long as it runs, but in a pack beside it
+(tools/embed_assets.py --pack): an embedded picture without data is read
+from there as it is decoded, and let go after (menu_art_png_release) */
+#ifdef HALO_XBOX_64MB
+#define MENU_ART_PACK "D:\\menu_art.pak"
+#endif
 
 /* ---------- the files */
 
@@ -44,6 +51,11 @@ struct menu_file
 	const unsigned char *data;
 	unsigned long size;
 	int loaded;
+#ifdef HALO_XBOX_64MB
+	/* (in the pack, at that offset: above) */
+	int packed;
+	unsigned long pack_offset;
+#endif
 };
 
 static struct menu_file *files;
@@ -94,6 +106,10 @@ static long file_add(const char *path, const unsigned char *data, unsigned long 
 	files[index].data = data;
 	files[index].size = size;
 	files[index].loaded = loaded;
+#ifdef HALO_XBOX_64MB
+	files[index].packed = 0;
+	files[index].pack_offset = 0;
+#endif
 	return index;
 }
 
@@ -162,7 +178,17 @@ static void files_gather(void)
 		}
 		else
 		{
-			file_add(embedded->path, (const unsigned char *)embedded->data, embedded->size, 0);
+			long added = file_add(embedded->path, (const unsigned char *)embedded->data, embedded->size, 0);
+
+#ifdef HALO_XBOX_64MB
+			if (added >= 0 && !embedded->data)
+			{
+				files[added].packed = 1;
+				files[added].pack_offset = embedded->offset;
+			}
+#else
+			(void)added;
+#endif
 		}
 	}
 #ifndef HALO_ANDROID
@@ -219,32 +245,82 @@ static int path_inside_folder(const char *path)
 	return 1;
 }
 
-/* a file's data (a bitmap's PNG, by the path its <bitmap> gives): the
-menus folder's, else the embedded one */
-static const unsigned char *file_data(const char *path, unsigned long *size)
+/* a file's index (a bitmap's PNG, by the path its <bitmap> gives): the
+menus folder's, else the embedded one; -1 if it is none */
+static long file_index(const char *path)
 {
 	long index;
 
 	if (!path_inside_folder(path))
 	{
 		platform_log("menus: %s is not a path inside the menus folder", path);
-		return NULL;
+		return -1;
 	}
 	index = file_find(path);
 	if (index < 0)
 	{
 		char full[1200];
+		unsigned long size = 0;
 		unsigned char *data;
 
 		snprintf(full, sizeof(full), "%s/%s", folder, path);
-		data = file_read(full, size);
+		data = file_read(full, &size);
 		if (!data)
-			return NULL;
-		index = file_add(path, data, *size, 1);
-		if (index < 0)
-			return NULL;
+			return -1;
+		index = file_add(path, data, size, 1);
 	}
+	return index;
+}
+
+#ifdef HALO_XBOX_64MB
+/* the picture read from the pack last, until menu_art_png_release */
+static unsigned char *pack_data;
+
+static const unsigned char *pack_read(const struct menu_file *file)
+{
+	FILE *pack;
+
+	menu_art_png_release();
+	pack_data = malloc(file->size ? file->size : 1);
+	if (!pack_data)
+	{
+		platform_log("menus: out of memory for %s", file->path);
+		return NULL;
+	}
+	pack = fopen(MENU_ART_PACK, "rb");
+	if (!pack || fseek(pack, (long)file->pack_offset, SEEK_SET) != 0 ||
+		fread(pack_data, 1, file->size, pack) != file->size)
+	{
+		platform_log("menus: cannot read %s from %s", file->path, MENU_ART_PACK);
+		free(pack_data);
+		pack_data = NULL;
+	}
+	if (pack)
+		fclose(pack);
+	return pack_data;
+}
+#endif
+
+void menu_art_png_release(void)
+{
+#ifdef HALO_XBOX_64MB
+	free(pack_data);
+	pack_data = NULL;
+#endif
+}
+
+/* a file's data, as file_index finds it */
+static const unsigned char *file_data(const char *path, unsigned long *size)
+{
+	long index = file_index(path);
+
+	if (index < 0)
+		return NULL;
 	*size = files[index].size;
+#ifdef HALO_XBOX_64MB
+	if (files[index].packed)
+		return pack_read(&files[index]);
+#endif
 	return files[index].data;
 }
 
@@ -1112,6 +1188,13 @@ const unsigned char *menu_art_png(unsigned long data, unsigned long *size)
 	*size = 0;
 	/* (no png: out of memory registering it) */
 	return index < 0 || !art[index].png ? NULL : file_data(art[index].png, size);
+}
+
+long menu_art_file(unsigned long data)
+{
+	long index = art_find(data);
+
+	return index < 0 || !art[index].png ? -1 : file_index(art[index].png);
 }
 
 unsigned int menu_art_texture(unsigned long data, unsigned long *levels)

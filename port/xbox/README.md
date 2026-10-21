@@ -96,8 +96,8 @@ XBE keeps the "limit to 64 MB" flag). It plays multiplayer only, system
 link and internet play, with every other build: its game state, and all
 that the machines send each other, are the other builds'. Campaign and
 co-op maps, Halo Custom Edition maps and the Bink videos are refused.
-CI builds it as `halo-xbox64-release.zip` (and `-debug`), which updates
-itself from that zip.
+CI builds it as `halo-xbox64-release.zip` (and `-debug`), with
+`menu_art.pak` beside the XBE, which updates itself from that zip.
 
 It fits because most of the memory the game reserves is never written
 (all the Xbox builds do this; the 64 MB build depends on it):
@@ -113,8 +113,10 @@ It fits because most of the memory the game reserves is never written
   DMA would otherwise write the shared page.
 - The texture cache (13 MB) lies inside the tag cache, past the tags a
   stock multiplayer map loads (a map whose tags reach it is refused), and
-  the sound cache is 2 MB, the push buffer 1 MB. The menus' pictures keep
-  at most 1.5 MB, given back a second after no menu draws them.
+  the sound cache is 2 MB, the push buffer 1 MB. The menus' pictures are
+  not in the XBE but in `menu_art.pak` beside it (`tools/embed_assets.py
+  --pack`), each read as it is decoded (`menu_files.c`); the decoded ones
+  keep at most 1.5 MB, given back a second after no menu draws them.
 
 The menus are the PC version's (`port/assets/menus`), with their pictures
 at the size the original game drew them: `tools/xbox_menu_art.py` (Pillow)

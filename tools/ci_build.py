@@ -44,8 +44,10 @@ OUTPUTS = {
     # own disc (the workflow's xbox job brings nxdk), and internet play's
     # brokers, which it reads beside itself
     "xbox": ["build/xbox/halo/bin/default.xbe", "build/xbox/halo/bin/brokers.txt"],
-    # (and the 64 MB console's: multiplayer only, port/xbox/README.md)
-    "xbox64": ["build/xbox64/halo/bin/default.xbe", "build/xbox64/halo/bin/brokers.txt"],
+    # (and the 64 MB console's: multiplayer only, port/xbox/README.md; its
+    # menus' pictures beside it)
+    "xbox64": ["build/xbox64/halo/bin/default.xbe", "build/xbox64/halo/bin/brokers.txt",
+               "build/xbox64/halo/bin/menu_art.pak"],
     "android": [],  # the APK, below
     "web": [],  # the site, below
 }

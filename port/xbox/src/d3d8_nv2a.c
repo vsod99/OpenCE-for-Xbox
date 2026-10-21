@@ -1234,9 +1234,10 @@ largest side one has (a picture from a menus folder may be a desktop's) */
 
 struct art_texture
 {
-	/* the placeholder texture's Data, and the PNG decoded for it */
+	/* the placeholder texture's Data, and the menus' file of the PNG decoded
+	for it (menu_art_file) */
 	DWORD placeholder;
-	const unsigned char *png;
+	long file;
 	void *texels;
 	DWORD data, format;
 	unsigned long bytes;
@@ -1399,14 +1400,15 @@ placeholders have one */
 static const struct art_texture *art_texture(const DWORD *header, const struct xgpu_texture_description *description)
 {
 	struct art_texture *art = NULL, *free_slot = NULL;
-	unsigned long png_size;
+	unsigned long png_size = 0;
 	const unsigned char *png;
+	long file;
 	int index;
 
 	if (description->width != 4 || description->height != 4 || description->format != D3DFMT_A8R8G8B8)
 		return NULL;
-	png = menu_art_png(header[1], &png_size);
-	if (!png)
+	file = menu_art_file(header[1]);
+	if (file < 0)
 		return NULL;
 	for (index = 0; index < ART_TEXTURES && !art; index++)
 	{
@@ -1416,15 +1418,21 @@ static const struct art_texture *art_texture(const DWORD *header, const struct x
 			free_slot = &art_textures[index];
 	}
 	/* (the menus may give the placeholder another picture) */
-	if (art && art->png != png)
+	if (art && art->file != file)
 		art_release(art);
 	else if (!art && !(art = free_slot))
 		return NULL;
 	if (!art->placeholder)
 	{
 		art->placeholder = header[1];
-		art->png = png;
-		art_decode(art, png, png_size);
+		art->file = file;
+		/* (the 64 MB console's is read from the disc for it: menu_files.c) */
+		png = menu_art_png(header[1], &png_size);
+		if (png)
+			art_decode(art, png, png_size);
+		else
+			art->failed = TRUE;
+		menu_art_png_release();
 	}
 	art->last_frame = frame_number;
 	return art->failed ? NULL : art;

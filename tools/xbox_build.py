@@ -381,6 +381,20 @@ def generate_xbox_build(n: Writer, sln: Any) -> None:
                 description="XBOX EMBED $out",
             )
             n.build(outputs=menus, rule="xbox_embed_menus", implicit=[Path("tools/embed_assets.py"), *xbox_menu_inputs()])
+            n.rule(
+                name="xbox_embed_menus_packed",
+                command="$python tools/embed_assets.py --menus-only --xbox --pack $pack $source",
+                description="XBOX EMBED $out",
+            )
+        # (the 64 MB console's pictures in a pack beside the XBE, D:, read as
+        # they are drawn rather than kept in its memory: menu_files.c)
+        packed = "-DHALO_XBOX_64MB" in extra_defines
+        if packed:
+            menus = build / "generated" / "menu_files_assets.c"
+            menu_art_pack = xbe.parent / "menu_art.pak"
+            n.build(outputs=[menus, menu_art_pack], rule="xbox_embed_menus_packed",
+                    implicit=[Path("tools/embed_assets.py"), *xbox_menu_inputs()],
+                    variables={"pack": str(menu_art_pack), "source": str(menus)})
         add_object(menus, platform_cflags)
         # the settings file's parser (port_config.c)
         add_object(TOML_DIR / "tomlc17.c", " ".join([abi, "-std=gnu11", "-w", pdclib_includes]))
@@ -424,5 +438,5 @@ def generate_xbox_build(n: Writer, sln: Any) -> None:
         n.build(outputs=brokers, rule="xbox_copy", inputs=Path("port/assets/network/brokers.txt"))
         # the game's units alone, which compile before the platform layer links
         n.build(outputs=f"{target}-game", rule="phony", inputs=game_objects)
-        n.build(outputs=target, rule="phony", inputs=[xbe, brokers])
+        n.build(outputs=target, rule="phony", inputs=[xbe, brokers, *([menu_art_pack] if packed else [])])
     n.newline()
