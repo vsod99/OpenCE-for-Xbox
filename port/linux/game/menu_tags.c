@@ -393,6 +393,8 @@ static char const *const port_function_names[] =
 	/* (the main menu's Mods: menu_functions.c) */
 	"port mods init", "port mods close", "port mods toggle", "port mods move up", "port mods move down",
 	"port mods save",
+	/* (the 64 MB Xbox's Campaign: handler_build) */
+	"port campaign unavailable",
 };
 
 /* the PC version's game data functions that the Xbox's have not, from
@@ -995,6 +997,22 @@ static void handler_build(struct ui_widget_event_handler_reference *handler, str
 {
 	char const *targets[5];
 	long target_count = 0;
+#ifdef HALO_XBOX_64MB
+	struct halo_menu_handler campaign;
+
+	/* the 64 MB console plays no campaign (its tags do not fit beside the
+	texture cache, port/xbox/README.md): the main menu's Campaign and
+	Multiplayer's co-op say so rather than opening their menus */
+	if ((source->open && !strcmp(source->open, "main_menu/campaign_select/campaign_menu")) ||
+		(source->run && !strcmp(source->run, "port coop begin")))
+	{
+		campaign = *source;
+		campaign.run = "port campaign unavailable";
+		campaign.open = NULL;
+		campaign.branch = FALSE;
+		source = &campaign;
+	}
+#endif
 
 	handler->event_type = (short)event_type;
 	reference_clear(&handler->widget_tag, UI_WIDGET_DEFINITION_TAG);

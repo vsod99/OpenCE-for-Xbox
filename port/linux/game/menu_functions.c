@@ -60,6 +60,10 @@ begin" makes two players, player 1 on its profile; "port coop player 2"
 gives player 2 the profile chosen and the controller that chose it; then the
 campaign's New Game and difficulty start the game for both.
 
+On the 64 MB Xbox, which plays no campaign, the main menu's Campaign and
+co-op run "port campaign unavailable" instead (menu_tags.c), which says
+so.
+
 The rest are the PC version's, which its menus (port/assets/menus/ce)
 name and the Xbox's has not: they do nothing yet, and succeed, so that what
 their handlers open opens.
@@ -969,6 +973,11 @@ static short map_kind_shown(struct widget_instance *list, boolean singleplayer, 
 	struct widget_instance *spinner = named(list, "list_item_0_map_kind_spinner", 0);
 	short kind;
 
+#ifdef HALO_XBOX_64MB
+	/* (the 64 MB console plays no campaign: a host's map list has no
+	levels for co-op) */
+	singleplayer = FALSE;
+#endif
 	if (!spinner)
 		return singleplayer ? MAP_KIND_SINGLEPLAYER : MAP_KIND_MULTIPLAYER;
 	kind = (short)PIN(spinner->parameters.list.selected_index, 0, NUMBER_OF_MAP_KINDS - 1);
@@ -6152,6 +6161,10 @@ boolean pc_menu_event_function_invoke(
 		else if (!strcmp(name, "new campaign decision"))
 		{
 			return new_profile_decision(widget, event, widget_deleted);
+		}
+		else if (!strcmp(name, "port campaign unavailable"))
+		{
+			display_error_text_deferred(L"The campaign needs an\r\nXbox with 128 MB of\r\nmemory.", NONE);
 		}
 		/* (the press posted is the controller's that chose the button: a
 		split screen player's LEAVE is theirs) */

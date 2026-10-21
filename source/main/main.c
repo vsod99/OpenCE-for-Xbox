@@ -3536,7 +3536,7 @@ static boolean main_loop_iteration(
 			{
 				main_memory_short_ended = TRUE;
 				error(_error_silent, "the Xbox ran short of memory: the game ends");
-				display_error_text_when_main_menu_loaded(L"The Xbox ran out of memory,\r\nand the game was ended.");
+				display_error_text_when_main_menu_loaded(L"The Xbox ran out of\r\nmemory, and the game\r\nwas ended.");
 				if (main_globals.connection==_game_connection_network_client ||
 					main_globals.connection==_game_connection_network_server)
 				{
