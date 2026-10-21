@@ -24,10 +24,15 @@ static void *resource_data(DWORD data)
 	return data ? PLATFORM_PHYSICAL_TO_VIRTUAL(data) : NULL;
 }
 
+/* (write combined, as the Xbox's Direct3D has its resources: the original
+Xbox's GPU reads memory past the processor's caches, so what the processor
+wrote to a cached page, a particle's vertices each frame, may not have
+reached memory when the GPU draws it, which xemu, with no caches, never
+shows; the other ports' allocators take no notice of it) */
 static void *allocate_resource_memory(unsigned long size)
 {
 	void *memory = platform_contiguous_alloc(size, D3DTEXTURE_ALIGNMENT,
-		PLATFORM_ANY_PHYSICAL_ADDRESS, PAGE_READWRITE);
+		PLATFORM_ANY_PHYSICAL_ADDRESS, PAGE_READWRITE | PAGE_WRITECOMBINE);
 
 	if (!memory)
 		platform_log("Direct3D: out of contiguous memory for a %lu byte resource", size);
