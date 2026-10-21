@@ -888,7 +888,7 @@ scoreboard does) around a line each, and the last player's machine mutes
 the host's for itself (as a client's scoreboard does) before another,
 which every machine's `debug.txt` records as
 it shows them (the notices as `chat notice:`), and `debug.network_test_score`
-shortens the game, to test the next (`host:<map>:<variant>,<variant>...`
+(and `debug.network_test_minutes`, its time limit) shortens the game, to test the next (`host:<map>:<variant>,<variant>...`
 plays the variants in turn, the next once a game is over, as the host's
 button on the scores does). `debug.network_test_public` lists the host's
 game in the server browser, and `browse` joins the one listed there with the

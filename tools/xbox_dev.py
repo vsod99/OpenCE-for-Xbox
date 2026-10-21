@@ -225,12 +225,12 @@ def game_target(project: Path):
     return None
 
 
-def build(config: dict, project: Path, environment: list = ()) -> Path:
+def build(config: dict, project: Path, environment: list = (), name: str = "") -> Path:
     """make the project's bin/default.xbe (an nxdk project with its
     Makefile, or the game, build/xbox/halo or build/xbox64/halo, with `ninja
     xbox` or `ninja xbox64`), set its
-    memory limit to the configured console's, and pack bin/ into an ISO;
-    returns the ISO"""
+    memory limit to the configured console's, and pack bin/ into an ISO
+    (build/xbox/NAME.iso, the project's name by default); returns the ISO"""
     jobs = str(os.cpu_count() or 4)
     if (project / "Makefile").is_file():
         command = ["make", "-C", tool_path(config, project), "-j", jobs]
@@ -249,7 +249,7 @@ def build(config: dict, project: Path, environment: list = ()) -> Path:
     if game_target(project):
         add_maps(config, project / "bin/maps")
         add_custom_maps(config, project / "bin/custom_maps")
-    return pack(config, project, environment, project.name)
+    return pack(config, project, environment, name or project.name)
 
 
 def pack(config: dict, project: Path, environment: list, name: str) -> Path:
@@ -991,7 +991,7 @@ class RouterForward:
 
 def link(config: dict, timeout: float, host_environment: list, join_environment: list, environment: list,
          headless: bool, internet: bool = False, forward: bool = False, upnp: bool = False, profile: str = "",
-         profile_machine: str = "host") -> int:
+         profile_machine: str = "host", builds: tuple = ("", "")) -> int:
     """two Xboxes and a cable: the game hosting a system link game
     (debug.network_test host:MAP) and the game joining it, in two xemus
     whose network cards send each other their frames over UDP on this Mac,
@@ -1012,17 +1012,27 @@ def link(config: dict, timeout: float, host_environment: list, join_environment:
     forward ports to xemu's address.
 
     With profile (START:SECONDS), one machine's processor is sampled as
-    run --profile does (its profile.txt in its own folder)."""
-    project = ROOT / "build/xbox/halo"
+    run --profile does (its profile.txt in its own folder).
+
+    builds names each machine's build, "xbox" or "xbox64" (the 64 MB
+    console's), its console's memory the build's: 128 or 64 MB; by
+    default build/xbox/halo for both, on the configured memory."""
     names = ("host", "join")
+    projects = [ROOT / "build" / (name or "xbox") / "halo" for name in builds]
+    configs = []
+    for name in builds:
+        machine_config = {**config, "console": dict(config["console"])}
+        if name:
+            machine_config["console"]["memory"] = "64" if name == "xbox64" else "128"
+        configs.append(machine_config)
     router = ForwardedPort() if internet and forward else None
     if internet and not upnp:
         environment = environment + ["HALO_NET_ALLOW_UPNP=false"]
     environments = (environment + host_environment + (router.environment() if router else []),
                     environment + join_environment)
-    isos = [build(config, project, environments[0])]
+    isos = [build(configs[0], projects[0], environments[0])]
     if not internet:
-        isos.append(pack(config, project, environments[1], "halo-join"))
+        isos.append(build(configs[1], projects[1], environments[1], "halo-join"))
     out = ROOT / "build/xbox/runs" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
     console = config["console"]
@@ -1067,7 +1077,7 @@ def link(config: dict, timeout: float, host_environment: list, join_environment:
             net = ["backend = 'udp'", "", "[net.udp]", f"bind_addr = '127.0.0.1:{free_udp_port()}'",
                    f"remote_addr = '127.0.0.1:{cable.ports[index]}'"]
         print(f"{name}: Ethernet {address}")
-        machines.append(Xemu(config, isos[index], out / name, headless, files=files, net=net,
+        machines.append(Xemu(configs[index], isos[index], out / name, headless, files=files, net=net,
                              gdb_port=sampler.port if index == profiled else 0))
 
     def follow(index: int) -> None:
@@ -1085,8 +1095,8 @@ def link(config: dict, timeout: float, host_environment: list, join_environment:
                     print("(host: no invite logged; the joining machine is not started)")
                     break
                 print(f"join: opening {invite[0]}")
-                isos.append(pack(config, project, environments[1] + [f"HALO_COMMAND_LINE={invite[0]}"],
-                                 "halo-join"))
+                isos.append(build(configs[1], projects[1], environments[1] + [f"HALO_COMMAND_LINE={invite[0]}"],
+                                  "halo-join"))
             start(index)
             threads.append(threading.Thread(target=follow, args=(index,), daemon=True))
             threads[-1].start()
@@ -1367,6 +1377,11 @@ def main() -> None:
                              help="sample one machine's processor as run --profile does: profile.txt in its folder")
     link_parser.add_argument("--profile-machine", choices=("host", "join"), default="host",
                              help="the machine --profile samples (the host)")
+    link_parser.add_argument("--host-build", choices=("xbox", "xbox64"), default="",
+                             help="the host's build: xbox (on 128 MB) or xbox64 (on 64 MB); build/xbox/halo "
+                                  "on the configured memory by default")
+    link_parser.add_argument("--join-build", choices=("xbox", "xbox64"), default="",
+                             help="the joining machine's build, as --host-build")
     profile_parser = sub.add_parser("profile", help="write a run's profile.txt again from its samples.json "
                                                     "(halo.exe as it is now)")
     profile_parser.add_argument("run", type=Path, help="the run's folder (build/xbox/runs/...)")
@@ -1391,7 +1406,8 @@ def main() -> None:
     if args.command == "link":
         sys.exit(link(config, args.timeout, [f"HALO_NETWORK_TEST=host:{args.map}"] + args.host_env,
                       ["HALO_NETWORK_TEST=join"] + args.join_env, args.env, args.headless, args.internet,
-                      args.forward, args.upnp, args.profile, args.profile_machine))
+                      args.forward, args.upnp, args.profile, args.profile_machine,
+                      (args.host_build, args.join_build)))
     if sys.platform != "darwin":
         mac_only = [flag for flag, used in (("--press", args.press), ("--shot", args.shot), ("--listen", args.listen))
                     if used]

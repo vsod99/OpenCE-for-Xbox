@@ -9,7 +9,9 @@ Automated system link sessions for testing the netcode without the menus
   (slayer by default; game_engine_get_variant_by_name), as the pregame
   screen's fast setup does, and starts it debug.network_test_start seconds
   later; with more variants, once a game is over (debug.network_test_score
-  makes it short) the next, as the host's button on the scores does. A map
+  makes it short, and debug.network_test_minutes ends it in time) the
+  next, as the host's button on the scores does
+  ("<variant>@<map>" plays that one on another map). A map
   with a path is that level (custom_maps\a30, a Custom Edition map's), and
   the variant "coop" makes the game network co-op on it, at normal
   difficulty, as the Map screen does for a campaign level;
@@ -124,7 +126,7 @@ static struct
 	boolean checked;
 	short mode;
 	char map_name[64];
-	char variant_name[64];
+	char variant_name[512];
 	/* "local:": a local (split screen) game, not a system link one */
 	boolean local;
 	/* ... the variant of this game, of variant_name's list; and the seconds
@@ -151,6 +153,8 @@ static struct
 	real chat_time;
 	short chat_lines_said;
 	long score_to_win;
+	/* debug.network_test_minutes */
+	short minutes;
 	long logged_time;
 	boolean public_game;
 	boolean browsing;
@@ -209,18 +213,14 @@ static void network_test_read_settings(
 	network_test.checked = TRUE;
 	if ((!strncmp(setting, "host:", 5) && setting[5]) || (!strncmp(setting, "local:", 6) && setting[6]))
 	{
-		char *colon;
+		char const *map = strchr(setting, ':') + 1;
+		char const *colon = strchr(map, ':');
 
 		network_test.mode = _network_test_host;
 		network_test.local = setting[0] == 'l';
-		snprintf(network_test.map_name, sizeof(network_test.map_name), "%s", strchr(setting, ':') + 1);
-		snprintf(network_test.variant_name, sizeof(network_test.variant_name), "slayer");
-		colon = strchr(network_test.map_name, ':');
-		if (colon)
-		{
-			*colon = 0;
-			snprintf(network_test.variant_name, sizeof(network_test.variant_name), "%s", colon + 1);
-		}
+		snprintf(network_test.map_name, sizeof(network_test.map_name), "%.*s",
+			(int)(colon ? colon - map : (long)strlen(map)), map);
+		snprintf(network_test.variant_name, sizeof(network_test.variant_name), "%s", colon ? colon + 1 : "slayer");
 	}
 	else if (!strcmp(setting, "join"))
 	{
@@ -265,6 +265,7 @@ static void network_test_read_settings(
 	snprintf(network_test.pickup_weapon, sizeof(network_test.pickup_weapon), "%s",
 		config_string("debug.network_test_pickup_weapon"));
 	network_test.score_to_win = (long)config_integer("debug.network_test_score");
+	network_test.minutes = (short)PIN(config_integer("debug.network_test_minutes"), 0, 60);
 	network_test.cue_players = MAX(1, config_integer("debug.network_test_cue_players"));
 	network_test.cues_start = NONE;
 #ifndef HALO_WEB
@@ -1585,14 +1586,23 @@ void network_test_update(
 			{
 				char path[128];
 				char variant_name[64];
+				char *map_name = network_test.map_name;
+				char *at;
 				struct game_variant variant;
 
-				/* (a level of its own path, else a multiplayer map's name) */
-				if (strchr(network_test.map_name, '\\'))
-					snprintf(path, sizeof(path), "%s", network_test.map_name);
-				else
-					snprintf(path, sizeof(path), "levels\\test\\%s\\%s", network_test.map_name, network_test.map_name);
+				/* (the variant's own map, "<variant>@<map>", else the test's) */
 				network_test_variant(network_test.variant_index, variant_name, sizeof(variant_name));
+				at = strchr(variant_name, '@');
+				if (at)
+				{
+					*at = '\0';
+					map_name = at + 1;
+				}
+				/* (a level of its own path, else a multiplayer map's name) */
+				if (strchr(map_name, '\\'))
+					snprintf(path, sizeof(path), "%s", map_name);
+				else
+					snprintf(path, sizeof(path), "levels\\test\\%s\\%s", map_name, map_name);
 				if (!strcmp(variant_name, "coop"))
 				{
 					/* (the Map screen's co-op: menu_functions.c) */
@@ -1611,8 +1621,22 @@ void network_test_update(
 					/* debug.network_test_score: a short game, to test the next */
 					if (network_test.score_to_win > 0)
 						variant.universal_variant.score_to_win = network_test.score_to_win;
-					player_ui_set_game_variant(&variant);
-					network_game_server_change_game_variant(global_network_game_server_get(), &variant);
+					/* debug.network_test_minutes: a game that ends when no one scores */
+					if (network_test.minutes > 0)
+					{
+						extern boolean ui_widget_port_game_variant_set(struct game_variant *variant,
+							struct game_variant_options const *options);
+						struct game_variant_options options;
+
+						game_variant_options_default(&variant, &options);
+						options.time_limit = network_test.minutes;
+						ui_widget_port_game_variant_set(&variant, &options);
+					}
+					else
+					{
+						player_ui_set_game_variant(&variant);
+						network_game_server_change_game_variant(global_network_game_server_get(), &variant);
+					}
 				}
 				network_test.map_set = TRUE;
 			}
