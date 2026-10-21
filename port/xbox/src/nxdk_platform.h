@@ -84,9 +84,11 @@ int xbox_audio_start(xbox_audio_mix_function mix);
 the pixel count, a word the GPU zeroes), for indices 0 to 0xfff */
 #define XBOX_GPU_DMA_REPORT 20
 #define XBOX_GPU_REPORT_BYTES (4096UL * 16)
-/* after them, the fence: the count the GPU writes once it has drawn all
-before it (d3d8_nv2a.c) */
-#define XBOX_GPU_FENCE_OFFSET XBOX_GPU_REPORT_BYTES
+/* and over a page of its own, the fence: the count the GPU writes, at the
+semaphore's offset 0, once it has drawn all before it (d3d8_nv2a.c). The
+NV2A refuses a semaphore DMA as large as the reports' ("GPU Error :
+protection error" at NV097_SET_CONTEXT_DMA_SEMAPHORE), which xemu takes */
+#define XBOX_GPU_DMA_SEMAPHORE 21
 /* whether pbkit started (with the video mode) */
 int xbox_gpu_ready(void);
 /* whether the console's video setting is widescreen (16:9) */
@@ -131,7 +133,7 @@ static __inline__ void xbox_gpu_end(unsigned long *end)
 }
 int xbox_gpu_busy(void);
 void xbox_gpu_wait_idle(void);
-/* the count the GPU last wrote at XBOX_GPU_FENCE_OFFSET, and a wait,
+/* the count the GPU last wrote at the fence, and a wait,
 yielding to the other threads, until it reaches that count */
 unsigned long xbox_gpu_fence(void);
 void xbox_gpu_wait_fence(unsigned long fence);

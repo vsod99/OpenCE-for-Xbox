@@ -230,6 +230,22 @@ with the setting empty, nothing is sent. In xemu, `--env
 HALO_LOG_ADDRESS=10.0.2.2` reaches the Mac through xemu's NAT (checked Oct
 11: the same lines as COM2's, from the first).
 
+On a console, a method the NV2A refuses ends in pbkit's "GPU Error"
+screen and "System halted" (a loop in its interrupt handling: only a power
+off ends it), where xemu takes the method and draws on. Two settings in
+`environment.txt` help find one: `HALO_GPU_TRACE=1` waits for the GPU
+after each block of methods (`src/nxdk_nv2a.c`; slow), so that the screen
+names the method refused, not one after it, and `HALO_GPU_REPORTS=0`
+leaves the visibility tests' reports and the fence unused (the device
+waits for the GPU to be idle, and lens flares are not drawn). The first
+runs on a console (October 2026) found six such methods that xemu takes:
+a combiner count of none, a texture filter with no convolution kernel, a
+texture pitch of none, a 16-bit target with a 32-bit depth format, the
+flip inside an unended begin, and a semaphore DMA as large as the
+reports'; and the processor's caches, which xemu has none of: the
+resources the processor writes and the GPU reads are write combined, as
+the Xbox's Direct3D has them.
+
 xemu's QMP has no `screendump`, since xemu draws with its own renderer:
 `--shot SECONDS` saves xemu's window that long after the program's first
 log line as `shot-SECONDS.png` in the run's folder (the terminal needs
