@@ -92,6 +92,9 @@ static struct
 	unsigned long decoded_capacity;
 	/* the most the region of the combined offset space for them holds */
 	unsigned long decoded_limit;
+	/* whether `decoded` is memory given for them
+	(custom_edition_sounds_decode_into), not the allocator's */
+	boolean decoded_given;
 } custom_edition_sounds_globals;
 
 /* ---------- private code */
@@ -493,6 +496,10 @@ static long decoded_reserve(
 	{
 		return NONE;
 	}
+	if (needed > custom_edition_sounds_globals.decoded_capacity && custom_edition_sounds_globals.decoded_given)
+	{
+		return NONE;
+	}
 	if (needed > custom_edition_sounds_globals.decoded_capacity)
 	{
 		unsigned long capacity = (needed + DECODED_GROWTH - 1) / DECODED_GROWTH * DECODED_GROWTH;
@@ -578,6 +585,17 @@ static boolean permutation_convert(
 }
 
 /* ---------- public code */
+
+void custom_edition_sounds_decode_into(
+	byte *memory,
+	unsigned long bytes)
+{
+	custom_edition_sounds_globals.decoded = memory;
+	custom_edition_sounds_globals.decoded_capacity = bytes;
+	custom_edition_sounds_globals.decoded_given = TRUE;
+
+	return;
+}
 
 boolean custom_edition_sounds_decode(
 	byte *tag_cache,
@@ -701,8 +719,9 @@ boolean custom_edition_sounds_read(
 void custom_edition_sounds_dispose(
 	void)
 {
-	/* (none, when no sound needed decoding: debug_free does not take NULL) */
-	if (custom_edition_sounds_globals.decoded)
+	/* (none, when no sound needed decoding: debug_free does not take NULL;
+	nor memory given for them) */
+	if (custom_edition_sounds_globals.decoded && !custom_edition_sounds_globals.decoded_given)
 		free(custom_edition_sounds_globals.decoded);
 	memset(&custom_edition_sounds_globals, 0, sizeof(custom_edition_sounds_globals));
 

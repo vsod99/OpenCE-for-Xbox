@@ -1296,7 +1296,11 @@ long scenario_tags_load(
 		if (cache_file_header_verify(&cache_file_globals.header, scenario_name, TRUE))
 		{
 #ifdef HALO_XBOX_64MB
-			csmemset(tag_cache_base_address, 0xCD, CACHE_FILE_TAG_ROOM); /* port: (above) */
+			/* port: (above; a Custom Edition map may have placed it elsewhere) */
+			texture_cache_place(
+				(byte *)tag_cache_base_address + HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET,
+				HALO_PORT_TEXTURE_CACHE_PAGE_COUNT);
+			csmemset(tag_cache_base_address, 0xCD, CACHE_FILE_TAG_ROOM);
 			csmemset(tag_cache_base_address + CACHE_FILE_BSP_FLOOR, 0xCD, 0x01600000 - CACHE_FILE_BSP_FLOOR);
 #else
 			csmemset(tag_cache_base_address, 0xCD, 0x01600000);

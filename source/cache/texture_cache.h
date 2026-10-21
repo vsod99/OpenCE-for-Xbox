@@ -46,6 +46,12 @@ void *texture_cache_steal_memory(
 (port/linux/game/custom_edition_geometry.c) */
 void *texture_cache_lend_memory(
 	long size);
+#ifdef HALO_XBOX_64MB
+/* port: the 64 MB console's cache placed in the tag cache, emptied */
+void texture_cache_place(
+	void *base_address,
+	long page_count);
+#endif
 void texture_cache_debug_render(
 	void);
 

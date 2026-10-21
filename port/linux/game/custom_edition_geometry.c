@@ -319,6 +319,7 @@ which model_local_nodes_make gave it its own of) */
 
 /* (port/xbox/src/nxdk_memory.c) */
 unsigned long xbox_custom_edition_tag_cache_gpu_bytes(void);
+void xbox_processor_caches_flush(void);
 
 static struct
 {
@@ -335,6 +336,12 @@ static struct
 	struct model_vertex_uncompressed *part_vertices;
 	struct model_vertex_uncompressed *part_scratch;
 	word *part_strip;
+#ifdef HALO_XBOX_64MB
+	/* the 64 MB console's texture cache, which the room ends at: its offset
+	into the Custom Edition tag cache, and its bytes */
+	unsigned long texture_offset;
+	unsigned long texture_bytes;
+#endif
 } geometry_room;
 
 /* the Xbox tag cache's address of an offset into the Custom Edition tag
@@ -352,14 +359,34 @@ static unsigned long geometry_room_bsp_headers_size(
 	return (unsigned long)report->structure_bsp_materials_checked * 2 * GEOMETRY_HEADER_SIZE + 16;
 }
 
-/* the room's end once the models are converted: the lowest structure BSP */
-static unsigned long geometry_room_limit(
+/* the lowest structure BSP's offset into the Custom Edition tag cache */
+static unsigned long geometry_room_lowest_structure_bsp(
 	struct custom_edition_load_report const *report)
 {
 	return report->lowest_structure_bsp_address ?
 		report->lowest_structure_bsp_address - CUSTOM_EDITION_TAG_CACHE_ADDRESS :
 		report->tag_cache_bytes;
 }
+
+/* the room's end once the models are converted: the lowest structure BSP,
+or on the 64 MB console the texture cache below it */
+static unsigned long geometry_room_limit(
+	struct custom_edition_load_report const *report)
+{
+#ifdef HALO_XBOX_64MB
+	return geometry_room.texture_offset;
+#else
+	return geometry_room_lowest_structure_bsp(report);
+#endif
+}
+
+#ifdef HALO_XBOX_64MB
+static boolean geometry_room_texture_cache_measure(
+	byte *tag_cache,
+	unsigned long loaded_bytes,
+	unsigned long start,
+	struct custom_edition_load_report const *report);
+#endif
 
 /* Sets the room for the models' geometry, below the room for the largest
 part of the models of `tag_cache` (`loaded_bytes` of it in use); FALSE,
@@ -377,6 +404,11 @@ static boolean geometry_room_begin(
 	struct model *model;
 	int32_t tag_index = NONE;
 
+#ifdef HALO_XBOX_64MB
+	/* (after the sounds decoded at load, which the 64 MB console has in the
+	tag cache from the first page after the tags: custom_edition_cache.c) */
+	start += (custom_edition_sounds_decoded_bytes() + GEOMETRY_ALIGNMENT - 1) & ~(GEOMETRY_ALIGNMENT - 1);
+#endif
 	while ((model = custom_edition_cache_tag_next(tag_cache, loaded_bytes, GBXMODEL_GROUP_TAG, sizeof(*model), &tag_index)) != NULL)
 	{
 		long geometry_index;
@@ -410,6 +442,12 @@ static boolean geometry_room_begin(
 		error(_error_silent, "custom edition: no room to read a model part of %lu vertices", largest_vertex_count);
 		return FALSE;
 	}
+#ifdef HALO_XBOX_64MB
+	/* (the parts are read over where the texture cache goes, and above it:
+	it is placed, empty, once they are converted) */
+	if (!geometry_room_texture_cache_measure(tag_cache, loaded_bytes, start, report))
+		return FALSE;
+#endif
 	geometry_room.part_vertices = (struct model_vertex_uncompressed *)(tag_cache + part_offset);
 	geometry_room.part_scratch = geometry_room.part_vertices + largest_vertex_count;
 	geometry_room.part_strip = (word *)(geometry_room.part_scratch + largest_vertex_count);
@@ -540,7 +578,9 @@ static unsigned long custom_edition_models_reduce(
 	return reduced_bytes;
 }
 
-/* the models converted: the room reaches to the lowest structure BSP */
+/* the models converted: the room reaches to the lowest structure BSP (on
+the 64 MB console the texture cache, now placed below it); what the
+processor wrote of their geometry is in memory, for the GPU */
 static void geometry_room_models_done(
 	struct custom_edition_load_report const *report)
 {
@@ -548,6 +588,14 @@ static void geometry_room_models_done(
 	geometry_room.part_vertices = NULL;
 	geometry_room.part_scratch = NULL;
 	geometry_room.part_strip = NULL;
+#ifdef HALO_XBOX_64MB
+	texture_cache_place(
+		geometry_room_address(geometry_room.texture_offset),
+		(long)(geometry_room.texture_bytes / HALO_PORT_TEXTURE_CACHE_PAGE_SIZE));
+	error(_error_silent, "custom edition: the texture cache is %lu KB, from 0x%lX, below the structure BSPs",
+		geometry_room.texture_bytes >> 10, geometry_room.texture_offset);
+#endif
+	xbox_processor_caches_flush();
 
 	return;
 }
@@ -705,6 +753,54 @@ the GPU, is not drawn this frame (custom_edition_model_geometry_ready). */
 #define GEOMETRY_CACHE_LENT_BYTES 0x400000UL
 /* frames between the cache's lines in the log (30 s at 30 fps) */
 #define GEOMETRY_CACHE_LOG_FRAMES 900
+
+#ifdef HALO_XBOX_64MB
+/* Sets the 64 MB console's texture cache in the Custom Edition tag cache,
+which it has no memory of its own beside (halo_port_capacity.h): below the
+lowest structure BSP, of all the room above the tags, from `start`, but
+what the models' geometry takes (at most the smallest cache of it read when
+drawn, which their reduced detail may still need) and the structure BSPs'
+buffers' headers, up to its own size; FALSE, logged, when that leaves it
+too little (custom_edition_cache.c refuses such a map first). */
+static boolean geometry_room_texture_cache_measure(
+	byte *tag_cache,
+	unsigned long loaded_bytes,
+	unsigned long start,
+	struct custom_edition_load_report const *report)
+{
+	unsigned long end = geometry_room_lowest_structure_bsp(report) & ~(HALO_PORT_TEXTURE_CACHE_PAGE_SIZE - 1UL);
+	unsigned long headers_size = (geometry_room_bsp_headers_size(report) + GEOMETRY_ALIGNMENT - 1) & ~(GEOMETRY_ALIGNMENT - 1);
+	unsigned long models_bytes = 0;
+	unsigned long geometry_room_bytes;
+	unsigned long texture_bytes;
+	struct model *model;
+	int32_t tag_index = NONE;
+
+	while ((model = custom_edition_cache_tag_next(tag_cache, loaded_bytes, GBXMODEL_GROUP_TAG, sizeof(*model), &tag_index)) != NULL)
+	{
+		long geometry_index;
+
+		for (geometry_index = 0; geometry_index < model->geometries.count; geometry_index++)
+		{
+			models_bytes += geometry_bytes(TAG_BLOCK_GET_ELEMENT(&model->geometries, geometry_index, struct model_geometry));
+		}
+	}
+	/* (the headers once after the models, once at a cache's start) */
+	geometry_room_bytes = MIN(models_bytes + GEOMETRY_ALIGNMENT, GEOMETRY_CACHE_MINIMUM_ROOM) + 2 * headers_size;
+	texture_bytes = end > start && end - start > geometry_room_bytes ? end - start - geometry_room_bytes : 0;
+	texture_bytes = MIN(texture_bytes, (unsigned long)HALO_PORT_TEXTURE_CACHE_SIZE) & ~(HALO_PORT_TEXTURE_CACHE_PAGE_SIZE - 1UL);
+	if (texture_bytes < HALO_PORT_TEXTURE_CACHE_CUSTOM_EDITION_MINIMUM_SIZE)
+	{
+		error(_error_silent, "custom edition: no room for the texture cache on a 64 MB console: %lu KB between the tags and the structure BSPs, the models' geometry taking %lu KB",
+			end > start ? (end - start) >> 10 : 0UL, geometry_room_bytes >> 10);
+		return FALSE;
+	}
+	geometry_room.texture_offset = end - texture_bytes;
+	geometry_room.texture_bytes = texture_bytes;
+
+	return TRUE;
+}
+#endif
 
 static unsigned long geometry_cache_round(
 	unsigned long size)
@@ -919,6 +1015,8 @@ static boolean geometry_cache_load(
 	globals->geometry_bytes_read += bytes;
 	globals->geometries_resident++;
 	globals->geometry_bytes_resident += bytes;
+	/* (in memory, for the GPU) */
+	xbox_processor_caches_flush();
 
 	return TRUE;
 }
@@ -2154,6 +2252,10 @@ boolean custom_edition_structure_bsp_load(
 			vertices_offset += material->compressed_vertex_data.size;
 		}
 	}
+#ifdef HALO_XBOX
+	/* (the vertices compressed in place in memory, for the GPU) */
+	xbox_processor_caches_flush();
+#endif
 	if (success)
 	{
 		error(

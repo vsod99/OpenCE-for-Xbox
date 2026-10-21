@@ -62,6 +62,18 @@ heap in a map (port/xbox/README.md), 2 MB; the sounds past it are silenced */
 #else
 #define DECODED_SOUNDS_LIMIT (COMBINED_BITMAPS_OFFSET - COMBINED_DECODED_OFFSET)
 #endif
+/* The 64 MB Xbox has not those 2 MB of heap: they are had in the tag cache,
+from the first page after the tags (where custom_edition_geometry.c starts
+the models' geometry after them), of the room between the tags and the
+lowest structure BSP that the texture cache and the models' geometry leave
+at their least (halo_port_capacity.h): the room it needs at the least, with
+the models' geometry's (the smallest cache of it read when drawn), the
+structure BSPs' buffers' headers and the roundings
+(geometry_room_texture_cache_measure). */
+#ifdef HALO_XBOX_64MB
+#define XBOX_BESIDE_TAGS_BYTES (HALO_PORT_TEXTURE_CACHE_CUSTOM_EDITION_MINIMUM_SIZE + 0x300000UL + 0x40000UL)
+#define XBOX_DECODED_SOUNDS_ALIGNMENT 0x1000UL
+#endif
 
 /* The renderer write-protects the memory it has made textures of and learns
 of changes to it from the faults writes take (port/linux/src/memory_watch.c);
@@ -693,8 +705,23 @@ static boolean custom_edition_cache_tags_convert(
 		loaded_bytes,
 		COMBINED_BITMAPS_OFFSET,
 		COMBINED_SOUNDS_OFFSET);
+	unsigned long decoded_limit = DECODED_SOUNDS_LIMIT;
+
+#ifdef HALO_XBOX_64MB
+	/* (above) */
+	{
+		unsigned long start = (loaded_bytes + XBOX_DECODED_SOUNDS_ALIGNMENT - 1) & ~(XBOX_DECODED_SOUNDS_ALIGNMENT - 1);
+		unsigned long end = report->lowest_structure_bsp_address ?
+			report->lowest_structure_bsp_address - CUSTOM_EDITION_TAG_CACHE_ADDRESS :
+			report->tag_cache_bytes;
+
+		decoded_limit = end > start + XBOX_BESIDE_TAGS_BYTES ? end - start - XBOX_BESIDE_TAGS_BYTES : 0;
+		decoded_limit = MIN(decoded_limit, DECODED_SOUNDS_LIMIT);
+		custom_edition_sounds_decode_into(tag_cache + start, decoded_limit);
+	}
+#endif
 	/* (before the conversion, which silences sounds this build cannot play) */
-	custom_edition_sounds_decode(tag_cache, loaded_bytes, (long)COMBINED_DECODED_OFFSET, DECODED_SOUNDS_LIMIT);
+	custom_edition_sounds_decode(tag_cache, loaded_bytes, (long)COMBINED_DECODED_OFFSET, decoded_limit);
 	status = custom_edition_cache_convert(tag_cache, loaded_bytes, report->identity.name, &conversion);
 	if (status != _cache_file_status_ok)
 	{
@@ -782,6 +809,14 @@ maps' tags are measured from their indexes when an allowance for them would
 not leave room. */
 #define XBOX_RESOURCE_TAGS_ALLOWANCE 0x100000UL
 #define XBOX_MODEL_PART_READ_ALLOWANCE 0x200000UL
+/* On the 64 MB console the texture cache lies there too, below the lowest
+structure BSP (XBOX_BESIDE_TAGS_BYTES, above). */
+#ifdef HALO_XBOX_64MB
+#define XBOX_NAME "a 64 MB Xbox"
+#else
+#define XBOX_BESIDE_TAGS_BYTES 0UL
+#define XBOX_NAME "the Xbox"
+#endif
 
 /* Maps that fit but do not yet run well enough to offer: Precipice's view
 needs more of its large uncompressed textures than the texture cache holds,
@@ -790,6 +825,12 @@ xemu), and most of them are too large for the heap to swizzle. */
 static char const *const xbox_unsupported_maps[] =
 {
 	"precipice",
+#ifdef HALO_XBOX_64MB
+	/* (the 64 MB console's texture cache, 6.2 MB beside its tags, holds too
+	little of its view: 5 fps in xemu, its walls mostly the default
+	checkerboard at 4.9 MB) */
+	"Chronopolis_C3_Public_Beta0.4",
+#endif
 };
 
 static boolean custom_edition_cache_fits(
@@ -819,7 +860,7 @@ static boolean custom_edition_cache_fits(
 	limit = measure.lowest_structure_bsp_address ?
 		measure.lowest_structure_bsp_address - CUSTOM_EDITION_TAG_CACHE_ADDRESS :
 		CUSTOM_EDITION_TAG_CACHE_BYTES;
-	if (limit <= CUSTOM_EDITION_TAG_CACHE_BYTES && loaded_bytes > limit)
+	if (limit <= CUSTOM_EDITION_TAG_CACHE_BYTES && loaded_bytes + XBOX_BESIDE_TAGS_BYTES > limit)
 	{
 		struct custom_edition_file resource_files[NUMBER_OF_RESOURCE_MAP_TYPES];
 		struct resource_map resource_map_storage[NUMBER_OF_RESOURCE_MAP_TYPES];
@@ -857,10 +898,10 @@ static boolean custom_edition_cache_fits(
 		}
 		loaded_bytes = measured_bytes;
 	}
-	if (limit > CUSTOM_EDITION_TAG_CACHE_BYTES || loaded_bytes > limit ||
+	if (limit > CUSTOM_EDITION_TAG_CACHE_BYTES || loaded_bytes + XBOX_BESIDE_TAGS_BYTES > limit ||
 		loaded_bytes > CUSTOM_EDITION_TAG_CACHE_BYTES - XBOX_MODEL_PART_READ_ALLOWANCE)
 	{
-		error(_error_silent, "custom edition: '%s' is too large for the Xbox: its tags take 0x%lX bytes, its structure BSPs load from 0x%lX",
+		error(_error_silent, "custom edition: '%s' is too large for " XBOX_NAME ": its tags take 0x%lX bytes, its structure BSPs load from 0x%lX",
 			path, loaded_bytes, limit);
 		return FALSE;
 	}
@@ -1239,7 +1280,7 @@ boolean custom_edition_cache_present(
 #ifdef HALO_XBOX
 	if (!custom_edition_xbox_fits(level_name))
 	{
-		snprintf(message, message_size, "The map %.64s is too large to play on the Xbox.", name);
+		snprintf(message, message_size, "The map %.64s is too large to play on " XBOX_NAME ".", name);
 		return FALSE;
 	}
 #endif

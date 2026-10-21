@@ -338,12 +338,6 @@ void xbox_custom_edition_tag_cache_map(void *tag_cache, unsigned long tag_cache_
 
 	if (!config_boolean("game.custom_edition"))
 		return;
-#ifdef HALO_XBOX_64MB
-	/* (the 64 MB console's texture cache lies in the tag cache, where a
-	Custom Edition map's tags would be: halo_port_capacity.h) */
-	platform_log("custom edition: not on a 64 MB console");
-	return;
-#endif
 	/* (the 1 MB more is had only when there are Custom Edition maps) */
 	attributes = GetFileAttributesA(CUSTOM_EDITION_MAP_DIRECTORY);
 	if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -423,6 +417,15 @@ void xbox_custom_edition_tag_cache_map(void *tag_cache, unsigned long tag_cache_
 	custom_edition_tag_cache = (void *)CUSTOM_EDITION_TAG_CACHE_ADDRESS;
 	platform_log("custom edition: the tag cache at %08lx is the Xbox tag cache's pages and the %lu KB after them",
 		CUSTOM_EDITION_TAG_CACHE_ADDRESS, extra_bytes / 1024);
+}
+
+/* Writes back and empties the processor's caches: memory the processor
+wrote through its caches is then what the GPU reads (it does not look in
+them), and no line it held of memory given over to the GPU's own (write
+combined) use is written over that later. The game runs in ring 0. */
+void xbox_processor_caches_flush(void)
+{
+	__asm__ __volatile__("wbinvd" ::: "memory");
 }
 
 unsigned long xbox_custom_edition_tag_cache_gpu_bytes(void)

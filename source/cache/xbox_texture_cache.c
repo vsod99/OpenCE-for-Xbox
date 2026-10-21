@@ -343,6 +343,12 @@ static unsigned long texture_cache_last_failure_time = 0;
 /* port: pages at the top of the cache lent to a Halo Custom Edition map's
 model geometry while the map is loaded (texture_cache_lend_memory) */
 static long texture_cache_lent_page_count = 0;
+/* port: the pages the cache has, all of them but on the 64 MB console, whose
+cache a Halo Custom Edition map places in its own tag cache
+(texture_cache_place) */
+static long texture_cache_page_count = XBOX_TEXTURE_CACHE_PAGE_COUNT;
+#define TEXTURE_CACHE_STEALABLE_PAGE_COUNT \
+	(texture_cache_page_count - 2 * (XBOX_TEXTURE_CACHE_STEAL_GUARD_SIZE / XBOX_TEXTURE_CACHE_PAGE_SIZE))
 
 /* ---------- public code */
 
@@ -427,9 +433,9 @@ void *texture_cache_steal_memory(
 	long page_count = size / XBOX_TEXTURE_CACHE_PAGE_SIZE + 1;
 	/* port: below the pages lent (texture_cache_lend_memory) */
 	long remaining_page_count =
-		XBOX_TEXTURE_CACHE_STEALABLE_PAGE_COUNT - texture_cache_lent_page_count - page_count;
+		TEXTURE_CACHE_STEALABLE_PAGE_COUNT - texture_cache_lent_page_count - page_count;
 	byte *base_address =
-		(byte *)physical_memory_get_texture_cache_base_address() +
+		xbox_texture_cache_globals.base_address +
 		remaining_page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE;
 	long stolen_size = page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE;
 	byte *stolen_address =
@@ -485,10 +491,10 @@ void texture_cache_return_memory(
 	/* port: less the pages lent (texture_cache_lend_memory) */
 	lruv_resize(
 		xbox_texture_cache_globals.cache,
-		XBOX_TEXTURE_CACHE_PAGE_COUNT - texture_cache_lent_page_count);
+		texture_cache_page_count - texture_cache_lent_page_count);
 	XPhysicalProtect(
-		physical_memory_get_texture_cache_base_address(),
-		XBOX_TEXTURE_CACHE_SIZE - texture_cache_lent_page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE,
+		xbox_texture_cache_globals.base_address,
+		(texture_cache_page_count - texture_cache_lent_page_count) * XBOX_TEXTURE_CACHE_PAGE_SIZE,
 		XBOX_TEXTURE_CACHE_PROTECTION);
 	xbox_texture_cache_globals.stolen_memory = FALSE;
 
@@ -510,8 +516,8 @@ void *texture_cache_lend_memory(
 	assert(!xbox_texture_cache_globals.stolen_memory);
 	if (texture_cache_lent_page_count)
 	{
-		address = (byte *)physical_memory_get_texture_cache_base_address() +
-			(XBOX_TEXTURE_CACHE_PAGE_COUNT - texture_cache_lent_page_count) * XBOX_TEXTURE_CACHE_PAGE_SIZE;
+		address = xbox_texture_cache_globals.base_address +
+			(texture_cache_page_count - texture_cache_lent_page_count) * XBOX_TEXTURE_CACHE_PAGE_SIZE;
 		XPhysicalProtect(
 			address,
 			texture_cache_lent_page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE,
@@ -519,19 +525,19 @@ void *texture_cache_lend_memory(
 		texture_cache_lent_page_count = 0;
 		lruv_resize(
 			xbox_texture_cache_globals.cache,
-			XBOX_TEXTURE_CACHE_PAGE_COUNT);
+			texture_cache_page_count);
 	}
 	/* (half the pages at most: a steal still finds room below them) */
-	if (page_count <= 0 || page_count > XBOX_TEXTURE_CACHE_STEALABLE_PAGE_COUNT / 2)
+	if (page_count <= 0 || page_count > TEXTURE_CACHE_STEALABLE_PAGE_COUNT / 2)
 	{
 		return NULL;
 	}
 	lruv_resize(
 		xbox_texture_cache_globals.cache,
-		XBOX_TEXTURE_CACHE_PAGE_COUNT - page_count);
+		texture_cache_page_count - page_count);
 	texture_cache_lent_page_count = page_count;
-	address = (byte *)physical_memory_get_texture_cache_base_address() +
-		(XBOX_TEXTURE_CACHE_PAGE_COUNT - page_count) * XBOX_TEXTURE_CACHE_PAGE_SIZE;
+	address = xbox_texture_cache_globals.base_address +
+		(texture_cache_page_count - page_count) * XBOX_TEXTURE_CACHE_PAGE_SIZE;
 	XPhysicalProtect(
 		address,
 		page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE,
@@ -539,6 +545,46 @@ void *texture_cache_lend_memory(
 
 	return address;
 }
+
+#ifdef HALO_XBOX_64MB
+/* port: Places the 64 MB console's cache, which lies in the tag cache
+(halo_port_capacity.h), at `base_address` with `page_count` pages, emptied:
+a Halo Custom Edition map's between its tags and its structure BSPs
+(port/linux/game/custom_edition_geometry.c), the other maps' where the
+memory map put it. The memory it leaves is the tag cache's again; the
+memory it takes is write combined, as its own is, with what the processor
+had cached of it written back first, so that no line the processor wrote
+there for tags reaches it later. */
+void texture_cache_place(
+	void *base_address,
+	long page_count)
+{
+	extern void xbox_processor_caches_flush(void);
+
+	assert(!xbox_texture_cache_globals.stolen_memory && !texture_cache_lent_page_count);
+	assert(page_count > 0 && page_count <= XBOX_TEXTURE_CACHE_PAGE_COUNT);
+	texture_cache_flush();
+	if ((byte *)base_address != xbox_texture_cache_globals.base_address || page_count != texture_cache_page_count)
+	{
+		XPhysicalProtect(
+			xbox_texture_cache_globals.base_address,
+			texture_cache_page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE,
+			PAGE_READWRITE);
+		XPhysicalProtect(
+			base_address,
+			page_count * XBOX_TEXTURE_CACHE_PAGE_SIZE,
+			XBOX_TEXTURE_CACHE_PROTECTION);
+		xbox_texture_cache_globals.base_address = (byte *)base_address;
+		texture_cache_page_count = page_count;
+		lruv_resize(
+			xbox_texture_cache_globals.cache,
+			page_count);
+	}
+	xbox_processor_caches_flush();
+
+	return;
+}
+#endif
 
 static const char *texture_cache_name_block_proc(
 	long block_index)

@@ -288,6 +288,12 @@ byte *custom_edition_sounds_encode(
 	long rate,
 	long encoded_rate,
 	unsigned long *encoded_bytes);
+/* Has the next custom_edition_sounds_decode put the samples in `bytes` of
+`memory` (not the game's allocator's), until custom_edition_sounds_dispose
+(the 64 MB Xbox's tag cache, after the tags: custom_edition_cache.c) */
+void custom_edition_sounds_decode_into(
+	byte *memory,
+	unsigned long bytes);
 /* the bytes of the samples custom_edition_sounds_decode made */
 unsigned long custom_edition_sounds_decoded_bytes(
 	void);

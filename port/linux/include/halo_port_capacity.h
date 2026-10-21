@@ -62,15 +62,22 @@ as is the original Xbox port's (128 MB in all). */
 between a multiplayer map's tags (7.1 MB at most) and its structure bsp
 (loaded at the top, from 20.1 MB on: sidewinder), so only maps whose tags
 and bsps leave that room are played there (cache/cache_files.c). Blood
-Gulch draws about 9 MB of textures a frame. */
+Gulch draws about 9 MB of textures a frame. A Halo Custom Edition map's
+tags run to other ends, its structure BSPs from other starts: its cache is
+placed between them, below the lowest BSP (custom_edition_geometry.c), as
+large as leaves its models' geometry its room (at least 3 MB, or all of
+it), up to the same 13 MB; a map that leaves it less than 6 MB is not
+played there (custom_edition_cache.c). */
 #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x342 /* (0x580) */
 #define HALO_PORT_TEXTURE_CACHE_TAG_CACHE_OFFSET 0x710000
+#define HALO_PORT_TEXTURE_CACHE_CUSTOM_EDITION_MINIMUM_SIZE 0x600000
 #elif defined(HALO_ARM64_GUEST) || defined(HALO_WEB) || defined(HALO_XBOX)
 #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x580 /* (0x580) */
 #else
 #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x4000 /* (0x580) */
 #endif
-#define HALO_PORT_TEXTURE_CACHE_SIZE (HALO_PORT_TEXTURE_CACHE_PAGE_COUNT*0x4000) /* (0x1600000) */
+#define HALO_PORT_TEXTURE_CACHE_PAGE_SIZE 0x4000
+#define HALO_PORT_TEXTURE_CACHE_SIZE (HALO_PORT_TEXTURE_CACHE_PAGE_COUNT*HALO_PORT_TEXTURE_CACHE_PAGE_SIZE) /* (0x1600000) */
 
 /* ---------- sounds
 

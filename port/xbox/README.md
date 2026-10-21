@@ -95,7 +95,8 @@ console gives the program 64 MB.
 XBE keeps the "limit to 64 MB" flag). It plays multiplayer only, system
 link and internet play, with every other build: its game state, and all
 that the machines send each other, are the other builds'. Campaign and
-co-op maps, Halo Custom Edition maps and the Bink videos are refused.
+co-op maps and the Bink videos are refused; Halo Custom Edition
+multiplayer maps play when they leave the texture cache room (below).
 CI builds it as `halo-xbox64-release.zip` (and `-debug`), with
 `menu_art.pak` beside the XBE, which updates itself from that zip.
 
@@ -117,6 +118,18 @@ It fits because most of the memory the game reserves is never written
   not in the XBE but in `menu_art.pak` beside it (`tools/embed_assets.py
   --pack`), each read as it is decoded (`menu_files.c`); the decoded ones
   keep at most 1.5 MB, given back a second after no menu draws them.
+- A Halo Custom Edition map's tags and structure BSPs lie elsewhere in the
+  tag cache: its texture cache is placed for it between them, below its
+  lowest BSP (`texture_cache_place`, `custom_edition_geometry.c`), as
+  large as leaves its models' geometry its room (all of it, or at least
+  the 3 MB of a cache of it read when drawn), up to 13 MB. The sounds
+  decoded as it loads (up to 2 MB, the heap's on the 128 MB console) go
+  in the tag cache too, after the tags, in what the texture cache's
+  6 MB and the geometry's room leave (the rest are silent). A map that
+  leaves the texture cache less than 6 MB is left out of the map lists
+  (`custom_edition_cache.c`): with 4.9 MB Chronopolis drew most of its
+  walls as the red and green checkerboard. Stock maps put it back where
+  it was.
 
 The menus are the PC version's (`port/assets/menus`), with their pictures
 at the size the original game drew them: `tools/xbox_menu_art.py` (Pillow)
@@ -512,6 +525,12 @@ vertices and strip lie in the map in its tag's empty blocks, and each
 geometry its block in its tag's padding, so the cache costs the heap
 nothing per part. The log has a line on the cache every 900 frames.
 
+The GPU reads memory, not the processor's caches, and the processor writes
+this geometry through them: they are written back (`wbinvd`,
+`xbox_processor_caches_flush`) once the models are converted, once a
+structure BSP's vertices are compressed, and after each geometry read when
+drawn. xemu has no such caches, so only a console shows what is missed.
+
 Textures load into the Xbox's 22 MB texture cache (less the 4 MB it may
 lend), and a Custom Edition map made for Halo PC can draw more than that
 in one view (TSCE's beach about 40 MB). A texture the cache has no room for
@@ -549,6 +568,14 @@ enough yet (`xbox_unsupported_maps` in `custom_edition_cache.c`).
 | bigass v3 | 26.7 MB (12.8) | 5.5 MB | 18-20 fps, read when drawn; 120-155 textures drawn smaller |
 | Coldsnap | 8.4 MB (6.3) | 1.2 MB (12.5 MB BSPs) | runs, under 3 fps: its scripts take the processor (trigger volume tests every tick) |
 | Precipice | 4.5 MB (2.6) | 0.2 MB (16 MB BSP) | not listed: its textures thrash the texture cache (3-4 fps) |
+
+On the 64 MB console (above, "The 64 MB console"), hosting with 7 test
+clients in xemu: Death Island, Infinity and Yoyorast Island (7.4-8.6 MB of
+texture cache, models at medium detail, 23-30 fps) and cmt Snow Grove
+(6.6 MB, models read when drawn, 13-30 fps) play, with 2-4 MB free;
+Chronopolis is not offered (5 fps with 6.2 MB of textures); Portent,
+Hugeass, Extinction and bigass leave the texture cache less than 6 MB, and
+the rest less still.
 
 A large uncompressed Custom Edition bitmap is swizzled through two heap
 buffers its own size (`rasterizer_swizzle.c`); with 2-3 MB of heap free in a
