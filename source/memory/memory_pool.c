@@ -218,6 +218,9 @@ void memory_pool_compact(
 	byte *destination;
 	struct memory_pool_block *block;
 	struct memory_pool_block *previous_block;
+#ifdef HALO_XBOX
+	byte *used_end = pool->last_block ? (byte *)pool->last_block+pool->last_block->size : (byte *)pool->base_address;
+#endif
 
 	block = pool->first_block;
 	if (block)
@@ -244,6 +247,18 @@ void memory_pool_compact(
 		previous_block->next_block = NULL;
 		pool->last_block = previous_block;
 	}
+#ifdef HALO_XBOX
+	/* port: what the blocks moved from is emptied: the original Xbox port
+	backs the game state's pages as they are first written
+	(port/xbox/src/nxdk_memory.c), and the copies left there would keep a
+	game's objects' pages once they are gone */
+	{
+		byte *end = pool->last_block ? (byte *)pool->last_block+pool->last_block->size : (byte *)pool->base_address;
+
+		if (used_end > end)
+			HALO_PORT_SPARSE_ZERO(end, (unsigned long)(used_end-end));
+	}
+#endif
 	memory_pool_verify(pool);
 	return;
 }

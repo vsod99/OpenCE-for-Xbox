@@ -460,7 +460,7 @@ sparse ranges through a buffer of their own (xbox_sparse_read_through), and
 no static array a device writes to is made sparse. */
 #define GAME_STATE_ON_DEMAND 1
 #define GAME_STATE_MAXIMUM_PAGES (0x02000000UL / PAGE_BYTES)
-#define SPARSE_MAXIMUM_RANGES 128
+#define SPARSE_MAXIMUM_RANGES 256
 /* the heap's large blocks (xbox_sparse_allocate), in an address range of
 their own */
 #define SPARSE_HEAP_BASE 0x44000000UL
@@ -1177,6 +1177,9 @@ long xbox_sparse_read_through(void *destination, unsigned long size,
 
 /* between frames: the stock refilled, and now and then the zeroed pages
 taken back and the use logged */
+/* (nxdk's C library's heap is dlmalloc's) */
+int dlmalloc_trim(size_t pad);
+
 void xbox_game_state_frame(unsigned long frame)
 {
 	MM_STATISTICS statistics;
@@ -1195,6 +1198,9 @@ void xbox_game_state_frame(unsigned long frame)
 	demand.short_of_memory = short_of_memory;
 	if (frame % 300 == 0)
 	{
+		/* (and the C library's heap gives back what it holds free: a large
+		game's blocks freed after it would be kept for the next) */
+		dlmalloc_trim(0);
 		if (sparse_heap_ready)
 			RtlEnterCriticalSection(&sparse_heap_lock);
 		sparse_reclaim();

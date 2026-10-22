@@ -822,8 +822,10 @@ struct global_block
 /* The original Xbox port's large blocks are sparse: their pages are backed
 only once written, and read as zeros until then (port/xbox/src/nxdk_memory.c).
 The game's debug records and pools sized for the worst case are most of its
-heap, and seldom filled. */
-#define SPARSE_BLOCK_BYTES (256 * 1024)
+heap, and seldom filled. Blocks from 32 KB up: a network game's queues (a
+connection's, 54 KB each) freed among the blocks that stay would otherwise
+leave holes the C library's heap keeps, a megabyte after a large game. */
+#define SPARSE_BLOCK_BYTES (32 * 1024)
 void *xbox_sparse_allocate(unsigned long size);
 unsigned long xbox_sparse_size(const void *address);
 void xbox_sparse_free(void *address);

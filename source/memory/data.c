@@ -388,17 +388,20 @@ void data_delete_all(
 	csstrncpy((char *)&data->next_identifier, data->name, sizeof(data->next_identifier));
 	data->next_identifier |= 0x8000;
 
+#ifdef HALO_XBOX
+	/* port: the whole array emptied rather than each identifier zeroed: the
+	original Xbox port backs the game state's pages as they are first
+	written (port/xbox/src/nxdk_memory.c), and a game's datums would keep
+	theirs once it is over; emptied, they are the shared page of zeros again
+	(a new datum is zeroed anyway, datum_initialize) */
+	(void)absolute_index;
+	HALO_PORT_SPARSE_ZERO(data->data, (unsigned long)data->size*data->maximum_count);
+#else
 	for (absolute_index = 0; absolute_index<data->maximum_count; absolute_index++)
 	{
-#ifdef HALO_XBOX
-		/* port: only the identifiers not zero already are written: the
-		original Xbox port backs the game state's pages as they are first
-		written (port/xbox/src/nxdk_memory.c), and its arrays are mostly
-		never used */
-		if (((struct datum_header *)((byte *)data->data+data->size*absolute_index))->identifier)
-#endif
 		((struct datum_header *)((byte *)data->data+data->size*absolute_index))->identifier = 0;
 	}
+#endif
 
 	return;
 }
