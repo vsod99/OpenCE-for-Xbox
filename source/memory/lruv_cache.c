@@ -229,7 +229,13 @@ void lruv_delete(
 	struct lruv_cache *cache)
 {
 	lruv_cache_verify(cache, TRUE);
-	data_dispose(cache->blocks);
+	/* port: the blocks' array lies in the cache's own allocation, after it
+	(lruv_initialize), and goes with it: data_dispose would free it alone,
+	which the debug allocator stops the game at (the original only deleted
+	caches as it quit; a Custom Edition map's geometry cache goes with each
+	map, port/linux/game/custom_edition_geometry.c) */
+	data_verify(cache->blocks);
+	csmemset(cache->blocks, 0, sizeof(*cache->blocks));
 	csmemset(cache, 0, sizeof(*cache));
 	match_free("c:\\halo\\SOURCE\\memory\\lruv_cache.c", 163, cache);
 
